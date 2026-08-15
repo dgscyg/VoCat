@@ -25,7 +25,6 @@ export interface OverviewNetworkPanelProps {
 
 export function OverviewNetworkPanel({ device, trafficMinuteRx, trafficMinuteTx, trafficSpeedRx, trafficSpeedTx }: OverviewNetworkPanelProps) {
   const { t, lang } = useI18n();
-  const developerActive = !!device.developerEnabled;
   const [publicIP, setPublicIP] = useState<PublicIPInfo | null>(null);
   const [detectingIP, setDetectingIP] = useState(false);
   const traffic = device.traffic || {};
@@ -41,7 +40,6 @@ export function OverviewNetworkPanel({ device, trafficMinuteRx, trafficMinuteTx,
   useEffect(() => {
     let cancelled = false;
     setPublicIP(null);
-    if (!developerActive) return () => { cancelled = true; };
     api<PublicIPInfo>(`/devices/${encodeURIComponent(device.id)}/network/public-ip`)
       .then((info) => {
         if (!cancelled) setPublicIP(info.detected ? info : null);
@@ -50,7 +48,7 @@ export function OverviewNetworkPanel({ device, trafficMinuteRx, trafficMinuteTx,
         if (!cancelled) setPublicIP(null);
       });
     return () => { cancelled = true; };
-  }, [developerActive, device.id, device.interface, device.networkEnabled, device.modem?.iccid]);
+  }, [device.id, device.interface, device.networkEnabled, device.modem?.iccid]);
 
   async function detectPublicIP() {
     setDetectingIP(true);
@@ -75,10 +73,6 @@ export function OverviewNetworkPanel({ device, trafficMinuteRx, trafficMinuteTx,
   const location = publicIP
     ? [countryName, publicIP.region, publicIP.city].filter((value, index, values) => value && values.indexOf(value) === index).join(" · ")
     : "";
-
-  if (!developerActive) {
-    return null;
-  }
 
   return (
     <div className="ui-panel-muted p-4">

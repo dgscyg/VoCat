@@ -1755,10 +1755,6 @@ func (s *Server) handleTrafficAnalysis(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
-	if !s.developerActive(r.Context()) {
-		writeError(w, http.StatusForbidden, "developer_mode_required", "traffic analysis is available only in developer mode")
-		return
-	}
 	rangeName := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("range")))
 	if rangeName == "" {
 		rangeName = "day"

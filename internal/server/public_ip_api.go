@@ -60,10 +60,6 @@ func (s *Server) handleCellularPublicIP(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return true
 	}
-	if !s.developerActive(r.Context()) {
-		writeError(w, http.StatusForbidden, "developer_mode_required", "public IP detection through roaming data is available only in developer mode")
-		return true
-	}
 	w.Header().Set("Cache-Control", "no-store")
 	if r.Method == http.MethodGet {
 		info, ok := s.loadPublicIP(config.ID, iccid)

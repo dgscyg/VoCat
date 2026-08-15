@@ -1,4 +1,4 @@
-import { ArrowSyncRegular, PowerRegular, ChatRegular } from "@fluentui/react-icons";
+import { ArrowSyncRegular, PowerRegular, ChatRegular, CallRegular } from "@fluentui/react-icons";
 import { Button, Switch } from "../ui";
 import type { DeviceDetail } from "./types";
 import { useI18n } from "../../lib/i18n";
@@ -15,6 +15,7 @@ export interface DeviceDetailHeaderProps {
   onReconnectVowifi: () => void;
   onRebootModem: () => void;
   onOpenSms: () => void;
+  onOpenCall?: () => void;
 	wifiCallingOnly?: boolean;
 }
 
@@ -43,7 +44,7 @@ export function DeviceDetailHeader(props: DeviceDetailHeaderProps) {
             <Button loading={props.reconnectingVoWiFi} onClick={props.onReconnectVowifi} className="ui-glass-border !border-0" icon={<ArrowSyncRegular />}>
               {t("重连 VoWiFi")}
             </Button>
-		  ) : device.developerEnabled && !props.wifiCallingOnly ? (
+		  ) : !props.wifiCallingOnly ? (
 			<div
 			  className="ui-glass-border flex h-8 items-center gap-2 rounded-lg px-3 text-sm text-gray-700 dark:text-gray-200"
 			  title={t("蜂窝数据仅进入 Export Proxy 的受保护路由，不会成为主机默认出口")}
@@ -65,6 +66,11 @@ export function DeviceDetailHeader(props: DeviceDetailHeaderProps) {
           <Button onClick={props.onOpenSms} className="ui-glass-border !border-0" icon={<ChatRegular />}>
             {t("短信")}
           </Button>
+          {props.onOpenCall ? (
+            <Button onClick={props.onOpenCall} className="ui-glass-border !border-0" icon={<CallRegular />}>
+              {t("通话")}
+            </Button>
+          ) : null}
         </div>
       </div>
     </div>

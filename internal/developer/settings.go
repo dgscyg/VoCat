@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 
-	"vocat/internal/exportproxy"
 	"vocat/internal/httpsmode"
 	"vocat/internal/store"
 )
@@ -93,9 +92,10 @@ func SetSMSHourlyLimit(ctx context.Context, database *store.Store, limit int) er
 	return database.UpsertAppSetting(ctx, store.AppSetting{Key: SMSHourlyLimitKey, Value: value})
 }
 
-// ResetExperimental restores every mutable developer-only setting. It is
+// ResetExperimental restores developer-only experimental settings. It is
 // called both by `vocat develop off` and at startup whenever developer mode is
-// disabled, so stale database values cannot silently remain active.
+// disabled. Roaming data and export-proxy configurations are first-class
+// product features and are left untouched.
 func ResetExperimental(ctx context.Context, database *store.Store) error {
 	httpsValue, err := json.Marshal(map[string]bool{"enabled": false})
 	if err != nil {
@@ -110,37 +110,6 @@ func ResetExperimental(ctx context.Context, database *store.Store) error {
 	}
 	if err := SetSMSHourlyLimit(ctx, database, DefaultSMSHourlyLimit); err != nil {
 		resetErrors = append(resetErrors, fmt.Errorf("reset SMS hourly limit: %w", err))
-	}
-	if err := database.DeleteAppSetting(ctx, exportproxy.SettingKey); err != nil && !errors.Is(err, store.ErrNotFound) {
-		resetErrors = append(resetErrors, fmt.Errorf("delete export proxy configurations: %w", err))
-	}
-	devices, err := database.ListDevices(ctx)
-	if err != nil {
-		resetErrors = append(resetErrors, fmt.Errorf("list devices while disabling roaming data: %w", err))
-	} else {
-		for _, device := range devices {
-			if !device.NetworkEnabled {
-				continue
-			}
-			device.NetworkEnabled = false
-			if err := database.UpsertDevice(ctx, device); err != nil {
-				resetErrors = append(resetErrors, fmt.Errorf("disable roaming data for device %s: %w", device.ID, err))
-			}
-		}
-	}
-	policies, err := database.ListCardPolicies(ctx)
-	if err != nil {
-		resetErrors = append(resetErrors, fmt.Errorf("list card policies while disabling roaming data: %w", err))
-	} else {
-		for _, policy := range policies {
-			if !policy.NetworkEnabled {
-				continue
-			}
-			policy.NetworkEnabled = false
-			if err := database.UpsertCardPolicy(ctx, policy); err != nil {
-				resetErrors = append(resetErrors, fmt.Errorf("disable roaming policy for card %s: %w", policy.ICCID, err))
-			}
-		}
 	}
 	return errors.Join(resetErrors...)
 }
