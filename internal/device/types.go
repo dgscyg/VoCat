@@ -19,6 +19,7 @@ var (
 	ErrSMSReferenceMissing    = errors.New("modem completed SMS command without a message reference")
 	ErrSMSInvalidMessageIndex = errors.New("invalid SMS message index")
 	ErrDataBackendUnavailable = errors.New("cellular data backend is unavailable")
+	ErrCellularData           = errors.New("cellular data path failed")
 	ErrInvalidNetworkAPN      = errors.New("invalid cellular APN")
 	ErrRegionBlocked          = errors.New("sim card home region is not served")
 	ErrUSSDSessionNotFound    = errors.New("ussd session not found or already closed")

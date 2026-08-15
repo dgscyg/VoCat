@@ -33,32 +33,53 @@ func LookupPublicIP(ctx context.Context, networkInterface string) (PublicIPInfo,
 	if err := platformSupported(); err != nil {
 		return PublicIPInfo{}, err
 	}
+	if err := interfaceDialReady(networkInterface); err != nil {
+		return PublicIPInfo{}, err
+	}
 	dialer := boundDialer(networkInterface)
-	resolver := boundResolver(networkInterface)
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
-			return dialTarget(ctx, address, &dialer, resolver)
+			return dialTarget(ctx, address, &dialer, networkInterface)
 		},
 		DisableKeepAlives:     true,
 		ResponseHeaderTimeout: 12 * time.Second,
 	}
 	defer transport.CloseIdleConnections()
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, ipInfoURL, nil)
+	info, err := queryPublicIPEndpoint(ctx, transport, ipInfoURL, "application/json", decodePublicIPInfo)
+	if err == nil {
+		return info, nil
+	}
+	fallback, fallbackErr := queryPublicIPEndpoint(ctx, transport, cloudflareTraceURL, "text/plain", decodeCloudflareTrace)
+	if fallbackErr == nil {
+		return fallback, nil
+	}
+	return PublicIPInfo{}, fmt.Errorf("query public IP through %s: %w", networkInterface, errors.Join(err, fallbackErr))
+}
+
+const cloudflareTraceURL = "https://1.1.1.1/cdn-cgi/trace"
+
+func queryPublicIPEndpoint(
+	ctx context.Context,
+	transport *http.Transport,
+	rawURL, accept string,
+	decode func(io.Reader) (PublicIPInfo, error),
+) (PublicIPInfo, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return PublicIPInfo{}, err
 	}
-	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Accept", accept)
 	request.Header.Set("User-Agent", "VoCat/1.0")
 	response, err := transport.RoundTrip(request)
 	if err != nil {
-		return PublicIPInfo{}, fmt.Errorf("query ipinfo.io through %s: %w", networkInterface, err)
+		return PublicIPInfo{}, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
-		return PublicIPInfo{}, fmt.Errorf("ipinfo.io returned HTTP %d", response.StatusCode)
+		return PublicIPInfo{}, fmt.Errorf("%s returned HTTP %d", request.URL.Host, response.StatusCode)
 	}
-	return decodePublicIPInfo(io.LimitReader(response.Body, 64<<10))
+	return decode(io.LimitReader(response.Body, 64<<10))
 }
 
 func decodePublicIPInfo(reader io.Reader) (PublicIPInfo, error) {
@@ -85,4 +106,31 @@ func decodePublicIPInfo(reader io.Reader) (PublicIPInfo, error) {
 		Region: strings.TrimSpace(response.Region), City: strings.TrimSpace(response.City),
 		Organization: strings.TrimSpace(response.Org),
 	}, nil
+}
+
+func decodeCloudflareTrace(reader io.Reader) (PublicIPInfo, error) {
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		return PublicIPInfo{}, err
+	}
+	info := PublicIPInfo{}
+	for _, line := range strings.Split(string(body), "\n") {
+		key, value, found := strings.Cut(strings.TrimSpace(line), "=")
+		if !found {
+			continue
+		}
+		switch key {
+		case "ip":
+			info.IP = strings.TrimSpace(value)
+		case "loc":
+			info.CountryCode = strings.ToUpper(strings.TrimSpace(value))
+		}
+	}
+	if net.ParseIP(info.IP) == nil {
+		return PublicIPInfo{}, errors.New("cloudflare trace contained no valid IP address")
+	}
+	if len(info.CountryCode) != 2 {
+		info.CountryCode = ""
+	}
+	return info, nil
 }

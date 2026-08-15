@@ -20,3 +20,13 @@ func TestDecodePublicIPInfoRejectsInvalidResponse(t *testing.T) {
 		t.Fatal("invalid IP was accepted")
 	}
 }
+
+func TestDecodeCloudflareTrace(t *testing.T) {
+	info, err := decodeCloudflareTrace(strings.NewReader("fl=123\nh=1.1.1.1\nip=198.51.100.9\nloc=GB\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.IP != "198.51.100.9" || info.CountryCode != "GB" {
+		t.Fatalf("info = %+v", info)
+	}
+}

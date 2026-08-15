@@ -426,7 +426,12 @@ func (manager *Manager) start(ctx context.Context, id string) error {
 			return err
 		}
 	}
-	delete(manager.lastError, id)
+	if err := interfaceDialReady(config.Interface); err != nil {
+		manager.lastError[id] = err.Error()
+		manager.logger.Warn("export proxy interface is not ready", "id", id, "interface", config.Interface, "error", err)
+	} else {
+		delete(manager.lastError, id)
+	}
 	manager.listeners[id] = listener
 	manager.started[id] = time.Now().UTC()
 	manager.mu.Unlock()
@@ -450,7 +455,6 @@ func (manager *Manager) stopLocked(id string) {
 
 func (manager *Manager) serve(listener net.Listener, config Config) {
 	dialer := boundDialer(config.Interface)
-	resolver := boundResolver(config.Interface)
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -460,9 +464,9 @@ func (manager *Manager) serve(listener net.Listener, config Config) {
 			defer client.Close()
 			var err error
 			if config.Mode == "http" {
-				err = serveHTTP(client, config, &dialer, resolver)
+				err = serveHTTP(client, config, &dialer)
 			} else {
-				err = serveSOCKS(client, config, &dialer, resolver)
+				err = serveSOCKS(client, config, &dialer)
 			}
 			if err != nil {
 				manager.logger.Debug("export proxy connection closed", "id", config.ID, "error", err)

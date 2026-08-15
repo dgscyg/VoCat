@@ -84,6 +84,70 @@ func TestSetNetworkDoesNotExposeAPNCredentialsInErrorsOrState(t *testing.T) {
 	client.assertDone(t)
 }
 
+func TestSetNetworkATBackendBindsUSBNetWhenInterfacePresent(t *testing.T) {
+	originalConfigure, originalRelease := configureCellularHost, releaseCellularHost
+	configureCellularHost = func(context.Context, modem.Candidate, modem.Client) (string, error) {
+		return "protected stub lease 10.0.0.2/30", nil
+	}
+	releaseCellularHost = func(context.Context, string) {}
+	t.Cleanup(func() {
+		configureCellularHost, releaseCellularHost = originalConfigure, originalRelease
+	})
+	client := &transcriptClient{steps: []clientStep{
+		{command: `AT+CGDCONT=1,"IPV4V6","internet"`, response: okResponse()},
+		{command: "AT+CGATT=1", response: okResponse()},
+		{command: "AT+CGACT=1,1", response: okResponse()},
+		{command: "AT+QNETDEVCTL=1,1,1", response: okResponse()},
+		{command: "AT+QNETDEVCTL=0,1", response: okResponse()},
+		{command: "AT+CGACT=0,1", response: okResponse()},
+	}}
+	manager, id := newStartedTestManagerWithInterface(t, client, "wwan0")
+	result, err := manager.SetNetwork(context.Background(), id, NetworkRequest{
+		Enabled: true, APN: "internet", IPVersion: "IPV4V6",
+	})
+	if err != nil {
+		t.Fatalf("enable network: %v", err)
+	}
+	if result.Backend != "at" || result.Interface != "wwan0" || !strings.Contains(result.Detail, "protected stub lease") {
+		t.Fatalf("enable result = %#v", result)
+	}
+	if _, err := manager.SetNetwork(context.Background(), id, NetworkRequest{Enabled: false, APN: "internet"}); err != nil {
+		t.Fatalf("disable network: %v", err)
+	}
+	client.assertDone(t)
+}
+
+func TestSetNetworkATBackendRollsBackWhenHostPathFails(t *testing.T) {
+	originalConfigure, originalRelease := configureCellularHost, releaseCellularHost
+	configureCellularHost = func(context.Context, modem.Candidate, modem.Client) (string, error) {
+		return "", errors.New("udhcpc: network is unreachable")
+	}
+	released := ""
+	releaseCellularHost = func(_ context.Context, networkInterface string) {
+		released = networkInterface
+	}
+	t.Cleanup(func() {
+		configureCellularHost, releaseCellularHost = originalConfigure, originalRelease
+	})
+	client := &transcriptClient{steps: []clientStep{
+		{command: `AT+CGDCONT=1,"IP","internet"`, response: okResponse()},
+		{command: "AT+CGATT=1", response: okResponse()},
+		{command: "AT+CGACT=1,1", response: okResponse()},
+		{command: "AT+QNETDEVCTL=1,1,1", response: okResponse()},
+		{command: "AT+QNETDEVCTL=0,1", response: okResponse()},
+		{command: "AT+CGACT=0,1", response: okResponse()},
+	}}
+	manager, id := newStartedTestManagerWithInterface(t, client, "wwan0")
+	_, err := manager.SetNetwork(context.Background(), id, NetworkRequest{Enabled: true, APN: "internet", IPVersion: "IP"})
+	if !errors.Is(err, ErrCellularData) {
+		t.Fatalf("error = %v, want ErrCellularData", err)
+	}
+	if released != "wwan0" {
+		t.Fatalf("release interface = %q", released)
+	}
+	client.assertDone(t)
+}
+
 func TestSetNetworkRejectsUnsafeAPNBeforeOpeningModem(t *testing.T) {
 	client := &transcriptClient{}
 	manager, id := newStartedTestManager(t, client)

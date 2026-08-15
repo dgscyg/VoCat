@@ -18,6 +18,13 @@ func setQMINetwork(
 	string,
 	string,
 	string,
+	modem.Client,
 ) (NetworkResult, error) {
 	return NetworkResult{}, fmt.Errorf("%w: QMI control is supported only on Linux", ErrDataBackendUnavailable)
 }
+
+func activateExportProxyInterface(context.Context, modem.Candidate, modem.Client) (string, error) {
+	return "", nil
+}
+
+func deactivateExportProxyInterface(context.Context, string) {}

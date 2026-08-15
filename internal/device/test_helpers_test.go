@@ -195,15 +195,25 @@ func newStartedTestManager(
 	client modem.Client,
 ) (*Manager, string) {
 	t.Helper()
+	return newStartedTestManagerWithInterface(t, client, "")
+}
+
+func newStartedTestManagerWithInterface(
+	t *testing.T,
+	client modem.Client,
+	networkInterface string,
+) (*Manager, string) {
+	t.Helper()
 	const id = "quectel-test-ec20"
 	opener := &staticOpener{client: client}
 	manager, err := NewManager(Options{
 		Discoverer: staticDiscoverer{candidates: []modem.Candidate{{
-			ID:           id,
-			VendorID:     "2c7c",
-			ProductID:    "0125",
-			Manufacturer: "Quectel",
-			Product:      "EC20",
+			ID:               id,
+			VendorID:         "2c7c",
+			ProductID:        "0125",
+			Manufacturer:     "Quectel",
+			Product:          "EC20",
+			NetworkInterface: networkInterface,
 			ATPort: modem.Port{
 				Path:            "/dev/ttyUSB2",
 				Name:            "ttyUSB2",
