@@ -45,11 +45,13 @@ func LookupPublicIP(ctx context.Context, networkInterface string) (PublicIPInfo,
 		ResponseHeaderTimeout: 12 * time.Second,
 	}
 	defer transport.CloseIdleConnections()
-	info, err := queryPublicIPEndpoint(ctx, transport, ipInfoURL, "application/json", decodePublicIPInfo)
+	// Prefer an IP-literal probe so a broken carrier DNS cannot block detection
+	// once the cellular default route exists.
+	info, err := queryPublicIPEndpoint(ctx, transport, cloudflareTraceURL, "text/plain", decodeCloudflareTrace)
 	if err == nil {
 		return info, nil
 	}
-	fallback, fallbackErr := queryPublicIPEndpoint(ctx, transport, cloudflareTraceURL, "text/plain", decodeCloudflareTrace)
+	fallback, fallbackErr := queryPublicIPEndpoint(ctx, transport, ipInfoURL, "application/json", decodePublicIPInfo)
 	if fallbackErr == nil {
 		return fallback, nil
 	}

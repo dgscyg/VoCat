@@ -116,11 +116,11 @@ func dnsQueryAOn(ctx context.Context, dialer *net.Dialer, network, server, name 
 		return nil, fmt.Errorf("dial %s %s:53: %w", network, server, err)
 	}
 	defer conn.Close()
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	} else {
-		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	deadline := time.Now().Add(3 * time.Second)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
 	}
+	_ = conn.SetDeadline(deadline)
 	if strings.HasPrefix(network, "tcp") {
 		var header [2]byte
 		binary.BigEndian.PutUint16(header[:], uint16(len(payload)))
@@ -175,7 +175,25 @@ func exportRouteDNSServers(networkInterface string) []string {
 	if len(servers) == 0 {
 		return []string{"1.1.1.1", "8.8.8.8"}
 	}
-	return servers
+	return appendPublicResolverFallbacks(servers)
+}
+
+func appendPublicResolverFallbacks(servers []string) []string {
+	seen := make(map[string]bool, len(servers)+2)
+	out := make([]string, 0, len(servers)+2)
+	for _, server := range servers {
+		if seen[server] {
+			continue
+		}
+		seen[server] = true
+		out = append(out, server)
+	}
+	for _, fallback := range []string{"1.1.1.1", "8.8.8.8"} {
+		if !seen[fallback] {
+			out = append(out, fallback)
+		}
+	}
+	return out
 }
 
 // Linux IFNAMSIZ is 16 including the terminator. Restricting names here both

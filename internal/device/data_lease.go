@@ -133,3 +133,59 @@ func (lease cellularLease) prefixLen() int {
 	}
 	return ones
 }
+
+// nextHop is the address that marked sockets should use as the cellular
+// default gateway. Carrier "router" fields are often a public DNS/NAT address
+// outside the /30; ARP for that address on wwan0 fails with "no route to host".
+func (lease cellularLease) nextHop() net.IP {
+	address := lease.Address.To4()
+	if address == nil {
+		return nil
+	}
+	mask := lease.Mask
+	if mask == nil {
+		mask = net.CIDRMask(32, 32)
+	}
+	if gateway := lease.Gateway.To4(); gateway != nil && sameIPv4Network(address, gateway, mask) {
+		return gateway
+	}
+	return pointToPointPeer(address, mask)
+}
+
+func sameIPv4Network(left, right net.IP, mask net.IPMask) bool {
+	left4, right4 := left.To4(), right.To4()
+	if left4 == nil || right4 == nil || mask == nil {
+		return false
+	}
+	return left4.Mask(mask).Equal(right4.Mask(mask))
+}
+
+func pointToPointPeer(address net.IP, mask net.IPMask) net.IP {
+	ip := address.To4()
+	if ip == nil || mask == nil {
+		return nil
+	}
+	ones, bits := mask.Size()
+	if bits != 32 {
+		return nil
+	}
+	network := ip.Mask(mask)
+	switch ones {
+	case 31:
+		peer := append(net.IP(nil), ip...)
+		peer[3] ^= 1
+		return peer
+	case 30:
+		first := append(net.IP(nil), network...)
+		first[3] |= 1
+		second := append(net.IP(nil), network...)
+		second[3] |= 2
+		switch {
+		case ip.Equal(first):
+			return second
+		case ip.Equal(second):
+			return first
+		}
+	}
+	return nil
+}

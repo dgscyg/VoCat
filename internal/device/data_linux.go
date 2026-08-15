@@ -134,7 +134,9 @@ func exportProxyRouteIdentity(networkInterface string) (mark uint32, table, prio
 	value := hash.Sum32()
 	mark = 0x56000000 | (value & 0x00ffffff)
 	table = 20000 + int(value%10000)
-	priority = 20000 + int(value%10000)
+	// Stay below Clash/tun rules (often pref 9000) so marked sockets are not
+	// stolen before they reach the protected cellular table.
+	priority = 60 + int(value%40)
 	return
 }
 
@@ -379,19 +381,20 @@ func applyCellularLease(ctx context.Context, ipCommand, networkInterface string,
 	if result, routeErr := exec.CommandContext(ctx, ipCommand, "-4", "route", "replace", "table", strconv.Itoa(table), connectedCIDR, "dev", networkInterface, "scope", "link", "src", lease.Address.String()).CombinedOutput(); routeErr != nil {
 		return fmt.Errorf("install protected connected route: %w: %s", routeErr, strings.TrimSpace(string(result)))
 	}
-	defaultArgs := []string{"-4", "route", "replace", "table", strconv.Itoa(table), "default"}
-	if lease.Gateway != nil {
-		defaultArgs = append(defaultArgs, "via", lease.Gateway.String())
+	nextHop := lease.nextHop()
+	if err := installCellularDefault(ctx, ipCommand, networkInterface, nextHop, strconv.Itoa(table), ""); err != nil {
+		return err
 	}
-	defaultArgs = append(defaultArgs, "dev", networkInterface, "onlink")
-	if result, routeErr := exec.CommandContext(ctx, ipCommand, defaultArgs...).CombinedOutput(); routeErr != nil {
-		return fmt.Errorf("install protected default route: %w: %s", routeErr, strings.TrimSpace(string(result)))
+	// BINDTODEVICE can ignore policy tables and only see this interface's main
+	// routes. A high-metric default keeps eth0 as the host default.
+	if err := installCellularDefault(ctx, ipCommand, networkInterface, nextHop, "", strconv.Itoa(cellularMainMetric)); err != nil {
+		return err
 	}
 	markText := fmt.Sprintf("0x%x", mark)
-	ruleArgs := []string{"rule", "add", "priority", strconv.Itoa(priority), "fwmark", markText, "lookup", strconv.Itoa(table)}
+	ruleArgs := []string{"-4", "rule", "add", "priority", strconv.Itoa(priority), "fwmark", markText, "lookup", strconv.Itoa(table)}
 	result, err := exec.CommandContext(ctx, ipCommand, ruleArgs...).CombinedOutput()
 	if err != nil && strings.Contains(strings.ToLower(string(result)), "file exists") {
-		_, _ = exec.CommandContext(ctx, ipCommand, "rule", "del", "priority", strconv.Itoa(priority), "fwmark", markText, "lookup", strconv.Itoa(table)).CombinedOutput()
+		_, _ = exec.CommandContext(ctx, ipCommand, "-4", "rule", "del", "priority", strconv.Itoa(priority), "fwmark", markText, "lookup", strconv.Itoa(table)).CombinedOutput()
 		result, err = exec.CommandContext(ctx, ipCommand, ruleArgs...).CombinedOutput()
 	}
 	if err != nil {
@@ -399,6 +402,46 @@ func applyCellularLease(ctx context.Context, ipCommand, networkInterface string,
 	}
 	if err := writeExportProxyDNS(networkInterface, lease.DNS); err != nil {
 		return fmt.Errorf("publish protected DNS configuration: %w", err)
+	}
+	if err := verifyMarkedCellularRoute(ctx, ipCommand, networkInterface, lease.Address, markText); err != nil {
+		return err
+	}
+	return nil
+}
+
+const cellularMainMetric = 25000
+
+func installCellularDefault(ctx context.Context, ipCommand, networkInterface string, nextHop net.IP, table, metric string) error {
+	args := []string{"-4", "route", "replace", "default"}
+	if table != "" {
+		args = []string{"-4", "route", "replace", "table", table, "default"}
+	}
+	if nextHop != nil {
+		args = append(args, "via", nextHop.String())
+	}
+	args = append(args, "dev", networkInterface, "onlink")
+	if metric != "" {
+		args = append(args, "metric", metric)
+	}
+	result, err := exec.CommandContext(ctx, ipCommand, args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("install cellular default route: %w: %s", err, strings.TrimSpace(string(result)))
+	}
+	return nil
+}
+
+func verifyMarkedCellularRoute(ctx context.Context, ipCommand, networkInterface string, source net.IP, markText string) error {
+	args := []string{"-4", "route", "get", "1.1.1.1", "mark", markText, "oif", networkInterface}
+	if source != nil {
+		args = append(args, "from", source.String())
+	}
+	result, err := exec.CommandContext(ctx, ipCommand, args...).CombinedOutput()
+	detail := strings.TrimSpace(string(result))
+	if err != nil {
+		return fmt.Errorf("marked sockets still have no route out %s: %w: %s", networkInterface, err, detail)
+	}
+	if !strings.Contains(detail, "dev "+networkInterface) {
+		return fmt.Errorf("marked sockets still have no route out %s: %s", networkInterface, detail)
 	}
 	return nil
 }
@@ -469,11 +512,7 @@ func writeExportProxyDNS(networkInterface string, servers []string) error {
 			valid = append(valid, address.String())
 		}
 	}
-	if len(valid) == 0 {
-		// This is used only by marked Export Proxy sockets. It never changes the
-		// host resolver and is merely a fallback for carriers omitting DHCP DNS.
-		valid = []string{"1.1.1.1", "8.8.8.8"}
-	}
+	valid = appendPublicDNSFallbacks(valid)
 	if err := os.MkdirAll("/run/vocat", 0o755); err != nil {
 		return err
 	}
@@ -497,6 +536,29 @@ func writeExportProxyDNS(networkInterface string, servers []string) error {
 	return os.Rename(temporaryPath, exportProxyDNSPath(networkInterface))
 }
 
+func appendPublicDNSFallbacks(servers []string) []string {
+	seen := make(map[string]bool, len(servers)+2)
+	valid := make([]string, 0, len(servers)+2)
+	for _, server := range servers {
+		ip := net.ParseIP(server).To4()
+		if ip == nil {
+			continue
+		}
+		value := ip.String()
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		valid = append(valid, value)
+	}
+	for _, fallback := range []string{"1.1.1.1", "8.8.8.8"} {
+		if !seen[fallback] {
+			valid = append(valid, fallback)
+		}
+	}
+	return valid
+}
+
 func clearExportProxyRoute(ctx context.Context, networkInterface string) {
 	_ = os.Remove(exportProxyDNSPath(networkInterface))
 	ipCommand, err := exec.LookPath("ip")
@@ -504,8 +566,17 @@ func clearExportProxyRoute(ctx context.Context, networkInterface string) {
 		return
 	}
 	mark, table, priority := exportProxyRouteIdentity(networkInterface)
-	_, _ = exec.CommandContext(ctx, ipCommand, "rule", "del", "priority", strconv.Itoa(priority), "fwmark", fmt.Sprintf("0x%x", mark), "lookup", strconv.Itoa(table)).CombinedOutput()
+	markText := fmt.Sprintf("0x%x", mark)
+	for range 8 {
+		if _, err := exec.CommandContext(ctx, ipCommand, "-4", "rule", "del", "fwmark", markText).CombinedOutput(); err != nil {
+			break
+		}
+	}
+	_, _ = exec.CommandContext(ctx, ipCommand, "-4", "rule", "del", "priority", strconv.Itoa(priority), "fwmark", markText, "lookup", strconv.Itoa(table)).CombinedOutput()
+	// Older builds used priority == table (20000 + hash%10000).
+	_, _ = exec.CommandContext(ctx, ipCommand, "-4", "rule", "del", "priority", strconv.Itoa(table), "fwmark", markText, "lookup", strconv.Itoa(table)).CombinedOutput()
 	_, _ = exec.CommandContext(ctx, ipCommand, "-4", "route", "flush", "table", strconv.Itoa(table)).CombinedOutput()
+	_, _ = exec.CommandContext(ctx, ipCommand, "-4", "route", "del", "default", "dev", networkInterface, "metric", strconv.Itoa(cellularMainMetric)).CombinedOutput()
 }
 
 const managerCommandCleanupTimeout = 15 * time.Second

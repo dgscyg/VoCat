@@ -55,6 +55,38 @@ IPv4 gateway address: 10.123.45.68
 	}
 }
 
+func TestCellularLeaseNextHopPrefersInSubnetGateway(t *testing.T) {
+	lease := cellularLease{
+		Address: net.ParseIP("10.46.1.2").To4(),
+		Mask:    net.CIDRMask(30, 32),
+		Gateway: net.ParseIP("10.46.1.1").To4(),
+	}
+	if got := lease.nextHop(); got.String() != "10.46.1.1" {
+		t.Fatalf("nextHop() = %v, want 10.46.1.1", got)
+	}
+}
+
+func TestCellularLeaseNextHopIgnoresPublicRouterOnSlash30(t *testing.T) {
+	lease := cellularLease{
+		Address: net.ParseIP("10.49.135.129").To4(),
+		Mask:    net.CIDRMask(30, 32),
+		Gateway: net.ParseIP("109.249.185.130").To4(),
+	}
+	if got := lease.nextHop(); got.String() != "10.49.135.130" {
+		t.Fatalf("nextHop() = %v, want 10.49.135.130", got)
+	}
+}
+
+func TestPointToPointPeer(t *testing.T) {
+	mask := net.CIDRMask(30, 32)
+	if got := pointToPointPeer(net.ParseIP("10.49.135.129"), mask); got.String() != "10.49.135.130" {
+		t.Fatalf("peer(129) = %v", got)
+	}
+	if got := pointToPointPeer(net.ParseIP("10.49.135.130"), mask); got.String() != "10.49.135.129" {
+		t.Fatalf("peer(130) = %v", got)
+	}
+}
+
 func TestParseCGCONTRDPRejectsEmpty(t *testing.T) {
 	if _, ok := parseCGCONTRDP(modem.Response{Lines: []string{"OK"}}); ok {
 		t.Fatal("empty CGCONTRDP was accepted")
