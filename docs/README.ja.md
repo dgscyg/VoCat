@@ -68,25 +68,25 @@ Vocat は、互換性のある AT、QMI、シリアル、USB ネットワーク�
 root として(`sudo` が通常存在しない OpenWrt/Kwrt を含む):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/dev/scripts/install.sh | bash
 ```
 
 sudo を持つディストリビューションの一般ユーザーから:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/dev/scripts/install.sh | sudo bash
 ```
 
 VoCat をインストールせずに、ホストの VoWiFi/XFRM 前提条件を確認する:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | bash -s -- --check-env
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/dev/scripts/install.sh | bash -s -- --check-env
 ```
 
 特定のバージョンをインストールする:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/dev/scripts/install.sh -o install.sh
 sudo bash install.sh 0.0.2
 ```
 

@@ -68,25 +68,25 @@ Vocat 面向基於高通晶片、並暴露相容 AT、QMI、序列埠與 USB 網
 已是 root（包括預設沒有 `sudo` 的 OpenWrt/Kwrt）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/dev/scripts/install.sh | bash
 ```
 
 一般 Linux 使用者且系統裝有 sudo：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/dev/scripts/install.sh | sudo bash
 ```
 
 只檢查 VoWiFi/XFRM 環境，不安裝 VoCat：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | bash -s -- --check-env
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/dev/scripts/install.sh | bash -s -- --check-env
 ```
 
 安裝指定版本:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/dev/scripts/install.sh -o install.sh
 sudo bash install.sh 0.0.2
 ```
 

@@ -68,25 +68,25 @@ Vocat ориентирован на модули Quectel на базе Qualcomm,
 От имени root (включая OpenWrt/Kwrt, где `sudo` обычно отсутствует):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/dev/scripts/install.sh | bash
 ```
 
 От обычного пользователя в дистрибутиве с sudo:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/dev/scripts/install.sh | sudo bash
 ```
 
 Проверить предварительные требования VoWiFi/XFRM на хосте без установки VoCat:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | bash -s -- --check-env
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/dev/scripts/install.sh | bash -s -- --check-env
 ```
 
 Установить конкретную версию:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/dev/scripts/install.sh -o install.sh
 sudo bash install.sh 0.0.2
 ```
 

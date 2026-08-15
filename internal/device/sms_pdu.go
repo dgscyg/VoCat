@@ -572,7 +572,11 @@ func (cursor *pduCursor) bytes(count int) ([]byte, error) {
 }
 
 func decodeSMSPDU(raw string) (SMSMessage, error) {
-	raw = strings.ToUpper(strings.TrimSpace(raw))
+	return decodeSMSPDUWithLength(raw, 0)
+}
+
+func decodeSMSPDUWithLength(raw string, tpduLength int) (SMSMessage, error) {
+	raw = normalizeReceivedPDUHex(raw, tpduLength)
 	message := SMSMessage{
 		Direction:     SMSDirectionUnknown,
 		Encoding:      SMSEncodingUnknown,
@@ -883,6 +887,118 @@ func parseConcatHeader(header []byte) *SMSConcatInfo {
 		index += length
 	}
 	return nil
+}
+
+// normalizeReceivedPDUHex applies the same received-PDU hygiene as vodjive:
+// strip spaces, treat a header TPDU length as authoritative, accept TPDU-only
+// hex (no SMSC prefix), drop trailing modem junk, and mask unused GSM-7 bits
+// in the last user-data octet so concatenation UDH and text stay intact.
+func normalizeReceivedPDUHex(raw string, tpduLength int) string {
+	raw = strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(raw), " ", ""))
+	decoded, err := hex.DecodeString(raw)
+	if err != nil || len(decoded) == 0 {
+		return raw
+	}
+	if tpduLength > 0 && tpduLength == len(decoded) {
+		decoded = append([]byte{0}, decoded...)
+	} else if tpduLength > 0 {
+		smscLength := int(decoded[0])
+		want := 1 + smscLength + tpduLength
+		if want > 1 && want <= len(decoded) {
+			decoded = decoded[:want]
+		}
+	}
+	if len(decoded) < 2 {
+		return strings.ToUpper(hex.EncodeToString(decoded))
+	}
+	start := 1 + int(decoded[0])
+	if start <= 1 || start >= len(decoded) {
+		return strings.ToUpper(hex.EncodeToString(decoded))
+	}
+	body := decoded[start:]
+	if trimmed, ok := trimDeliverTPDUToDeclaredLength(body); ok {
+		decoded = append(append([]byte{}, decoded[:start]...), trimmed...)
+		body = decoded[start:]
+	}
+	if normalized, ok := normalizeDeliverTPDUGSM7SpareBits(body); ok {
+		decoded = append(append([]byte{}, decoded[:start]...), normalized...)
+	}
+	return strings.ToUpper(hex.EncodeToString(decoded))
+}
+
+func trimDeliverTPDUToDeclaredLength(tpduBytes []byte) ([]byte, bool) {
+	want, ok := deliverTPDUDeclaredLength(tpduBytes)
+	if !ok || want >= len(tpduBytes) {
+		return tpduBytes, false
+	}
+	return append([]byte(nil), tpduBytes[:want]...), true
+}
+
+func deliverTPDUDeclaredLength(tpduBytes []byte) (int, bool) {
+	_, _, udOffset, udOctets, ok := deliverTPDULayout(tpduBytes)
+	if !ok {
+		return 0, false
+	}
+	want := udOffset + udOctets
+	if want > len(tpduBytes) {
+		return 0, false
+	}
+	return want, true
+}
+
+func normalizeDeliverTPDUGSM7SpareBits(tpduBytes []byte) ([]byte, bool) {
+	dcs, udl, udOffset, udOctets, ok := deliverTPDULayout(tpduBytes)
+	if !ok || dcs&0x0c != 0 || udl == 0 || udOctets == 0 {
+		return tpduBytes, false
+	}
+	want := udOffset + udOctets
+	if want > len(tpduBytes) {
+		return tpduBytes, false
+	}
+	usedBits := (udl * 7) % 8
+	if usedBits == 0 {
+		return tpduBytes, false
+	}
+	mask := byte((1 << usedBits) - 1)
+	last := want - 1
+	if tpduBytes[last]&^mask == 0 {
+		return tpduBytes, false
+	}
+	out := append([]byte(nil), tpduBytes...)
+	out[last] &= mask
+	return out, true
+}
+
+func deliverTPDULayout(tpduBytes []byte) (dcs byte, udl, udOffset, udOctets int, ok bool) {
+	if len(tpduBytes) < 1 || tpduBytes[0]&0x03 != 0 {
+		return 0, 0, 0, 0, false
+	}
+	index := 1
+	if index+2 > len(tpduBytes) {
+		return 0, 0, 0, 0, false
+	}
+	oaLen := int(tpduBytes[index])
+	index += 2
+	oaOctets := (oaLen + 1) / 2
+	if index+oaOctets > len(tpduBytes) {
+		return 0, 0, 0, 0, false
+	}
+	index += oaOctets
+	if index+10 > len(tpduBytes) {
+		return 0, 0, 0, 0, false
+	}
+	dcs = tpduBytes[index+1]
+	index += 2 + 7
+	udl = int(tpduBytes[index])
+	index++
+	udOctets = udl
+	if dcs&0x0c == 0 {
+		udOctets = (udl*7 + 7) / 8
+	}
+	if index+udOctets > len(tpduBytes) {
+		return 0, 0, 0, 0, false
+	}
+	return dcs, udl, index, udOctets, true
 }
 
 func decodeSMSTimestamp(value []byte) (*time.Time, error) {

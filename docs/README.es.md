@@ -68,25 +68,25 @@ Las funciones disponibles dependen del firmware del módulo, la composición USB
 Como root (incluyendo OpenWrt/Kwrt, donde `sudo` normalmente está ausente):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/dev/scripts/install.sh | bash
 ```
 
 Desde un usuario normal en una distribución con sudo:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/dev/scripts/install.sh | sudo bash
 ```
 
 Comprobar los prerrequisitos de VoWiFi/XFRM del host sin instalar VoCat:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | bash -s -- --check-env
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/dev/scripts/install.sh | bash -s -- --check-env
 ```
 
 Instalar una versión específica:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/dev/scripts/install.sh -o install.sh
 sudo bash install.sh 0.0.2
 ```
 
