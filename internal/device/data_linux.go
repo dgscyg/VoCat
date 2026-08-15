@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"vocat/internal/modem"
@@ -69,7 +70,9 @@ func setQMINetwork(
 		return NetworkResult{}, fmt.Errorf("%w: install iproute2 to control %s", ErrDataBackendUnavailable, candidate.NetworkInterface)
 	}
 	if enabled {
-		ensureQMIRawIP(ctx, ipCommand, candidate.NetworkInterface)
+		if err := ensureQMIRawIP(ctx, ipCommand, candidate.NetworkInterface); err != nil {
+			return NetworkResult{}, err
+		}
 	}
 	action := "stop"
 	if enabled {
@@ -86,6 +89,11 @@ func setQMINetwork(
 			strings.Contains(lowerDetail, "already connected"))
 		if !idempotentStop && !idempotentStart {
 			return NetworkResult{}, fmt.Errorf("qmi-network %s failed: %w: %s", action, err, detail)
+		}
+	}
+	if enabled {
+		if err := ensureQMIRawIP(ctx, ipCommand, candidate.NetworkInterface); err != nil {
+			return NetworkResult{}, err
 		}
 	}
 	linkAction := "down"
@@ -134,9 +142,9 @@ func exportProxyRouteIdentity(networkInterface string) (mark uint32, table, prio
 	value := hash.Sum32()
 	mark = 0x56000000 | (value & 0x00ffffff)
 	table = 20000 + int(value%10000)
-	// Stay below Clash/tun rules (often pref 9000) so marked sockets are not
-	// stolen before they reach the protected cellular table.
-	priority = 60 + int(value%40)
+	// fwmark-only, so priority 1 stays after "lookup local" and still beats
+	// Clash/tun catch-all rules that commonly sit at 100–9000.
+	priority = 1
 	return
 }
 
@@ -154,11 +162,21 @@ func bringUpExportProxyInterface(ctx context.Context, candidate modem.Candidate,
 	if err != nil {
 		return "", fmt.Errorf("%w: install iproute2 to control %s", ErrDataBackendUnavailable, networkInterface)
 	}
-	ensureQMIRawIP(ctx, ipCommand, networkInterface)
+	if err := ensureQMIRawIP(ctx, ipCommand, networkInterface); err != nil {
+		return "", err
+	}
 	if result, linkErr := exec.CommandContext(ctx, ipCommand, "link", "set", "dev", networkInterface, "up").CombinedOutput(); linkErr != nil {
 		return "", wrapCellularData(fmt.Errorf("set %s up: %w: %s", networkInterface, linkErr, strings.TrimSpace(string(result))))
 	}
 	waitForInterface(ctx, networkInterface, 3*time.Second)
+	if err := ensureQMIRawIP(ctx, ipCommand, networkInterface); err != nil {
+		return "", err
+	}
+	if qmiRawIPEnabled(networkInterface) {
+		if result, linkErr := exec.CommandContext(ctx, ipCommand, "link", "set", "dev", networkInterface, "up").CombinedOutput(); linkErr != nil {
+			return "", wrapCellularData(fmt.Errorf("set %s up after raw_ip: %w: %s", networkInterface, linkErr, strings.TrimSpace(string(result))))
+		}
+	}
 	lease, source, err := obtainCellularLeaseWithRetry(ctx, candidate, atClient, sources, 6*time.Second)
 	if err != nil {
 		return "", wrapCellularData(err)
@@ -381,13 +399,17 @@ func applyCellularLease(ctx context.Context, ipCommand, networkInterface string,
 	if result, routeErr := exec.CommandContext(ctx, ipCommand, "-4", "route", "replace", "table", strconv.Itoa(table), connectedCIDR, "dev", networkInterface, "scope", "link", "src", lease.Address.String()).CombinedOutput(); routeErr != nil {
 		return fmt.Errorf("install protected connected route: %w: %s", routeErr, strings.TrimSpace(string(result)))
 	}
-	nextHop := lease.nextHop()
-	if err := installCellularDefault(ctx, ipCommand, networkInterface, nextHop, strconv.Itoa(table), ""); err != nil {
-		return err
+	rawIP := qmiRawIPEnabled(networkInterface)
+	if rawIP {
+		prepareRawIPLink(ctx, ipCommand, networkInterface)
 	}
-	// BINDTODEVICE can ignore policy tables and only see this interface's main
-	// routes. A high-metric default keeps eth0 as the host default.
-	if err := installCellularDefault(ctx, ipCommand, networkInterface, nextHop, "", strconv.Itoa(cellularMainMetric)); err != nil {
+	nextHop := lease.nextHop()
+	if rawIP {
+		// raw-ip has no Ethernet ARP. "via <peer> onlink" makes TCP connect()
+		// fail with EHOSTUNREACH even when `ip route get oif` looks correct.
+		nextHop = nil
+	}
+	if err := installCellularDefaults(ctx, ipCommand, networkInterface, nextHop, table); err != nil {
 		return err
 	}
 	markText := fmt.Sprintf("0x%x", mark)
@@ -406,7 +428,19 @@ func applyCellularLease(ctx context.Context, ipCommand, networkInterface string,
 	if err := verifyMarkedCellularRoute(ctx, ipCommand, networkInterface, lease.Address, markText); err != nil {
 		return err
 	}
+	if err := ensureBoundCellularPath(ctx, ipCommand, networkInterface, nextHop, table, mark); err != nil {
+		return err
+	}
 	return nil
+}
+
+func installCellularDefaults(ctx context.Context, ipCommand, networkInterface string, nextHop net.IP, table int) error {
+	if err := installCellularDefault(ctx, ipCommand, networkInterface, nextHop, strconv.Itoa(table), ""); err != nil {
+		return err
+	}
+	// BINDTODEVICE can ignore policy tables and only see this interface's main
+	// routes. A high-metric default keeps eth0 as the host default.
+	return installCellularDefault(ctx, ipCommand, networkInterface, nextHop, "", strconv.Itoa(cellularMainMetric))
 }
 
 const cellularMainMetric = 25000
@@ -417,9 +451,10 @@ func installCellularDefault(ctx context.Context, ipCommand, networkInterface str
 		args = []string{"-4", "route", "replace", "table", table, "default"}
 	}
 	if nextHop != nil {
-		args = append(args, "via", nextHop.String())
+		args = append(args, "via", nextHop.String(), "dev", networkInterface, "onlink")
+	} else {
+		args = append(args, "dev", networkInterface)
 	}
-	args = append(args, "dev", networkInterface, "onlink")
 	if metric != "" {
 		args = append(args, "metric", metric)
 	}
@@ -446,20 +481,124 @@ func verifyMarkedCellularRoute(ctx context.Context, ipCommand, networkInterface 
 	return nil
 }
 
-func ensureQMIRawIP(ctx context.Context, ipCommand, networkInterface string) {
+func qmiRawIPEnabled(networkInterface string) bool {
 	if !safeSysfsInterfaceName(networkInterface) {
-		return
+		return false
+	}
+	current, err := os.ReadFile("/sys/class/net/" + networkInterface + "/qmi/raw_ip")
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(string(current)), "Y")
+}
+
+func prepareRawIPLink(ctx context.Context, ipCommand, networkInterface string) {
+	_, _ = exec.CommandContext(ctx, ipCommand, "link", "set", "dev", networkInterface, "arp", "off").CombinedOutput()
+	if safeSysfsInterfaceName(networkInterface) {
+		_ = os.WriteFile("/proc/sys/net/ipv4/conf/"+networkInterface+"/rp_filter", []byte("2\n"), 0o644)
+	}
+}
+
+func ensureBoundCellularPath(ctx context.Context, ipCommand, networkInterface string, nextHop net.IP, table int, mark uint32) error {
+	err := probeBoundCellularTCP(ctx, networkInterface, mark)
+	if err == nil || !isNoRouteError(err) {
+		return nil
+	}
+	prepareRawIPLink(ctx, ipCommand, networkInterface)
+	if nextHop != nil {
+		if instErr := installCellularDefaults(ctx, ipCommand, networkInterface, nil, table); instErr != nil {
+			return instErr
+		}
+		if retry := probeBoundCellularTCP(ctx, networkInterface, mark); retry == nil || !isNoRouteError(retry) {
+			return nil
+		}
+	}
+	if bindOnly := probeBoundCellularTCP(ctx, networkInterface, 0); bindOnly == nil {
+		return fmt.Errorf("bound TCP out %s works without SO_MARK; a higher-priority policy rule is stealing marked sockets: %w", networkInterface, err)
+	}
+	return fmt.Errorf("bound TCP out %s has no usable route: %w", networkInterface, err)
+}
+
+func probeBoundCellularTCP(ctx context.Context, networkInterface string, mark uint32) error {
+	dialer := net.Dialer{
+		Timeout: 4 * time.Second,
+		Control: func(_, _ string, raw syscall.RawConn) error {
+			var bindError error
+			controlErr := raw.Control(func(fd uintptr) {
+				if mark != 0 {
+					if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, int(mark)); err != nil {
+						bindError = err
+						return
+					}
+				}
+				bindError = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, networkInterface)
+			})
+			if controlErr != nil {
+				return controlErr
+			}
+			return bindError
+		},
+	}
+	var last error
+	for _, address := range []string{"1.1.1.1:443", "8.8.8.8:53"} {
+		probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		conn, err := dialer.DialContext(probeCtx, "tcp4", address)
+		cancel()
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		last = err
+		if isNoRouteError(err) {
+			return err
+		}
+	}
+	return last
+}
+
+func isNoRouteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) && (errno == syscall.EHOSTUNREACH || errno == syscall.ENETUNREACH) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "no route to host") || strings.Contains(message, "network is unreachable")
+}
+
+func ensureQMIRawIP(ctx context.Context, ipCommand, networkInterface string) error {
+	if !safeSysfsInterfaceName(networkInterface) {
+		return nil
 	}
 	path := "/sys/class/net/" + networkInterface + "/qmi/raw_ip"
 	current, err := os.ReadFile(path)
 	if err != nil {
-		return
+		return nil
 	}
 	if strings.EqualFold(strings.TrimSpace(string(current)), "Y") {
-		return
+		prepareRawIPLink(ctx, ipCommand, networkInterface)
+		return nil
 	}
-	_, _ = exec.CommandContext(ctx, ipCommand, "link", "set", "dev", networkInterface, "down").CombinedOutput()
-	_ = os.WriteFile(path, []byte("Y\n"), 0o644)
+	// The kernel ignores writes while the netdev is up, so RX stays at 0
+	// (ethernet frames never match the modem's raw IP packets).
+	if result, downErr := exec.CommandContext(ctx, ipCommand, "link", "set", "dev", networkInterface, "down").CombinedOutput(); downErr != nil {
+		return fmt.Errorf("set %s down to enable qmi raw_ip: %w: %s", networkInterface, downErr, strings.TrimSpace(string(result)))
+	}
+	if err := os.WriteFile(path, []byte("Y\n"), 0o644); err != nil {
+		return fmt.Errorf("write %s qmi/raw_ip: %w", networkInterface, err)
+	}
+	current, err = os.ReadFile(path)
+	if err != nil || !strings.EqualFold(strings.TrimSpace(string(current)), "Y") {
+		value := strings.TrimSpace(string(current))
+		if err != nil {
+			value = err.Error()
+		}
+		return fmt.Errorf("failed to set %s qmi/raw_ip=Y (now %q); the modem will transmit but never receive", networkInterface, value)
+	}
+	prepareRawIPLink(ctx, ipCommand, networkInterface)
+	return nil
 }
 
 func waitForInterface(ctx context.Context, networkInterface string, timeout time.Duration) {
