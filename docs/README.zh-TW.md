@@ -68,25 +68,25 @@ Vocat 面向基於高通晶片、並暴露相容 AT、QMI、序列埠與 USB 網
 已是 root（包括預設沒有 `sudo` 的 OpenWrt/Kwrt）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | bash
 ```
 
 一般 Linux 使用者且系統裝有 sudo：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | sudo bash
 ```
 
 只檢查 VoWiFi/XFRM 環境，不安裝 VoCat：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh | bash -s -- --check-env
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | bash -s -- --check-env
 ```
 
 安裝指定版本:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh -o install.sh
 sudo bash install.sh 0.0.2
 ```
 
@@ -181,7 +181,7 @@ Vocat 先從 `VOCAT_CONFIG` 讀取可選的 JSON 配置檔,再套用 `VOCAT_*` �
 | `VOCAT_SECURE_COOKIES` | `false` | 在使用 HTTPS 時將工作階段 Cookie 標記為安全。 |
 | `VOCAT_SHUTDOWN_TIMEOUT` | `10s` | 優雅關閉逾時時間。 |
 | `VOCAT_MAX_REQUEST_BODY_BYTES` | `1048576` | API 請求主體最大位元組數。 |
-| `VOCAT_REPO` | `MengMengCode/VoCat` | 自我更新器使用的受信任 GitHub 倉庫,格式為 `owner/name`。 |
+| `VOCAT_REPO` | `dgscyg/VoCat` | 自我更新器使用的受信任 GitHub 倉庫,格式為 `owner/name`。 |
 | `GITHUB_TOKEN` | 空 | 可選的 GitHub token,用於私有倉庫或更高的 API 限額。 |
 
 請勿將 Telegram token、SMTP 密碼、Webhook 金鑰、SIM 憑證或其他私密資料存放在倉庫中。請透過應用設定或受保護的環境檔來配置它們。
@@ -205,13 +205,13 @@ Vocat 先從 `VOCAT_CONFIG` 讀取可選的 JSON 配置檔,再套用 `VOCAT_*` �
 檢查是否有更新的 GitHub Release:
 
 ```bash
-vocat update --check --repo MengMengCode/VoCat
+vocat update --check --repo dgscyg/VoCat
 ```
 
 安裝最新發佈版:
 
 ```bash
-sudo vocat update --repo MengMengCode/VoCat
+sudo vocat update --repo dgscyg/VoCat
 ```
 
 更新器會下載與目前 Linux 架構匹配的二進位檔,使用已發佈的 `SHA256SUMS` 進行校驗,原子性地替換可執行檔,並在可用時重新啟動 `vocat` systemd 服務。
@@ -322,4 +322,4 @@ cd web && npm run build
 
 參見 [LICENSE](../LICENSE)。
 
-[![MengMengCode/VoCat Star History](https://mengmeng.meteor-history.com/api/embed/MengMengCode/VoCat.svg?sig=sdeXRVxAoY3yLWgXL7JViY2USYIN3t9neJ6ScPvgUAo&theme=light&style=xkcd&color=dd4528&background=ffffff&textColor=000000&width=900&height=600&lineWidth=3&showTitle=true&showLegend=true&showDots=false&v=0.0.14)](https://meteor-history.com)
+[![GitHub stars](https://img.shields.io/github/stars/dgscyg/VoCat)](https://github.com/dgscyg/VoCat)

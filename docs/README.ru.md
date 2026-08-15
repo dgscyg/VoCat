@@ -68,25 +68,25 @@ Vocat ориентирован на модули Quectel на базе Qualcomm,
 От имени root (включая OpenWrt/Kwrt, где `sudo` обычно отсутствует):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | bash
 ```
 
 От обычного пользователя в дистрибутиве с sudo:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | sudo bash
 ```
 
 Проверить предварительные требования VoWiFi/XFRM на хосте без установки VoCat:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh | bash -s -- --check-env
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | bash -s -- --check-env
 ```
 
 Установить конкретную версию:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh -o install.sh
 sudo bash install.sh 0.0.2
 ```
 
@@ -198,7 +198,7 @@ Vocat читает необязательный JSON-файл конфигура
 | `VOCAT_SECURE_COOKIES` | `false` | Помечает cookie сессии как безопасные при использовании HTTPS. |
 | `VOCAT_SHUTDOWN_TIMEOUT` | `10s` | Тайм-аут корректного завершения работы. |
 | `VOCAT_MAX_REQUEST_BODY_BYTES` | `1048576` | Максимальный размер тела запроса API. |
-| `VOCAT_REPO` | `MengMengCode/VoCat` | Доверенный репозиторий GitHub, используемый самообновлятором, в формате `owner/name`. |
+| `VOCAT_REPO` | `dgscyg/VoCat` | Доверенный репозиторий GitHub, используемый самообновлятором, в формате `owner/name`. |
 | `GITHUB_TOKEN` | пусто | Необязательный токен GitHub для приватных репозиториев или более высоких лимитов API. |
 
 Не храните токены Telegram, пароли SMTP, секреты вебхуков, учётные данные SIM или другие приватные данные в репозитории. Настраивайте их через параметры приложения или защищённые файлы окружения.
@@ -222,13 +222,13 @@ Vocat читает необязательный JSON-файл конфигура
 Проверить наличие более нового GitHub Release:
 
 ```bash
-vocat update --check --repo MengMengCode/VoCat
+vocat update --check --repo dgscyg/VoCat
 ```
 
 Установить последний релиз:
 
 ```bash
-sudo vocat update --repo MengMengCode/VoCat
+sudo vocat update --repo dgscyg/VoCat
 ```
 
 Обновлятор загружает бинарный файл, соответствующий текущей архитектуре Linux, проверяет его по опубликованному `SHA256SUMS`, атомарно заменяет исполняемый файл и перезапускает сервис systemd `vocat`, когда он доступен.
@@ -339,4 +339,4 @@ cd web && npm run build
 
 См. [LICENSE](../LICENSE).
 
-[![MengMengCode/VoCat Star History](https://mengmeng.meteor-history.com/api/embed/MengMengCode/VoCat.svg?sig=sdeXRVxAoY3yLWgXL7JViY2USYIN3t9neJ6ScPvgUAo&theme=light&style=xkcd&color=dd4528&background=ffffff&textColor=000000&width=900&height=600&lineWidth=3&showTitle=true&showLegend=true&showDots=false&v=0.0.14)](https://meteor-history.com)
+[![GitHub stars](https://img.shields.io/github/stars/dgscyg/VoCat)](https://github.com/dgscyg/VoCat)

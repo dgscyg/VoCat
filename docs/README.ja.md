@@ -68,25 +68,25 @@ Vocat は、互換性のある AT、QMI、シリアル、USB ネットワーク�
 root として(`sudo` が通常存在しない OpenWrt/Kwrt を含む):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | bash
 ```
 
 sudo を持つディストリビューションの一般ユーザーから:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | sudo bash
 ```
 
 VoCat をインストールせずに、ホストの VoWiFi/XFRM 前提条件を確認する:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh | bash -s -- --check-env
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | bash -s -- --check-env
 ```
 
 特定のバージョンをインストールする:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh -o install.sh
 sudo bash install.sh 0.0.2
 ```
 
@@ -181,7 +181,7 @@ Vocat は `VOCAT_CONFIG` からオプションの JSON 設定ファイルを読�
 | `VOCAT_SECURE_COOKIES` | `false` | HTTPS 使用時にセッション Cookie をセキュアとしてマークします。 |
 | `VOCAT_SHUTDOWN_TIMEOUT` | `10s` | グレースフルシャットダウンのタイムアウト。 |
 | `VOCAT_MAX_REQUEST_BODY_BYTES` | `1048576` | API リクエストボディの最大サイズ。 |
-| `VOCAT_REPO` | `MengMengCode/VoCat` | 自己更新機能が使用する信頼された GitHub リポジトリ(`owner/name` 形式)。 |
+| `VOCAT_REPO` | `dgscyg/VoCat` | 自己更新機能が使用する信頼された GitHub リポジトリ(`owner/name` 形式)。 |
 | `GITHUB_TOKEN` | 空 | プライベートリポジトリやより高い API レート制限のためのオプションの GitHub トークン。 |
 
 Telegram トークン、SMTP パスワード、Webhook シークレット、SIM 認証情報、その他のプライベートデータをリポジトリに保存しないでください。アプリケーション設定または保護された環境ファイルを通じて設定してください。
@@ -205,13 +205,13 @@ Telegram 通知が有効で、Chat ID と Admin ID の両方が設定されて�
 より新しい GitHub Release を確認する:
 
 ```bash
-vocat update --check --repo MengMengCode/VoCat
+vocat update --check --repo dgscyg/VoCat
 ```
 
 最新リリースをインストールする:
 
 ```bash
-sudo vocat update --repo MengMengCode/VoCat
+sudo vocat update --repo dgscyg/VoCat
 ```
 
 アップデーターは、現在の Linux アーキテクチャに一致するバイナリをダウンロードし、公開された `SHA256SUMS` で検証し、実行ファイルをアトミックに置き換え、利用可能な場合は `vocat` systemd サービスを再起動します。
@@ -322,4 +322,4 @@ cd web && npm run build
 
 [LICENSE](../LICENSE) を参照してください。
 
-[![MengMengCode/VoCat Star History](https://mengmeng.meteor-history.com/api/embed/MengMengCode/VoCat.svg?sig=sdeXRVxAoY3yLWgXL7JViY2USYIN3t9neJ6ScPvgUAo&theme=light&style=xkcd&color=dd4528&background=ffffff&textColor=000000&width=900&height=600&lineWidth=3&showTitle=true&showLegend=true&showDots=false&v=0.0.14)](https://meteor-history.com)
+[![GitHub stars](https://img.shields.io/github/stars/dgscyg/VoCat)](https://github.com/dgscyg/VoCat)

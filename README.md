@@ -68,25 +68,25 @@ Available features depend on the module firmware, USB composition, SIM/eSIM capa
 As root (including OpenWrt/Kwrt, where `sudo` is normally absent):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | bash
 ```
 
 From a normal user on a distribution with sudo:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | sudo bash
 ```
 
 Check the host's VoWiFi/XFRM prerequisites without installing VoCat:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh | bash -s -- --check-env
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | bash -s -- --check-env
 ```
 
 Install a specific version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh -o install.sh
 sudo bash install.sh 0.0.2
 ```
 
@@ -209,7 +209,7 @@ Vocat reads an optional JSON configuration file from `VOCAT_CONFIG`, then applie
 | `VOCAT_SECURE_COOKIES` | `false` | Marks session cookies as secure when HTTPS is used. |
 | `VOCAT_SHUTDOWN_TIMEOUT` | `10s` | Graceful shutdown timeout. |
 | `VOCAT_MAX_REQUEST_BODY_BYTES` | `1048576` | Maximum API request body size. |
-| `VOCAT_REPO` | `MengMengCode/VoCat` | Trusted GitHub repository used by the self-updater, in `owner/name` form. |
+| `VOCAT_REPO` | `dgscyg/VoCat` | Trusted GitHub repository used by the self-updater, in `owner/name` form. |
 | `GITHUB_TOKEN` | empty | Optional GitHub token for private repositories or higher API limits. |
 
 Administrator credentials are stored only in SQLite. Initialize an empty
@@ -237,13 +237,13 @@ Profile switching and SMS submission use one-time confirmation buttons. The bot 
 Check for a newer GitHub Release:
 
 ```bash
-vocat update --check --repo MengMengCode/VoCat
+vocat update --check --repo dgscyg/VoCat
 ```
 
 Install the latest release:
 
 ```bash
-sudo vocat update --repo MengMengCode/VoCat
+sudo vocat update --repo dgscyg/VoCat
 ```
 
 The updater downloads the binary matching the current Linux architecture, verifies it with the published `SHA256SUMS`, replaces the executable atomically, and restarts the `vocat` systemd service when available.
@@ -354,4 +354,4 @@ cd web && npm run build
 
 See [LICENSE](LICENSE).
 
-[![MengMengCode/VoCat Star History](https://mengmeng.meteor-history.com/api/embed/MengMengCode/VoCat.svg?sig=sdeXRVxAoY3yLWgXL7JViY2USYIN3t9neJ6ScPvgUAo&theme=light&style=xkcd&color=dd4528&background=ffffff&textColor=000000&width=900&height=600&lineWidth=3&showTitle=true&showLegend=true&showDots=false&v=0.0.14)](https://meteor-history.com)
+[![GitHub stars](https://img.shields.io/github/stars/dgscyg/VoCat)](https://github.com/dgscyg/VoCat)
