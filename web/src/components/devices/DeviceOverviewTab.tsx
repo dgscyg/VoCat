@@ -27,7 +27,7 @@ export function DeviceOverviewTab(props: DeviceOverviewTabProps) {
   const [operatorOpen, setOperatorOpen] = useState(false);
   const { device } = props;
 	const wifiCallingOnly = device.deviceType === "usb_sim_reader";
-	const showNetworkDetails = !!device.developerEnabled && !wifiCallingOnly;
+	const showNetworkDetails = !wifiCallingOnly;
   return (
     <div className="space-y-4">
       <div className={`grid grid-cols-1 gap-4 ${showNetworkDetails ? "lg:grid-cols-3" : "lg:grid-cols-2"}`}>
@@ -54,7 +54,7 @@ export function DeviceOverviewTab(props: DeviceOverviewTabProps) {
           trafficSpeedTx={props.trafficSpeedTx}
 		/> : null}
       </div>
-      {device.developerEnabled && device.networkEnabled && device.id ? <OverviewTrafficChart deviceId={device.id} /> : null}
+      {showNetworkDetails && device.networkEnabled && device.id ? <OverviewTrafficChart deviceId={device.id} /> : null}
 	  {device?.id && !wifiCallingOnly ? (
         <OperatorSelectionDialog
           open={operatorOpen}

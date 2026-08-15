@@ -139,9 +139,6 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 		if err := developer.ResetExperimental(startupContext, database); err != nil {
 			return fmt.Errorf("reset disabled developer settings: %w", err)
 		}
-		if err := exportproxy.RemoveLegacyConfig(legacyExportProxyConfig); err != nil {
-			return fmt.Errorf("remove legacy export proxy configuration: %w", err)
-		}
 	}
 	httpsManager, err := httpsmode.New(
 		startupContext,
@@ -153,18 +150,20 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 		return fmt.Errorf("configure self-signed HTTPS: %w", err)
 	}
 
+	// Export proxy is a first-class feature: listeners bind to each modem's
+	// cellular interface and must start even when developer mode is off.
+	exportProxyManager, err := exportproxy.New(startupContext, database, logger, legacyExportProxyConfig)
+	if err != nil {
+		return fmt.Errorf("create built-in export proxy: %w", err)
+	}
+	defer exportProxyManager.Close()
+
 	// The plugin/extension system is gated behind a hidden developer-mode flag.
 	// When off (the default) the manager is never created and the server receives
 	// a nil Extensions handle, so every /extensions* and /plugin-assets/* route
 	// returns 503/404 and the SPA hides the plugin surface.
 	var extensionManager *extensions.Manager
-	var exportProxyManager *exportproxy.Manager
 	if developerEnabled {
-		exportProxyManager, err = exportproxy.New(startupContext, database, logger, legacyExportProxyConfig)
-		if err != nil {
-			return fmt.Errorf("create built-in export proxy: %w", err)
-		}
-		defer exportProxyManager.Close()
 		extensionManager, err = extensions.NewManager(
 			pluginRoot,
 			logger,
@@ -216,10 +215,8 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	go restoreConfiguredCellularData(pollContext, logger, database, deviceManager)
 	go collectCellularTraffic(pollContext, logger, database)
 	go persistLogsToStore(pollContext, logger, logs, database)
-	if !developerEnabled {
-		go disableAllDeveloperCellularData(pollContext, logger, database, deviceManager)
-	} else {
-		go watchDeveloperDisable(pollContext, logger, database, deviceManager, exportProxyManager, legacyExportProxyConfig)
+	if developerEnabled {
+		go watchDeveloperDisable(pollContext, logger, database)
 	}
 
 	vowifiManager, err := configureVoWiFiRuntime(
@@ -489,42 +486,10 @@ func restoreConfiguredCellularData(
 	}
 }
 
-func disableAllDeveloperCellularData(
-	ctx context.Context,
-	logger *slog.Logger,
-	database *store.Store,
-	manager *device.Manager,
-) {
-	configs, err := database.ListDevices(ctx)
-	if err != nil {
-		logger.Warn("developer cleanup: list devices", "error", err)
-		return
-	}
-	mapper := integration.ATMapper{Store: database, Devices: manager}
-	for _, config := range configs {
-		if config.DeviceType == store.DeviceTypeUSBSIMReader {
-			continue
-		}
-		entry, err := mapper.Get(config.ID)
-		if err != nil {
-			continue
-		}
-		disableContext, cancel := context.WithTimeout(ctx, 30*time.Second)
-		_, err = manager.SetNetwork(disableContext, entry.ID, device.NetworkRequest{Enabled: false, Backend: config.DeviceBackend})
-		cancel()
-		if err != nil && ctx.Err() == nil {
-			logger.Warn("developer cleanup: stop cellular data", "device_id", config.ID)
-		}
-	}
-}
-
 func watchDeveloperDisable(
 	ctx context.Context,
 	logger *slog.Logger,
 	database *store.Store,
-	manager *device.Manager,
-	exportProxy *exportproxy.Manager,
-	legacyConfigPath string,
 ) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -536,19 +501,10 @@ func watchDeveloperDisable(
 			if developer.Enabled(ctx, database) {
 				continue
 			}
-			if exportProxy != nil {
-				if err := exportProxy.DeleteAllAndDisable(ctx); err != nil && ctx.Err() == nil {
-					logger.Warn("developer cleanup: delete export proxies", "error", err)
-				}
-			}
-			if err := exportproxy.RemoveLegacyConfig(legacyConfigPath); err != nil {
-				logger.Warn("developer cleanup: remove legacy export proxy configuration", "error", err)
-			}
 			if err := developer.ResetExperimental(ctx, database); err != nil && ctx.Err() == nil {
 				logger.Warn("developer cleanup: reset settings", "error", err)
 			}
-			disableAllDeveloperCellularData(ctx, logger, database, manager)
-			logger.Info("developer mode disabled; roaming data and export proxies were removed")
+			logger.Info("developer mode disabled; experimental plugin settings were reset")
 			return
 		}
 	}

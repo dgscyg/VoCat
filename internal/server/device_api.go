@@ -244,9 +244,6 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) bool {
 		// restored by the user's later airplane-mode-off action.
 		config.VoWiFiEnabled = true
 		config.NetworkEnabled = false
-		if !s.developerActive(r.Context()) {
-			config.NetworkEnabled = false
-		}
 		fillConfigFromPhysical(&config, *selected)
 		if pinSetter, ok := s.devices.(interface{ SetSIMPin(string, string) error }); ok {
 			if err := pinSetter.SetSIMPin(selected.ID, config.SIMPIN); err != nil {
@@ -459,14 +456,12 @@ func (s *Server) handleDevicePath(
 				return true
 			}
 			next := payload.toStoreDevice()
-			if !s.developerActive(r.Context()) {
-				next.NetworkEnabled = false
-			}
 			next.ID = id
 			next.CreatedAt = config.CreatedAt
-			// VoWiFi/airplane transitions are transactional device actions. A
-			// general config save must not silently bypass their RF-safe ordering.
+			// VoWiFi/airplane/roaming transitions are transactional device
+			// actions. A general config save must not silently bypass them.
 			next.VoWiFiEnabled = config.VoWiFiEnabled
+			next.NetworkEnabled = config.NetworkEnabled
 			if next.Name == id && strings.TrimSpace(payload.Name) == "" {
 				next.Name = config.Name
 			}
@@ -1232,10 +1227,6 @@ func (s *Server) handleCellularData(
 	config store.Device,
 	physicalID string,
 ) bool {
-	if !s.developerActive(r.Context()) {
-		writeError(w, http.StatusForbidden, "developer_mode_required", "roaming data is available only in developer mode")
-		return true
-	}
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{
@@ -1571,7 +1562,6 @@ func (s *Server) configuredDeviceOverview(
 	entry device.Device,
 	present bool,
 ) map[string]any {
-	developerActive := s.developerActive(context.Background())
 	var physical *device.Device
 	if present {
 		physical = &entry
@@ -1586,14 +1576,14 @@ func (s *Server) configuredDeviceOverview(
 	result["control_device"] = config.ControlDevice
 	result["esim_transport"] = config.ESIMTransport
 	result["sms_enabled"] = config.SMSEnabled
-	result["network_enabled"] = developerActive && config.NetworkEnabled
+	result["network_enabled"] = config.NetworkEnabled
 	result["vowifi_enabled"] = config.VoWiFiEnabled
 	result["radio_live_ok"] = present && entry.Snapshot != nil && entry.Snapshot.Responsive
 
 	// Live network state: on-demand sample of the cellular interface counters,
 	// kept warm by the 2s overview SSE cadence. Only meaningful when the modem
 	// data path is enabled and an interface is configured.
-	if developerActive && config.NetworkEnabled && strings.TrimSpace(config.Interface) != "" {
+	if config.NetworkEnabled && strings.TrimSpace(config.Interface) != "" {
 		live := s.netTraffic.sample(config.ID, config.Interface, time.Now())
 		result["private_ip"] = live.ipv4
 		result["traffic"] = map[string]string{

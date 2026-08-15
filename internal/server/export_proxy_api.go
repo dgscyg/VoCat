@@ -14,8 +14,8 @@ func (s *Server) routeExportProxyAPI(w http.ResponseWriter, r *http.Request, cle
 	if cleanPath != "export-proxies" && !strings.HasPrefix(cleanPath, "export-proxies/") {
 		return false
 	}
-	if !s.developerActive(r.Context()) || s.exportProxy == nil {
-		writeError(w, http.StatusForbidden, "developer_mode_required", "Export Proxy is available only in developer mode")
+	if s.exportProxy == nil {
+		writeError(w, http.StatusServiceUnavailable, "export_proxy_unavailable", "Export Proxy is not available")
 		return true
 	}
 
@@ -114,7 +114,7 @@ func (s *Server) rejectUnsupportedExportProxyDevice(w http.ResponseWriter, ctx c
 func (s *Server) writeExportProxyError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, exportproxy.ErrDisabled):
-		writeError(w, http.StatusForbidden, "developer_mode_required", "Export Proxy is disabled")
+		writeError(w, http.StatusServiceUnavailable, "export_proxy_unavailable", "Export Proxy is disabled")
 	case errors.Is(err, exportproxy.ErrNotFound):
 		writeError(w, http.StatusNotFound, "export_proxy_not_found", err.Error())
 	default:

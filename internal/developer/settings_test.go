@@ -3,7 +3,6 @@ package developer
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"path/filepath"
 	"testing"
 
@@ -58,15 +57,15 @@ func TestResetExperimentalRestoresDefaults(t *testing.T) {
 		t.Fatalf("HTTPS setting = %s, error = %v", setting.Value, err)
 	}
 	device, err := database.Device(ctx, "modem-1")
-	if err != nil || device.NetworkEnabled {
-		t.Fatalf("device roaming data was not disabled: %+v, %v", device, err)
+	if err != nil || !device.NetworkEnabled {
+		t.Fatalf("device roaming data should survive ResetExperimental: %+v, %v", device, err)
 	}
 	policy, err := database.CardPolicy(ctx, "8901000000000000001")
-	if err != nil || policy.NetworkEnabled {
-		t.Fatalf("card roaming policy was not disabled: %+v, %v", policy, err)
+	if err != nil || !policy.NetworkEnabled {
+		t.Fatalf("card roaming policy should survive ResetExperimental: %+v, %v", policy, err)
 	}
-	if _, err := database.AppSetting(ctx, exportproxy.SettingKey); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("export proxy configurations were not deleted: %v", err)
+	if _, err := database.AppSetting(ctx, exportproxy.SettingKey); err != nil {
+		t.Fatalf("export proxy configurations should survive ResetExperimental: %v", err)
 	}
 }
 

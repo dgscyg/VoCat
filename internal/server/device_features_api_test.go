@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"vocat/internal/developer"
 	"vocat/internal/device"
 	"vocat/internal/exportproxy"
 	"vocat/internal/modem"
@@ -667,17 +666,11 @@ func TestHandleOverviewStreamReflectsConfigChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	if err := database.UpsertAppSetting(ctx, store.AppSetting{
-		Key:   developer.EnabledSettingKey,
-		Value: []byte(`{"enabled":true}`),
-	}); err != nil {
-		t.Fatal(err)
-	}
 	if err := database.UpsertDevice(ctx, store.Device{ID: "dev1", Name: "Test device", NetworkEnabled: true}); err != nil {
 		t.Fatal(err)
 	}
 
-	server := &Server{store: database, logger: regionTestLogger(), developerEnabled: true}
+	server := &Server{store: database, logger: regionTestLogger()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
 		config, err := database.Device(r.Context(), "dev1")
@@ -735,11 +728,6 @@ func TestHandleCellularDataRejectsDisableWhileExportProxyActive(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	if err := database.UpsertAppSetting(ctx, store.AppSetting{
-		Key: developer.EnabledSettingKey, Value: json.RawMessage(`{"enabled":true}`),
-	}); err != nil {
-		t.Fatal(err)
-	}
 	deviceConfig := store.Device{ID: "modem-1", Name: "modem-1", Interface: "wwan0", NetworkEnabled: true}
 	if err := database.UpsertDevice(ctx, deviceConfig); err != nil {
 		t.Fatal(err)
@@ -765,7 +753,6 @@ func TestHandleCellularDataRejectsDisableWhileExportProxyActive(t *testing.T) {
 	server := &Server{
 		store:               database,
 		logger:              regionTestLogger(),
-		developerEnabled:    true,
 		exportProxy:         proxyManager,
 		devices:             fakeDeviceController{},
 		maxRequestBodyBytes: 1 << 20,
@@ -826,5 +813,22 @@ func TestHandleCellularDataRejectsDisableWhileExportProxyActive(t *testing.T) {
 	}
 	if stored.NetworkEnabled {
 		t.Fatal("roaming data was not turned off after the export proxy was disabled")
+	}
+}
+
+func TestHandleCellularDataAvailableWithoutDeveloperMode(t *testing.T) {
+	server := &Server{logger: regionTestLogger()}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/devices/modem-1/network", nil)
+	config := store.Device{ID: "modem-1", Name: "EC20", Interface: "wwan0", NetworkEnabled: true, APN: "internet"}
+	if !server.handleCellularData(recorder, request, config, "physical-1") {
+		t.Fatal("handleCellularData did not handle the request")
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body)
+	}
+	data := decodeData(t, recorder)
+	if data["enabled"] != true || data["interface"] != "wwan0" {
+		t.Fatalf("cellular data = %#v", data)
 	}
 }
