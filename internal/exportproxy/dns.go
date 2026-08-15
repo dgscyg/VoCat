@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 )
@@ -172,4 +174,33 @@ func decodeDNSName(payload []byte, offset int) (int, string, error) {
 		}
 	}
 	return 0, "", errors.New("dns name pointer loop")
+}
+
+func decodeDNSJSON(reader io.Reader) ([]net.IP, error) {
+	var response struct {
+		Status int `json:"Status"`
+		Answer []struct {
+			Type int    `json:"type"`
+			Data string `json:"data"`
+		} `json:"Answer"`
+	}
+	if err := json.NewDecoder(reader).Decode(&response); err != nil {
+		return nil, fmt.Errorf("decode dns json: %w", err)
+	}
+	if response.Status != 0 {
+		return nil, fmt.Errorf("dns json status %d", response.Status)
+	}
+	var ips []net.IP
+	for _, answer := range response.Answer {
+		if answer.Type != 1 {
+			continue
+		}
+		if ip := net.ParseIP(strings.TrimSpace(answer.Data)).To4(); ip != nil {
+			ips = append(ips, ip)
+		}
+	}
+	if len(ips) == 0 {
+		return nil, errors.New("dns json contained no A records")
+	}
+	return ips, nil
 }

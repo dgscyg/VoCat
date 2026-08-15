@@ -36,6 +36,7 @@ func LookupPublicIP(ctx context.Context, networkInterface string) (PublicIPInfo,
 	if err := interfaceDialReady(networkInterface); err != nil {
 		return PublicIPInfo{}, err
 	}
+	prepareInterfaceDNS(networkInterface)
 	dialer := boundDialer(networkInterface)
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {

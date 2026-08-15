@@ -432,6 +432,7 @@ func (manager *Manager) start(ctx context.Context, id string) error {
 	} else {
 		delete(manager.lastError, id)
 	}
+	prepareInterfaceDNS(config.Interface)
 	manager.listeners[id] = listener
 	manager.started[id] = time.Now().UTC()
 	manager.mu.Unlock()

@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"vocat/internal/fwmark"
 	"vocat/internal/modem"
 )
 
@@ -422,6 +423,7 @@ func applyCellularLease(ctx context.Context, ipCommand, networkInterface string,
 	if err != nil {
 		return fmt.Errorf("install protected routing rule: %w: %s", err, strings.TrimSpace(string(result)))
 	}
+	fwmark.EnsureDNSBypass(mark)
 	if err := writeExportProxyDNS(networkInterface, lease.DNS); err != nil {
 		return fmt.Errorf("publish protected DNS configuration: %w", err)
 	}

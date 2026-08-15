@@ -11,14 +11,22 @@ import (
 	"hash/fnv"
 	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"syscall"
 	"time"
 	"unicode"
+
+	"vocat/internal/fwmark"
 )
 
 func platformSupported() error { return nil }
+
+func prepareInterfaceDNS(networkInterface string) {
+	fwmark.EnsureDNSBypass(exportRouteMark(networkInterface))
+}
 
 func boundDialer(networkInterface string) net.Dialer {
 	return net.Dialer{Control: func(_, _ string, raw syscall.RawConn) error {
@@ -81,27 +89,83 @@ func lookupBoundIPs(ctx context.Context, networkInterface, host string) ([]net.I
 	if err := interfaceDialReady(networkInterface); err != nil {
 		return nil, err
 	}
+	fwmark.EnsureDNSBypass(exportRouteMark(networkInterface))
 	dialer := boundDialer(networkInterface)
-	servers := exportRouteDNSServers(networkInterface)
 	var lastError error
-	for _, server := range servers {
-		ips, err := dnsQueryA(ctx, &dialer, server, host)
+	for _, server := range exportRouteDNSServers(networkInterface) {
+		resolved, queryErr := dnsQueryA(ctx, &dialer, server, host)
+		if queryErr == nil && len(resolved) > 0 {
+			return ipsToAddrs(resolved), nil
+		}
+		lastError = queryErr
+	}
+	if ips, dohErr := lookupDoH(ctx, networkInterface, host); dohErr == nil && len(ips) > 0 {
+		return ips, nil
+	} else if lastError == nil {
+		lastError = dohErr
+	}
+	return nil, fmt.Errorf("lookup %s through %s: %w", host, networkInterface, lastError)
+}
+
+func ipsToAddrs(ips []net.IP) []net.IPAddr {
+	result := make([]net.IPAddr, 0, len(ips))
+	for _, ip := range ips {
+		result = append(result, net.IPAddr{IP: ip})
+	}
+	return result
+}
+
+func lookupDoH(ctx context.Context, networkInterface, host string) ([]net.IPAddr, error) {
+	dialer := boundDialer(networkInterface)
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
+			return dialTarget(ctx, address, &dialer, networkInterface)
+		},
+		DisableKeepAlives:     true,
+		ResponseHeaderTimeout: 8 * time.Second,
+		TLSHandshakeTimeout:   8 * time.Second,
+	}
+	defer transport.CloseIdleConnections()
+	var lastError error
+	for _, rawURL := range []string{
+		"https://1.1.1.1/dns-query?name=" + url.QueryEscape(host) + "&type=A",
+		"https://8.8.8.8/resolve?name=" + url.QueryEscape(host) + "&type=A",
+	} {
+		ips, err := queryDoH(ctx, transport, rawURL)
 		if err == nil && len(ips) > 0 {
-			result := make([]net.IPAddr, 0, len(ips))
-			for _, ip := range ips {
-				result = append(result, net.IPAddr{IP: ip})
-			}
-			return result, nil
+			return ipsToAddrs(ips), nil
 		}
 		lastError = err
 	}
-	return nil, fmt.Errorf("lookup %s through %s via %s: %w", host, networkInterface, strings.Join(servers, ","), lastError)
+	if lastError == nil {
+		lastError = errors.New("no DoH answers")
+	}
+	return nil, lastError
+}
+
+func queryDoH(ctx context.Context, transport *http.Transport, rawURL string) ([]net.IP, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Accept", "application/dns-json")
+	request.Header.Set("User-Agent", "VoCat/1.0")
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
+		return nil, fmt.Errorf("doh %s returned HTTP %d", request.URL.Host, response.StatusCode)
+	}
+	return decodeDNSJSON(io.LimitReader(response.Body, 64<<10))
 }
 
 func dnsQueryA(ctx context.Context, dialer *net.Dialer, server, name string) ([]net.IP, error) {
 	ips, err := dnsQueryAOn(ctx, dialer, "udp4", server, name, 512)
-	if err == nil || !errors.Is(err, errDNSTruncated) {
-		return ips, err
+	if err == nil {
+		return ips, nil
 	}
 	return dnsQueryAOn(ctx, dialer, "tcp4", server, name, 4096)
 }

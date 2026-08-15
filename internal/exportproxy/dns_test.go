@@ -3,6 +3,7 @@ package exportproxy
 import (
 	"encoding/binary"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -64,6 +65,16 @@ func TestParseDNSResponseAAcceptsCNAMEThenA(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(ips) != 1 || !ips[0].Equal(net.IPv4(203, 0, 113, 8)) {
+		t.Fatalf("ips = %v", ips)
+	}
+}
+
+func TestDecodeDNSJSON(t *testing.T) {
+	ips, err := decodeDNSJSON(strings.NewReader(`{"Status":0,"Answer":[{"name":"ipv4.ip.sb","type":1,"TTL":168,"data":"104.26.13.31"},{"name":"ipv4.ip.sb","type":5,"data":"ignored.example"},{"name":"ipv4.ip.sb","type":1,"TTL":168,"data":"172.67.75.172"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ips) != 2 || ips[0].String() != "104.26.13.31" || ips[1].String() != "172.67.75.172" {
 		t.Fatalf("ips = %v", ips)
 	}
 }

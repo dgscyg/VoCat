@@ -10,6 +10,7 @@ import (
 
 func platformSupported() error      { return errors.New("built-in export proxy is only available on Linux") }
 func boundDialer(string) net.Dialer { return net.Dialer{} }
+func prepareInterfaceDNS(string)    {}
 
 func interfaceDialReady(string) error { return nil }
 
