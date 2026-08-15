@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-func serveHTTP(client net.Conn, config Config, dialer *net.Dialer, resolver *net.Resolver) error {
+func serveHTTP(client net.Conn, config Config, dialer *net.Dialer) error {
 	reader := bufio.NewReader(client)
 	request, err := http.ReadRequest(reader)
 	if err != nil {
@@ -23,7 +23,7 @@ func serveHTTP(client net.Conn, config Config, dialer *net.Dialer, resolver *net
 	}
 	if request.Method == http.MethodConnect {
 		ctx, cancel := context.WithTimeout(context.Background(), proxyTimeout)
-		target, err := dialTarget(ctx, request.URL.Host, dialer, resolver)
+		target, err := dialTarget(ctx, ensureHostPort(request.URL.Host, "443"), dialer, config.Interface)
 		cancel()
 		if err != nil {
 			_, _ = fmt.Fprint(client, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
@@ -48,7 +48,7 @@ func serveHTTP(client net.Conn, config Config, dialer *net.Dialer, resolver *net
 	request.RequestURI = ""
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
-			return dialTarget(ctx, address, dialer, resolver)
+			return dialTarget(ctx, address, dialer, config.Interface)
 		},
 		DisableKeepAlives: true,
 	}

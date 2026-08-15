@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -171,6 +172,26 @@ func TestModemSummaryRegionFields(t *testing.T) {
 	empty := modemSummary(nil, "", "")
 	if empty["service_blocked"] != false || empty["card_mcc"] != "" {
 		t.Fatalf("nil snapshot summary = %v / %v", empty["service_blocked"], empty["card_mcc"])
+	}
+}
+
+func TestWriteDeviceErrorMapsCellularDataTo502(t *testing.T) {
+	t.Parallel()
+	server := &Server{logger: regionTestLogger()}
+	recorder := httptest.NewRecorder()
+	server.writeDeviceError(recorder, fmt.Errorf("%w: wwan0 has no IPv4", device.ErrCellularData))
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", recorder.Code)
+	}
+	var envelope errorEnvelope
+	if err := json.NewDecoder(recorder.Body).Decode(&envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Error.Code != "cellular_data_failed" {
+		t.Fatalf("error code = %q", envelope.Error.Code)
+	}
+	if !strings.Contains(envelope.Error.Message, "wwan0 has no IPv4") {
+		t.Fatalf("message = %q", envelope.Error.Message)
 	}
 }
 

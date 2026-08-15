@@ -5,11 +5,16 @@ package exportproxy
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
 	"hash/fnv"
+	"io"
 	"net"
 	"os"
 	"strings"
 	"syscall"
+	"time"
 	"unicode"
 )
 
@@ -38,19 +43,112 @@ func exportRouteMark(networkInterface string) uint32 {
 	return 0x56000000 | (hash.Sum32() & 0x00ffffff)
 }
 
-func boundResolver(networkInterface string) *net.Resolver {
-	dialer := boundDialer(networkInterface)
-	return &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-		var lastError error
-		for _, server := range exportRouteDNSServers(networkInterface) {
-			connection, err := dialer.DialContext(ctx, network, net.JoinHostPort(server, "53"))
-			if err == nil {
-				return connection, nil
-			}
-			lastError = err
+func interfaceDialReady(networkInterface string) error {
+	networkInterface = strings.TrimSpace(networkInterface)
+	if networkInterface == "" {
+		return fmt.Errorf("cellular network interface is required")
+	}
+	iface, err := net.InterfaceByName(networkInterface)
+	if err != nil {
+		return fmt.Errorf("%s is not present on this host: %w", networkInterface, err)
+	}
+	if iface.Flags&net.FlagUp == 0 {
+		return fmt.Errorf("%s is down; enable roaming data so VoCat can assign a protected IPv4 address before public-IP or export-proxy traffic can leave the modem", networkInterface)
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return fmt.Errorf("read %s addresses: %w", networkInterface, err)
+	}
+	for _, addr := range addrs {
+		var ip net.IP
+		switch value := addr.(type) {
+		case *net.IPNet:
+			ip = value.IP
+		case *net.IPAddr:
+			ip = value.IP
 		}
-		return nil, lastError
-	}}
+		if ip.To4() != nil && !ip.IsLinkLocalUnicast() {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s is up but has no IPv4 address; AT+CGACT alone does not configure the host interface", networkInterface)
+}
+
+func lookupBoundIPs(ctx context.Context, networkInterface, host string) ([]net.IPAddr, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		return []net.IPAddr{{IP: ip}}, nil
+	}
+	if err := interfaceDialReady(networkInterface); err != nil {
+		return nil, err
+	}
+	dialer := boundDialer(networkInterface)
+	servers := exportRouteDNSServers(networkInterface)
+	var lastError error
+	for _, server := range servers {
+		ips, err := dnsQueryA(ctx, &dialer, server, host)
+		if err == nil && len(ips) > 0 {
+			result := make([]net.IPAddr, 0, len(ips))
+			for _, ip := range ips {
+				result = append(result, net.IPAddr{IP: ip})
+			}
+			return result, nil
+		}
+		lastError = err
+	}
+	return nil, fmt.Errorf("lookup %s through %s via %s: %w", host, networkInterface, strings.Join(servers, ","), lastError)
+}
+
+func dnsQueryA(ctx context.Context, dialer *net.Dialer, server, name string) ([]net.IP, error) {
+	ips, err := dnsQueryAOn(ctx, dialer, "udp4", server, name, 512)
+	if err == nil || !errors.Is(err, errDNSTruncated) {
+		return ips, err
+	}
+	return dnsQueryAOn(ctx, dialer, "tcp4", server, name, 4096)
+}
+
+func dnsQueryAOn(ctx context.Context, dialer *net.Dialer, network, server, name string, readSize int) ([]net.IP, error) {
+	payload, id, err := encodeDNSQueryA(name)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(server, "53"))
+	if err != nil {
+		return nil, fmt.Errorf("dial %s %s:53: %w", network, server, err)
+	}
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	} else {
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	}
+	if strings.HasPrefix(network, "tcp") {
+		var header [2]byte
+		binary.BigEndian.PutUint16(header[:], uint16(len(payload)))
+		if _, err := conn.Write(append(header[:], payload...)); err != nil {
+			return nil, err
+		}
+		if _, err := io.ReadFull(conn, header[:]); err != nil {
+			return nil, err
+		}
+		length := int(binary.BigEndian.Uint16(header[:]))
+		if length < 12 || length > 65535 {
+			return nil, errors.New("invalid tcp dns length")
+		}
+		buf := make([]byte, length)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return nil, err
+		}
+		return parseDNSResponseA(buf, id, name)
+	}
+	if _, err := conn.Write(payload); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, readSize)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+	return parseDNSResponseA(buf[:n], id, name)
 }
 
 func exportRouteDNSServers(networkInterface string) []string {
@@ -70,8 +168,8 @@ func exportRouteDNSServers(networkInterface string) []string {
 	servers := make([]string, 0, 2)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		if value := strings.TrimSpace(scanner.Text()); net.ParseIP(value) != nil {
-			servers = append(servers, value)
+		if ip := net.ParseIP(strings.TrimSpace(scanner.Text())); ip.To4() != nil {
+			servers = append(servers, ip.To4().String())
 		}
 	}
 	if len(servers) == 0 {

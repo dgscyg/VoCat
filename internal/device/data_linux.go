@@ -26,6 +26,7 @@ func setQMINetwork(
 	username string,
 	password string,
 	authentication string,
+	atClient modem.Client,
 ) (NetworkResult, error) {
 	qmiNetwork, err := exec.LookPath("qmi-network")
 	if err != nil {
@@ -63,6 +64,13 @@ func setQMINetwork(
 		return NetworkResult{}, fmt.Errorf("close temporary QMI profile: %w", err)
 	}
 
+	ipCommand, lookErr := exec.LookPath("ip")
+	if lookErr != nil {
+		return NetworkResult{}, fmt.Errorf("%w: install iproute2 to control %s", ErrDataBackendUnavailable, candidate.NetworkInterface)
+	}
+	if enabled {
+		ensureQMIRawIP(ctx, ipCommand, candidate.NetworkInterface)
+	}
 	action := "stop"
 	if enabled {
 		action = "start"
@@ -80,10 +88,6 @@ func setQMINetwork(
 			return NetworkResult{}, fmt.Errorf("qmi-network %s failed: %w: %s", action, err, detail)
 		}
 	}
-	ipCommand, lookErr := exec.LookPath("ip")
-	if lookErr != nil {
-		return NetworkResult{}, fmt.Errorf("%w: install iproute2 to control %s", ErrDataBackendUnavailable, candidate.NetworkInterface)
-	}
 	linkAction := "down"
 	if enabled {
 		linkAction = "up"
@@ -93,23 +97,18 @@ func setQMINetwork(
 		return NetworkResult{}, fmt.Errorf("set %s %s: %w: %s", candidate.NetworkInterface, linkAction, linkErr, strings.TrimSpace(string(linkOutput)))
 	}
 	if enabled {
-		busybox, busyboxErr := exec.LookPath("busybox")
-		if busyboxErr != nil {
-			return NetworkResult{}, fmt.Errorf("%w: busybox udhcpc is required for %s", ErrDataBackendUnavailable, candidate.NetworkInterface)
-		}
-		dhcpDetail, dhcpErr := configureExportProxyDHCP(ctx, busybox, ipCommand, candidate.NetworkInterface)
-		if dhcpErr != nil {
+		hostDetail, hostErr := bringUpExportProxyInterface(ctx, candidate, atClient, []string{"qmi-wds", "dhcp", "at-pdp"})
+		if hostErr != nil {
 			rollbackCtx, cancelRollback := context.WithTimeout(context.Background(), managerCommandCleanupTimeout)
 			defer cancelRollback()
-			clearExportProxyRoute(rollbackCtx, candidate.NetworkInterface)
+			releaseCellularHost(rollbackCtx, candidate.NetworkInterface)
 			_, _ = exec.CommandContext(rollbackCtx, qmiNetwork, "--profile="+profilePath, candidate.QMIControl, "stop").CombinedOutput()
 			_, _ = exec.CommandContext(rollbackCtx, ipCommand, "link", "set", "dev", candidate.NetworkInterface, "down").CombinedOutput()
-			return NetworkResult{}, fmt.Errorf("QMI session started but protected DHCP failed: %w", dhcpErr)
+			return NetworkResult{}, fmt.Errorf("QMI session started but the host interface has no IPv4: %w", hostErr)
 		}
-		detail = strings.TrimSpace(detail + "\n" + dhcpDetail)
+		detail = strings.TrimSpace(detail + "\n" + hostDetail)
 	} else {
-		clearExportProxyRoute(ctx, candidate.NetworkInterface)
-		_, _ = exec.CommandContext(ctx, ipCommand, "-4", "addr", "flush", "dev", candidate.NetworkInterface, "scope", "global").CombinedOutput()
+		releaseCellularHost(ctx, candidate.NetworkInterface)
 	}
 	return NetworkResult{
 		Enabled:       enabled,
@@ -139,18 +138,170 @@ func exportProxyRouteIdentity(networkInterface string) (mark uint32, table, prio
 	return
 }
 
-func configureExportProxyDHCP(ctx context.Context, busybox, ipCommand, networkInterface string) (string, error) {
-	lease, err := os.CreateTemp("", "vocat-dhcp-lease-*.env")
-	if err != nil {
-		return "", err
+func activateExportProxyInterface(ctx context.Context, candidate modem.Candidate, atClient modem.Client) (string, error) {
+	// AT+QNETDEVCTL / ECM paths should not prefer leftover QMI WDS settings.
+	return bringUpExportProxyInterface(ctx, candidate, atClient, []string{"dhcp", "at-pdp", "qmi-wds"})
+}
+
+func bringUpExportProxyInterface(ctx context.Context, candidate modem.Candidate, atClient modem.Client, sources []string) (string, error) {
+	networkInterface := strings.TrimSpace(candidate.NetworkInterface)
+	if networkInterface == "" {
+		return "", nil
 	}
-	leasePath := lease.Name()
-	_ = lease.Close()
+	ipCommand, err := exec.LookPath("ip")
+	if err != nil {
+		return "", fmt.Errorf("%w: install iproute2 to control %s", ErrDataBackendUnavailable, networkInterface)
+	}
+	ensureQMIRawIP(ctx, ipCommand, networkInterface)
+	if result, linkErr := exec.CommandContext(ctx, ipCommand, "link", "set", "dev", networkInterface, "up").CombinedOutput(); linkErr != nil {
+		return "", wrapCellularData(fmt.Errorf("set %s up: %w: %s", networkInterface, linkErr, strings.TrimSpace(string(result))))
+	}
+	waitForInterface(ctx, networkInterface, 3*time.Second)
+	lease, source, err := obtainCellularLeaseWithRetry(ctx, candidate, atClient, sources, 6*time.Second)
+	if err != nil {
+		return "", wrapCellularData(err)
+	}
+	if err := applyCellularLease(ctx, ipCommand, networkInterface, lease); err != nil {
+		clearExportProxyRoute(ctx, networkInterface)
+		return "", wrapCellularData(err)
+	}
+	return fmt.Sprintf("protected %s lease %s/%d", source, lease.Address.String(), lease.prefixLen()), nil
+}
+
+func deactivateExportProxyInterface(ctx context.Context, networkInterface string) {
+	networkInterface = strings.TrimSpace(networkInterface)
+	if networkInterface == "" {
+		return
+	}
+	clearExportProxyRoute(ctx, networkInterface)
+	ipCommand, err := exec.LookPath("ip")
+	if err != nil {
+		return
+	}
+	_, _ = exec.CommandContext(ctx, ipCommand, "-4", "addr", "flush", "dev", networkInterface, "scope", "global").CombinedOutput()
+	_, _ = exec.CommandContext(ctx, ipCommand, "link", "set", "dev", networkInterface, "down").CombinedOutput()
+}
+
+func obtainCellularLeaseWithRetry(ctx context.Context, candidate modem.Candidate, atClient modem.Client, sources []string, budget time.Duration) (cellularLease, string, error) {
+	deadline := time.Now().Add(budget)
+	var last error
+	for {
+		lease, source, err := obtainCellularLease(ctx, candidate, atClient, sources)
+		if err == nil {
+			return lease, source, nil
+		}
+		last = err
+		if !time.Now().Before(deadline) {
+			return cellularLease{}, "", last
+		}
+		select {
+		case <-ctx.Done():
+			if last == nil {
+				last = ctx.Err()
+			}
+			return cellularLease{}, "", last
+		case <-time.After(800 * time.Millisecond):
+		}
+	}
+}
+
+func obtainCellularLease(ctx context.Context, candidate modem.Candidate, atClient modem.Client, sources []string) (cellularLease, string, error) {
+	if len(sources) == 0 {
+		sources = []string{"dhcp", "at-pdp", "qmi-wds"}
+	}
+	var failures []string
+	for _, source := range sources {
+		var lease cellularLease
+		var ok bool
+		var detail string
+		switch source {
+		case "qmi-wds":
+			lease, ok, detail = leaseFromQMI(ctx, candidate.QMIControl)
+		case "dhcp":
+			lease, ok, detail = leaseFromUDHCPC(ctx, candidate.NetworkInterface)
+		case "at-pdp":
+			lease, ok, detail = leaseFromAT(ctx, atClient)
+		default:
+			continue
+		}
+		if ok {
+			return lease, source, nil
+		}
+		if detail != "" {
+			failures = append(failures, detail)
+		}
+	}
+	if len(failures) == 0 {
+		return cellularLease{}, "", errors.New("no QMI WDS, DHCP, or AT PDP address source is available")
+	}
+	return cellularLease{}, "", errors.New(strings.Join(failures, "; "))
+}
+
+func leaseFromQMI(ctx context.Context, control string) (cellularLease, bool, string) {
+	control = strings.TrimSpace(control)
+	if control == "" {
+		return cellularLease{}, false, ""
+	}
+	qmicli, err := exec.LookPath("qmicli")
+	if err != nil {
+		return cellularLease{}, false, "qmicli is not installed"
+	}
+	output, err := exec.CommandContext(ctx, qmicli, "-d", control, "--device-open-proxy", "--wds-get-current-settings").CombinedOutput()
+	detail := strings.TrimSpace(string(output))
+	if err != nil {
+		if detail == "" {
+			detail = err.Error()
+		}
+		return cellularLease{}, false, "qmicli --wds-get-current-settings: " + detail
+	}
+	lease, ok := parseQMICurrentSettings(string(output))
+	if !ok {
+		return cellularLease{}, false, "qmicli returned no IPv4 settings"
+	}
+	return lease, true, ""
+}
+
+func leaseFromUDHCPC(ctx context.Context, networkInterface string) (cellularLease, bool, string) {
+	busybox, err := exec.LookPath("busybox")
+	if err != nil {
+		return cellularLease{}, false, "busybox udhcpc is not installed"
+	}
+	lease, err := requestUDHCPCLease(ctx, busybox, networkInterface)
+	if err != nil {
+		return cellularLease{}, false, err.Error()
+	}
+	return lease, true, ""
+}
+
+func leaseFromAT(ctx context.Context, client modem.Client) (cellularLease, bool, string) {
+	if client == nil {
+		return cellularLease{}, false, ""
+	}
+	if response, err := client.Execute(ctx, "AT+CGCONTRDP=1"); err == nil && response.OK() {
+		if lease, ok := parseCGCONTRDP(response); ok {
+			return lease, true, ""
+		}
+	}
+	if response, err := client.Execute(ctx, "AT+CGPADDR=1"); err == nil && response.OK() {
+		if lease, ok := parseCGPADDR(response); ok {
+			return lease, true, ""
+		}
+	}
+	return cellularLease{}, false, "AT+CGCONTRDP/CGPADDR returned no IPv4 address"
+}
+
+func requestUDHCPCLease(ctx context.Context, busybox, networkInterface string) (cellularLease, error) {
+	leaseFile, err := os.CreateTemp("", "vocat-dhcp-lease-*.env")
+	if err != nil {
+		return cellularLease{}, err
+	}
+	leasePath := leaseFile.Name()
+	_ = leaseFile.Close()
 	_ = os.Remove(leasePath)
 	defer os.Remove(leasePath)
 	script, err := os.CreateTemp("", "vocat-udhcpc-*.sh")
 	if err != nil {
-		return "", err
+		return cellularLease{}, err
 	}
 	scriptPath := script.Name()
 	defer os.Remove(scriptPath)
@@ -164,25 +315,25 @@ exit 0
 `, leasePath)
 	if _, err := script.WriteString(scriptText); err != nil {
 		_ = script.Close()
-		return "", err
+		return cellularLease{}, err
 	}
 	if err := script.Chmod(0o700); err != nil {
 		_ = script.Close()
-		return "", err
+		return cellularLease{}, err
 	}
 	if err := script.Close(); err != nil {
-		return "", err
+		return cellularLease{}, err
 	}
 	output, err := exec.CommandContext(ctx, busybox, "udhcpc", "-q", "-n", "-t", "5", "-T", "3", "-i", networkInterface, "-s", scriptPath).CombinedOutput()
 	if err != nil {
 		if strings.Contains(strings.ToLower(string(output)), "address family not supported") {
-			return "", fmt.Errorf("udhcpc cannot open its link-layer socket: allow AF_PACKET in the vocat systemd service RestrictAddressFamilies setting: %w", err)
+			return cellularLease{}, fmt.Errorf("udhcpc cannot open its link-layer socket: allow AF_PACKET in the vocat systemd service RestrictAddressFamilies setting: %w", err)
 		}
-		return "", fmt.Errorf("udhcpc: %w: %s", err, strings.TrimSpace(string(output)))
+		return cellularLease{}, fmt.Errorf("udhcpc: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	raw, err := os.ReadFile(leasePath)
 	if err != nil {
-		return "", fmt.Errorf("read DHCP lease: %w", err)
+		return cellularLease{}, fmt.Errorf("read DHCP lease: %w", err)
 	}
 	values := make(map[string]string)
 	for _, line := range strings.Split(string(raw), "\n") {
@@ -194,48 +345,110 @@ exit 0
 	address := net.ParseIP(values["ip"]).To4()
 	maskIP := net.ParseIP(values["subnet"]).To4()
 	if address == nil || maskIP == nil {
-		return "", errors.New("DHCP returned no valid IPv4 address/subnet")
+		return cellularLease{}, errors.New("DHCP returned no valid IPv4 address/subnet")
 	}
-	mask := net.IPMask(maskIP)
-	ones, bits := mask.Size()
-	if bits != 32 || ones < 0 {
-		return "", errors.New("DHCP returned an invalid IPv4 subnet")
+	lease := cellularLease{Address: address, Mask: net.IPMask(maskIP), DNS: strings.Fields(values["dns"])}
+	if routers := strings.Fields(values["router"]); len(routers) > 0 {
+		if gateway := net.ParseIP(routers[0]).To4(); gateway != nil {
+			lease.Gateway = gateway
+		} else {
+			return cellularLease{}, errors.New("DHCP returned an invalid IPv4 gateway")
+		}
 	}
-	network := address.Mask(mask)
-	routers := strings.Fields(values["router"])
-	if len(routers) > 0 && net.ParseIP(routers[0]).To4() == nil {
-		return "", errors.New("DHCP returned an invalid IPv4 gateway")
+	if ones, bits := lease.Mask.Size(); bits != 32 || ones < 0 {
+		return cellularLease{}, errors.New("DHCP returned an invalid IPv4 subnet")
 	}
-	if result, addrErr := exec.CommandContext(ctx, ipCommand, "-4", "addr", "replace", fmt.Sprintf("%s/%d", address.String(), ones), "dev", networkInterface).CombinedOutput(); addrErr != nil {
-		return "", fmt.Errorf("configure cellular address: %w: %s", addrErr, strings.TrimSpace(string(result)))
+	return lease, nil
+}
+
+func applyCellularLease(ctx context.Context, ipCommand, networkInterface string, lease cellularLease) error {
+	if lease.Address.To4() == nil {
+		return errors.New("cellular lease has no IPv4 address")
+	}
+	if lease.Mask == nil {
+		lease.Mask = net.CIDRMask(32, 32)
+	}
+	ones := lease.prefixLen()
+	if result, addrErr := exec.CommandContext(ctx, ipCommand, "-4", "addr", "replace", fmt.Sprintf("%s/%d", lease.Address.String(), ones), "dev", networkInterface).CombinedOutput(); addrErr != nil {
+		return fmt.Errorf("configure cellular address: %w: %s", addrErr, strings.TrimSpace(string(result)))
 	}
 	mark, table, priority := exportProxyRouteIdentity(networkInterface)
 	clearExportProxyRoute(ctx, networkInterface)
+	network := lease.Address.Mask(lease.Mask)
 	connectedCIDR := fmt.Sprintf("%s/%d", network.String(), ones)
-	if result, routeErr := exec.CommandContext(ctx, ipCommand, "-4", "route", "replace", "table", strconv.Itoa(table), connectedCIDR, "dev", networkInterface, "scope", "link", "src", address.String()).CombinedOutput(); routeErr != nil {
-		clearExportProxyRoute(ctx, networkInterface)
-		return "", fmt.Errorf("install protected connected route: %w: %s", routeErr, strings.TrimSpace(string(result)))
+	if result, routeErr := exec.CommandContext(ctx, ipCommand, "-4", "route", "replace", "table", strconv.Itoa(table), connectedCIDR, "dev", networkInterface, "scope", "link", "src", lease.Address.String()).CombinedOutput(); routeErr != nil {
+		return fmt.Errorf("install protected connected route: %w: %s", routeErr, strings.TrimSpace(string(result)))
 	}
 	defaultArgs := []string{"-4", "route", "replace", "table", strconv.Itoa(table), "default"}
-	if len(routers) > 0 {
-		defaultArgs = append(defaultArgs, "via", routers[0])
+	if lease.Gateway != nil {
+		defaultArgs = append(defaultArgs, "via", lease.Gateway.String())
 	}
 	defaultArgs = append(defaultArgs, "dev", networkInterface, "onlink")
 	if result, routeErr := exec.CommandContext(ctx, ipCommand, defaultArgs...).CombinedOutput(); routeErr != nil {
-		clearExportProxyRoute(ctx, networkInterface)
-		return "", fmt.Errorf("install protected default route: %w: %s", routeErr, strings.TrimSpace(string(result)))
+		return fmt.Errorf("install protected default route: %w: %s", routeErr, strings.TrimSpace(string(result)))
 	}
 	markText := fmt.Sprintf("0x%x", mark)
-	result, err := exec.CommandContext(ctx, ipCommand, "rule", "add", "priority", strconv.Itoa(priority), "fwmark", markText, "lookup", strconv.Itoa(table)).CombinedOutput()
+	ruleArgs := []string{"rule", "add", "priority", strconv.Itoa(priority), "fwmark", markText, "lookup", strconv.Itoa(table)}
+	result, err := exec.CommandContext(ctx, ipCommand, ruleArgs...).CombinedOutput()
+	if err != nil && strings.Contains(strings.ToLower(string(result)), "file exists") {
+		_, _ = exec.CommandContext(ctx, ipCommand, "rule", "del", "priority", strconv.Itoa(priority), "fwmark", markText, "lookup", strconv.Itoa(table)).CombinedOutput()
+		result, err = exec.CommandContext(ctx, ipCommand, ruleArgs...).CombinedOutput()
+	}
 	if err != nil {
-		clearExportProxyRoute(ctx, networkInterface)
-		return "", fmt.Errorf("install protected routing rule: %w: %s", err, strings.TrimSpace(string(result)))
+		return fmt.Errorf("install protected routing rule: %w: %s", err, strings.TrimSpace(string(result)))
 	}
-	if err := writeExportProxyDNS(networkInterface, strings.Fields(values["dns"])); err != nil {
-		clearExportProxyRoute(ctx, networkInterface)
-		return "", fmt.Errorf("publish protected DNS configuration: %w", err)
+	if err := writeExportProxyDNS(networkInterface, lease.DNS); err != nil {
+		return fmt.Errorf("publish protected DNS configuration: %w", err)
 	}
-	return fmt.Sprintf("protected DHCP lease %s/%d", address.String(), ones), nil
+	return nil
+}
+
+func ensureQMIRawIP(ctx context.Context, ipCommand, networkInterface string) {
+	if !safeSysfsInterfaceName(networkInterface) {
+		return
+	}
+	path := "/sys/class/net/" + networkInterface + "/qmi/raw_ip"
+	current, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(string(current)), "Y") {
+		return
+	}
+	_, _ = exec.CommandContext(ctx, ipCommand, "link", "set", "dev", networkInterface, "down").CombinedOutput()
+	_ = os.WriteFile(path, []byte("Y\n"), 0o644)
+}
+
+func waitForInterface(ctx context.Context, networkInterface string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return
+		}
+		iface, err := net.InterfaceByName(networkInterface)
+		if err == nil && iface.Flags&net.FlagUp != 0 {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+func safeSysfsInterfaceName(value string) bool {
+	if value == "" || len(value) > 15 || value == "." || value == ".." {
+		return false
+	}
+	for _, character := range value {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' || character == '-' || character == '_' || character == '.' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func exportProxyDNSPath(networkInterface string) string {

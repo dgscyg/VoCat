@@ -1357,6 +1357,9 @@ func (s *Server) writeDeviceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusServiceUnavailable, "at_port_unavailable", "device has no usable AT port")
 	case errors.Is(err, device.ErrDataBackendUnavailable):
 		writeError(w, http.StatusNotImplemented, "data_backend_unavailable", err.Error())
+	case errors.Is(err, device.ErrCellularData):
+		s.logger.Warn("cellular data path failed", "error", err)
+		writeError(w, http.StatusBadGateway, "cellular_data_failed", err.Error())
 	case errors.Is(err, device.ErrEUICCChannelStuck):
 		writeError(w, http.StatusServiceUnavailable, "euicc_channel_stuck", err.Error())
 	case errors.Is(err, device.ErrESIMDeleteProfileNotFound):

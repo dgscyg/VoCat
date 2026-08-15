@@ -99,14 +99,18 @@ func (manager *Manager) SetNetwork(
 		if candidate.QMIControl == "" || candidate.NetworkInterface == "" {
 			return NetworkResult{}, fmt.Errorf("%w: QMI control device and network interface are required", ErrDataBackendUnavailable)
 		}
-		result, err := setQMINetwork(ctx, candidate, request.Enabled, apn, ipVersion, request.Username, request.Password, authentication)
+		var atClient modem.Client
+		if client, clientErr := manager.clientLocked(ctx, state, candidate); clientErr == nil {
+			atClient = client
+		}
+		result, err := setQMINetwork(ctx, candidate, request.Enabled, apn, ipVersion, request.Username, request.Password, authentication, atClient)
 		if err != nil && (request.Username != "" || request.Password != "") {
 			// qmi-network output is outside our control and may echo values read
 			// from its temporary profile. Do not return that output when the
 			// profile contains credentials.
-			return NetworkResult{}, errors.New("authenticated QMI cellular data operation failed")
+			return NetworkResult{}, fmt.Errorf("%w: authenticated QMI cellular data operation failed", ErrCellularData)
 		}
-		return result, err
+		return result, wrapCellularData(err)
 	}
 
 	client, err := manager.clientLocked(ctx, state, candidate)
@@ -145,21 +149,76 @@ func (manager *Manager) SetNetwork(
 				return NetworkResult{}, err
 			}
 		}
-	} else {
-		if _, err := manager.command(ctx, client, "AT+CGACT=0,1"); err != nil {
-			manager.setResult(id, state, nil, err)
-			return NetworkResult{}, err
+		detail := "PDP context activated"
+		if candidate.NetworkInterface != "" {
+			bindQuectelUSBNet(ctx, manager, client, true)
+			hostDetail, hostErr := configureCellularHost(ctx, candidate, client)
+			if hostErr != nil {
+				releaseCellularHost(ctx, candidate.NetworkInterface)
+				bindQuectelUSBNet(ctx, manager, client, false)
+				_, _ = manager.command(ctx, client, "AT+CGACT=0,1")
+				hostErr = wrapCellularData(hostErr)
+				manager.setResult(id, state, nil, hostErr)
+				return NetworkResult{}, hostErr
+			}
+			if strings.TrimSpace(hostDetail) != "" {
+				detail = detail + "\n" + hostDetail
+			}
 		}
+		manager.setResult(id, state, nil, nil)
+		return NetworkResult{
+			Enabled:   true,
+			Backend:   "at",
+			Interface: candidate.NetworkInterface,
+			APN:       apn,
+			IPVersion: ipVersion,
+			Detail:    detail,
+		}, nil
+	}
+
+	if candidate.NetworkInterface != "" {
+		releaseCellularHost(ctx, candidate.NetworkInterface)
+		bindQuectelUSBNet(ctx, manager, client, false)
+	}
+	if _, err := manager.command(ctx, client, "AT+CGACT=0,1"); err != nil {
+		manager.setResult(id, state, nil, err)
+		return NetworkResult{}, err
 	}
 	manager.setResult(id, state, nil, nil)
 	return NetworkResult{
-		Enabled:   request.Enabled,
+		Enabled:   false,
 		Backend:   "at",
 		Interface: candidate.NetworkInterface,
 		APN:       apn,
 		IPVersion: ipVersion,
-		Detail:    map[bool]string{true: "PDP context activated", false: "PDP context deactivated"}[request.Enabled],
+		Detail:    "PDP context deactivated",
 	}, nil
+}
+
+// configureCellularHost / releaseCellularHost are replaced in tests so AT
+// transcripts can cover USB-net binding without touching the host datapath.
+var (
+	configureCellularHost = activateExportProxyInterface
+	releaseCellularHost   = deactivateExportProxyInterface
+)
+
+func wrapCellularData(err error) error {
+	if err == nil || errors.Is(err, ErrCellularData) || errors.Is(err, ErrDataBackendUnavailable) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrCellularData, err)
+}
+
+func bindQuectelUSBNet(ctx context.Context, manager *Manager, client modem.Client, enabled bool) {
+	commands := []string{"AT+QNETDEVCTL=1,1,1", "AT+QNETDEVCTL=1,1"}
+	if !enabled {
+		commands = []string{"AT+QNETDEVCTL=0,1", "AT+QNETDEVCTL=0,1,0"}
+	}
+	for _, command := range commands {
+		if _, err := manager.command(ctx, client, command); err == nil {
+			return
+		}
+	}
 }
 
 func normalizeIPVersion(value string) string {

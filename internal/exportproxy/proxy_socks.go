@@ -9,9 +9,10 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 )
 
-func serveSOCKS(client net.Conn, config Config, dialer *net.Dialer, resolver *net.Resolver) error {
+func serveSOCKS(client net.Conn, config Config, dialer *net.Dialer) error {
 	reader := bufio.NewReader(client)
 	version, err := reader.ReadByte()
 	if err != nil || version != 5 {
@@ -53,10 +54,10 @@ func serveSOCKS(client net.Conn, config Config, dialer *net.Dialer, resolver *ne
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), proxyTimeout)
-	target, err := dialTarget(ctx, net.JoinHostPort(host, strconv.Itoa(port)), dialer, resolver)
+	target, err := dialTarget(ctx, net.JoinHostPort(host, strconv.Itoa(port)), dialer, config.Interface)
 	cancel()
 	if err != nil {
-		_ = writeSocksReply(client, 5)
+		_ = writeSocksReply(client, socksReplyForDialError(err))
 		return err
 	}
 	defer target.Close()
@@ -145,4 +146,23 @@ func readSocksAddress(reader *bufio.Reader, kind byte) (string, int, error) {
 func writeSocksReply(connection net.Conn, code byte) error {
 	_, err := connection.Write([]byte{5, code, 0, 1, 0, 0, 0, 0, 0, 0})
 	return err
+}
+
+func socksReplyForDialError(err error) byte {
+	if err == nil {
+		return 1
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "network is unreachable"), strings.Contains(message, "is down"), strings.Contains(message, "no ipv4"):
+		return 3
+	case strings.Contains(message, "timeout"), strings.Contains(message, "deadline exceeded"):
+		return 6
+	case strings.Contains(message, "no such host"), strings.Contains(message, "no a records"), strings.Contains(message, "dns rcode"):
+		return 4
+	case strings.Contains(message, "refused"):
+		return 5
+	default:
+		return 5
+	}
 }
