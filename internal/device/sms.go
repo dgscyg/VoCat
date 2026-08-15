@@ -360,7 +360,7 @@ func parseCMGL(response modem.Response) []SMSMessage {
 		case rawPDU == "":
 			message.DecodeError = "CMGL record has no PDU"
 		default:
-			decoded, decodeErr := decodeSMSPDU(rawPDU)
+			decoded, decodeErr := decodeSMSPDUWithLength(rawPDU, header.modemLength)
 			decoded.Index = header.index
 			decoded.StorageStatus = header.status
 			decoded.ModemLength = header.modemLength
@@ -414,7 +414,7 @@ func parseCMGR(index int, response modem.Response) (SMSMessage, error) {
 		if lineIndex+1 >= len(response.Lines) {
 			return SMSMessage{}, errors.New("CMGR response has no PDU")
 		}
-		message, decodeErr := decodeSMSPDU(response.Lines[lineIndex+1])
+		message, decodeErr := decodeSMSPDUWithLength(response.Lines[lineIndex+1], modemLength)
 		message.Index = index
 		message.StorageStatus = status
 		message.ModemLength = modemLength

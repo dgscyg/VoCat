@@ -128,6 +128,7 @@ resolve_target_version() {
         TARGET_VERSION="${TARGET_VERSION#v}"
         return
     fi
+    msg "正在获取 ${REPO} 的最新版本..." "Fetching the latest ${REPO} release..."
     local api_url="https://api.github.com/repos/${REPO}/releases/latest"
     local auth_hdr=()
     if [ -n "${GITHUB_TOKEN:-}" ]; then
@@ -208,7 +209,10 @@ install_pcsc_support() {
             opkg install $packages >/dev/null 2>&1 && installed=1 || true
         fi
     elif command -v apt-get >/dev/null 2>&1; then
-        if apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y pcscd libccid; then
+        # Third-party sources (expired Cloudflare keys, retired backports)
+        # must not abort the installer or look like a VoCat failure.
+        apt-get update -qq >/dev/null 2>&1 || true
+        if DEBIAN_FRONTEND=noninteractive apt-get install -y pcscd libccid >/dev/null 2>&1; then
             installed=1
         fi
     elif command -v dnf >/dev/null 2>&1; then
