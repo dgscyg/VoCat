@@ -68,25 +68,25 @@ Vocat هي لوحة تحكم ويب مفتوحة المصدر ومجموعة أ�
 بصفتك root (بما في ذلك OpenWrt/Kwrt، حيث يكون `sudo` غير موجود عادةً):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | bash
 ```
 
 من مستخدم عادي على توزيعة تحتوي على sudo:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | sudo bash
 ```
 
 تحقق من متطلبات VoWiFi/XFRM على المضيف دون تثبيت VoCat:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh | bash -s -- --check-env
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh | bash -s -- --check-env
 ```
 
 تثبيت إصدار محدد:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MengMengCode/VoCat/master/scripts/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/dgscyg/VoCat/master/scripts/install.sh -o install.sh
 sudo bash install.sh 0.0.2
 ```
 
@@ -197,7 +197,7 @@ Quectel USB المدعومة (معرّف الشركة المصنعة USB `2c7c`)
 | `VOCAT_SECURE_COOKIES` | `false` | يضع علامة آمنة على ملفات تعريف ارتباط الجلسة عند استخدام HTTPS. |
 | `VOCAT_SHUTDOWN_TIMEOUT` | `10s` | مهلة الإيقاف السلس. |
 | `VOCAT_MAX_REQUEST_BODY_BYTES` | `1048576` | الحد الأقصى لحجم جسم طلب API. |
-| `VOCAT_REPO` | `MengMengCode/VoCat` | مستودع GitHub الموثوق الذي يستخدمه المحدّث الذاتي، بصيغة `owner/name`. |
+| `VOCAT_REPO` | `dgscyg/VoCat` | مستودع GitHub الموثوق الذي يستخدمه المحدّث الذاتي، بصيغة `owner/name`. |
 | `GITHUB_TOKEN` | فارغ | رمز GitHub اختياري للمستودعات الخاصة أو حدود API أعلى. |
 
 لا تخزّن رموز Telegram، أو كلمات مرور SMTP، أو أسرار webhook، أو بيانات اعتماد SIM، أو بيانات خاصة أخرى في المستودع. قم بإعدادها عبر إعدادات التطبيق أو ملفات البيئة المحمية.
@@ -221,13 +221,13 @@ Quectel USB المدعومة (معرّف الشركة المصنعة USB `2c7c`)
 تحقق من وجود GitHub Release أحدث:
 
 ```bash
-vocat update --check --repo MengMengCode/VoCat
+vocat update --check --repo dgscyg/VoCat
 ```
 
 ثبّت أحدث إصدار:
 
 ```bash
-sudo vocat update --repo MengMengCode/VoCat
+sudo vocat update --repo dgscyg/VoCat
 ```
 
 ينزّل المحدّث الملف الثنائي المطابق لبنية Linux الحالية، ويتحقق منه باستخدام `SHA256SUMS` المنشور، ويستبدل الملف التنفيذي بشكل ذري، ويعيد تشغيل خدمة systemd `vocat` عند توفرها.
@@ -338,4 +338,4 @@ cd web && npm run build
 
 انظر [LICENSE](../LICENSE).
 
-[![MengMengCode/VoCat Star History](https://mengmeng.meteor-history.com/api/embed/MengMengCode/VoCat.svg?sig=sdeXRVxAoY3yLWgXL7JViY2USYIN3t9neJ6ScPvgUAo&theme=light&style=xkcd&color=dd4528&background=ffffff&textColor=000000&width=900&height=600&lineWidth=3&showTitle=true&showLegend=true&showDots=false&v=0.0.14)](https://meteor-history.com)
+[![GitHub stars](https://img.shields.io/github/stars/dgscyg/VoCat)](https://github.com/dgscyg/VoCat)

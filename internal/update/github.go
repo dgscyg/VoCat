@@ -40,7 +40,7 @@ type CheckResult struct {
 
 const (
 	githubAPI         = "https://api.github.com"
-	DefaultRepository = "MengMengCode/VoCat"
+	DefaultRepository = "dgscyg/VoCat"
 )
 
 var githubHTTPClient = &http.Client{
