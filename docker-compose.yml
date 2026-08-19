@@ -55,9 +55,11 @@ services:
       # SQLite database + persistent state.
       - vocat-data:/opt/vocat/data
       # Required for modem, MHI/WWAN and PC/SC USB-reader discovery, including
-      # devices added after the container starts.
+      # devices added after the container starts. /sys must be writable so
+      # qmi_wwan raw_ip can be set; a read-only bind makes roaming fail with
+      # "write wwan0 qmi/raw_ip: read-only file system".
       - /dev:/dev
-      - /sys:/sys:ro
+      - /sys:/sys
 
 volumes:
   vocat-data:

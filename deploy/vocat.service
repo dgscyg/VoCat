@@ -25,9 +25,12 @@ ProtectSystem=strict
 ProtectHome=true
 ProtectKernelLogs=true
 ProtectKernelModules=true
-ProtectKernelTunables=true
+# qmi_wwan raw_ip and per-iface rp_filter live under /sys and /proc/sys.
+ProtectKernelTunables=false
 ProtectControlGroups=true
-ReadWritePaths=/opt/vocat/data
+RuntimeDirectory=vocat
+RuntimeDirectoryMode=0755
+ReadWritePaths=/opt/vocat/data /opt/vocat/bin
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
 RestrictRealtime=true
 LockPersonality=true

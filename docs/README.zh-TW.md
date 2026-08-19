@@ -159,7 +159,7 @@ docker run -d \
   --user 0:0 \
   -v vocat-data:/opt/vocat/data \
   -v /dev:/dev \
-  -v /sys:/sys:ro \
+  -v /sys:/sys \
   ghcr.io/dgscyg/vocat:latest
 ```
 

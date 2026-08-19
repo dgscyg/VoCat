@@ -453,7 +453,10 @@ ProtectSystem=strict
 ProtectHome=true
 ProtectKernelLogs=true
 ProtectKernelModules=true
-ProtectKernelTunables=true
+# qmi_wwan raw_ip and per-iface rp_filter live under /sys and /proc/sys.
+# ProtectKernelTunables remounts those trees read-only and roaming then
+# fails with "write wwan0 qmi/raw_ip: read-only file system".
+ProtectKernelTunables=false
 ProtectControlGroups=true
 # The web/CLI self-updater verifies a release in this directory and atomically
 # renames it over the running binary. Keep the rest of the host read-only.

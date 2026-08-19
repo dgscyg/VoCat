@@ -589,7 +589,7 @@ func ensureQMIRawIP(ctx context.Context, ipCommand, networkInterface string) err
 		return fmt.Errorf("set %s down to enable qmi raw_ip: %w: %s", networkInterface, downErr, strings.TrimSpace(string(result)))
 	}
 	if err := os.WriteFile(path, []byte("Y\n"), 0o644); err != nil {
-		return fmt.Errorf("write %s qmi/raw_ip: %w", networkInterface, err)
+		return fmt.Errorf("write %s qmi/raw_ip: %w%s", networkInterface, err, readOnlySysfsHint(err))
 	}
 	current, err = os.ReadFile(path)
 	if err != nil || !strings.EqualFold(strings.TrimSpace(string(current)), "Y") {
@@ -601,6 +601,16 @@ func ensureQMIRawIP(ctx context.Context, ipCommand, networkInterface string) err
 	}
 	prepareRawIPLink(ctx, ipCommand, networkInterface)
 	return nil
+}
+
+func readOnlySysfsHint(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, syscall.EROFS) || strings.Contains(strings.ToLower(err.Error()), "read-only file system") {
+		return "; /sys is read-only (disable systemd ProtectKernelTunables or mount /sys read-write)"
+	}
+	return ""
 }
 
 func waitForInterface(ctx context.Context, networkInterface string, timeout time.Duration) {

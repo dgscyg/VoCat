@@ -8,6 +8,18 @@ import (
 	"testing"
 )
 
+func TestReadOnlySysfsHint(t *testing.T) {
+	if hint := readOnlySysfsHint(syscall.EROFS); hint == "" {
+		t.Fatal("EROFS produced no sysfs hint")
+	}
+	if hint := readOnlySysfsHint(errors.New("open /sys/class/net/wwan0/qmi/raw_ip: read-only file system")); hint == "" {
+		t.Fatal("read-only file system produced no sysfs hint")
+	}
+	if hint := readOnlySysfsHint(syscall.EBUSY); hint != "" {
+		t.Fatalf("EBUSY produced unexpected hint %q", hint)
+	}
+}
+
 func TestIsNoRouteError(t *testing.T) {
 	if !isNoRouteError(syscall.EHOSTUNREACH) {
 		t.Fatal("EHOSTUNREACH was not treated as no-route")

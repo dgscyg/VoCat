@@ -55,3 +55,17 @@ func TestInstallerProvidesRequiredQMIUtilities(t *testing.T) {
 		t.Error("installer does not install QMI utilities from its main path")
 	}
 }
+
+func TestInstallerLeavesSysfsWritableForQMIRawIP(t *testing.T) {
+	scriptBytes, err := os.ReadFile("../../scripts/install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(scriptBytes)
+	if !strings.Contains(script, "ProtectKernelTunables=false") {
+		t.Fatal("installer systemd unit remounts kernel tunables read-only; qmi/raw_ip cannot be written")
+	}
+	if strings.Contains(script, "ProtectKernelTunables=true") {
+		t.Fatal("installer still enables ProtectKernelTunables, which makes /sys read-only")
+	}
+}
