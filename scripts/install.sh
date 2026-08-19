@@ -460,7 +460,9 @@ ProtectKernelTunables=false
 ProtectControlGroups=true
 # The web/CLI self-updater verifies a release in this directory and atomically
 # renames it over the running binary. Keep the rest of the host read-only.
-ReadWritePaths=/opt/vocat/data /opt/vocat/bin
+# /run is required for iptables-legacy xtables.lock so Clash DNS/TCP
+# exemptions can be inserted for marked cellular sockets.
+ReadWritePaths=/opt/vocat/data /opt/vocat/bin /run
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
 RestrictRealtime=true
 LockPersonality=true

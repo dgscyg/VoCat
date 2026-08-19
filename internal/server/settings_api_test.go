@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"vocat/internal/developer"
 	"vocat/internal/store"
 )
 
@@ -836,12 +835,6 @@ func TestCardPolicyDefaultValidationAndPersistence(t *testing.T) {
 
 func TestTrafficAnalysisUsesAndAggregatesStoredBuckets(t *testing.T) {
 	test := newSettingsAPITest(t)
-	test.server.developerEnabled = true
-	if err := test.database.UpsertAppSetting(context.Background(), store.AppSetting{
-		Key: developer.EnabledSettingKey, Value: json.RawMessage(`{"enabled":true}`),
-	}); err != nil {
-		t.Fatal(err)
-	}
 	period := time.Now().UTC().Add(-time.Hour).Truncate(time.Minute)
 	for _, bucket := range []store.TrafficBucket{
 		{
@@ -894,11 +887,11 @@ func TestTrafficAnalysisUsesAndAggregatesStoredBuckets(t *testing.T) {
 	}
 }
 
-func TestTrafficAnalysisIsUnavailableOutsideDeveloperMode(t *testing.T) {
+func TestTrafficAnalysisIsAvailableOutsideDeveloperMode(t *testing.T) {
 	test := newSettingsAPITest(t)
 	recorder := test.request(t, http.MethodGet, "/api/traffic/analysis?range=week", "")
-	if recorder.Code != http.StatusForbidden {
-		t.Fatalf("traffic status = %d, want %d; body = %s", recorder.Code, http.StatusForbidden, recorder.Body)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("traffic status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body)
 	}
 }
 

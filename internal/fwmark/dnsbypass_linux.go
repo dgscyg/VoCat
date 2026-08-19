@@ -8,9 +8,11 @@ import (
 )
 
 // EnsureDNSBypass inserts iptables RETURN rules so marked export-proxy sockets
-// are not REDIRECTed by Clash/ShellCrash (shellcrash_dns_out hijacks :53 from
-// the cellular source address to 1053). ShellCrash already exempts mark
-// 0x1ed6; we exempt VoCat's own SO_MARK the same way.
+// are not hijacked by Clash/ShellCrash. ShellCrash REDIRECTs :53 from the
+// cellular source to 1053, and may also REDIRECT other TCP (public IP probes,
+// SOCKS CONNECT) into its redir port. It already exempts mark 0x1ed6; we
+// exempt VoCat's SO_MARK the same way, for every ShellCrash chain plus a
+// catch-all at the top of nat/mangle OUTPUT.
 func EnsureDNSBypass(mark uint32) {
 	if mark == 0 {
 		return
@@ -21,8 +23,17 @@ func EnsureDNSBypass(mark uint32) {
 		if err != nil {
 			continue
 		}
-		for _, chain := range []string{"shellcrash_dns_out", "shellcrash_dns"} {
-			insertIfMissing(path, []string{"-t", "nat", "-C", chain, "-m", "mark", "--mark", markText, "-j", "RETURN"},
+		for _, table := range []string{"nat", "mangle"} {
+			insertIfMissing(path,
+				[]string{"-t", table, "-C", "OUTPUT", "-m", "mark", "--mark", markText, "-j", "RETURN"},
+				[]string{"-t", table, "-I", "OUTPUT", "1", "-m", "mark", "--mark", markText, "-j", "RETURN"})
+		}
+		for _, chain := range []string{
+			"shellcrash_dns_out", "shellcrash_dns",
+			"shellcrash_out", "shellcrash_output", "shellcrash",
+		} {
+			insertIfMissing(path,
+				[]string{"-t", "nat", "-C", chain, "-m", "mark", "--mark", markText, "-j", "RETURN"},
 				[]string{"-t", "nat", "-I", chain, "1", "-m", "mark", "--mark", markText, "-j", "RETURN"})
 		}
 		for _, proto := range []string{"udp", "tcp"} {
