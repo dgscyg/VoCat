@@ -6,9 +6,27 @@ import (
 	"time"
 
 	"vocat/internal/device"
+	"vocat/internal/modem"
 	"vocat/internal/store"
 	"vocat/internal/vowifi"
 )
+
+func TestFillConfigFromPhysicalClassifiesDJI4G(t *testing.T) {
+	config := store.Device{DeviceType: store.DeviceTypePCIeEC20EC25}
+	entry := device.Device{Candidate: modem.Candidate{
+		VendorID:  "2ca3",
+		ProductID: "4006",
+	}}
+
+	fillConfigFromPhysical(&config, entry)
+
+	if config.DeviceType != store.DeviceTypeDJI4G {
+		t.Fatalf("device type = %q, want %q", config.DeviceType, store.DeviceTypeDJI4G)
+	}
+	if got := discoveredDeviceType(entry.Candidate); got != store.DeviceTypeDJI4G {
+		t.Fatalf("discovered device type = %q, want %q", got, store.DeviceTypeDJI4G)
+	}
+}
 
 func TestConfiguredDeviceSummaryIgnoresVoWiFiRuntimeFromPreviousSIM(t *testing.T) {
 	database, err := store.Open(context.Background(), ":memory:")
@@ -113,6 +131,29 @@ func TestConfiguredDeviceSummaryMarksIdleRuntimeAsNotInUse(t *testing.T) {
 	runtime := got["vowifi_runtime"].(map[string]any)
 	if runtime["enabled"] != false || got["vowifi_active"] != false {
 		t.Fatalf("summary = %#v", got)
+	}
+}
+
+func TestConfiguredDeviceOverviewAlwaysUsesLiveDiscoveredATPort(t *testing.T) {
+	database, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	s := &Server{store: database}
+	config := store.Device{ID: "ec20_1", ATPort: "/dev/ttyUSB9"}
+	entry := device.Device{Candidate: modem.Candidate{
+		ATPort: modem.Port{Path: "/dev/ttyUSB2", Role: modem.PortRoleAT},
+	}}
+
+	connected := s.configuredDeviceOverview(config, entry, true)
+	if got := connected["at_port"]; got != "/dev/ttyUSB2" {
+		t.Fatalf("connected AT port = %#v, want live /dev/ttyUSB2", got)
+	}
+
+	offline := s.configuredDeviceOverview(config, entry, false)
+	if got := offline["at_port"]; got != "" {
+		t.Fatalf("offline AT port = %#v, want empty instead of stored port", got)
 	}
 }
 

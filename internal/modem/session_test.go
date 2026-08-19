@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -27,6 +28,8 @@ type transcriptTransport struct {
 	unexpected    error
 	writePartial  bool
 	writeEvents   chan string
+	drainErrors   []error
+	drainCount    int
 }
 
 func (transport *transcriptTransport) Write(payload []byte) (int, error) {
@@ -114,7 +117,17 @@ func (transport *transcriptTransport) Read(buffer []byte) (int, error) {
 	return 0, nil
 }
 
-func (transport *transcriptTransport) Drain() error { return nil }
+func (transport *transcriptTransport) Drain() error {
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	transport.drainCount++
+	if len(transport.drainErrors) == 0 {
+		return nil
+	}
+	err := transport.drainErrors[0]
+	transport.drainErrors = transport.drainErrors[1:]
+	return err
+}
 
 func (transport *transcriptTransport) ResetInputBuffer() error {
 	transport.mu.Lock()
@@ -136,6 +149,31 @@ func (transport *transcriptTransport) Close() error {
 	transport.closed = true
 	transport.mu.Unlock()
 	return nil
+}
+
+func TestSessionRetriesInterruptedDrain(t *testing.T) {
+	transport := &transcriptTransport{
+		steps: []transportStep{{
+			write:  "AT+CSQ\r",
+			chunks: []string{"\r\nAT+CSQ\r\n+CSQ: 24,99\r\nOK\r\n"},
+		}},
+		drainErrors: []error{syscall.EINTR},
+	}
+	session, err := NewSession(transport, SessionOptions{})
+	if err != nil {
+		t.Fatalf("NewSession() error = %v", err)
+	}
+
+	response, err := session.Execute(context.Background(), "AT+CSQ")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if response.Final != "OK" {
+		t.Fatalf("response final = %q", response.Final)
+	}
+	if transport.drainCount != 2 {
+		t.Fatalf("Drain() calls = %d, want 2", transport.drainCount)
+	}
 }
 
 func TestSessionSeparatesInterleavedURCs(t *testing.T) {
@@ -412,6 +450,62 @@ func TestSessionExecutePromptRejectsUnsafeInput(t *testing.T) {
 		[]byte{'A', 0x1a},
 	); err == nil {
 		t.Fatal("expected Ctrl-Z payload rejection")
+	}
+}
+
+// drainOrderTransport forwards to an inner Transport while recording
+// transport-level events, so a test can assert the exact order of Drain and
+// Write calls.
+type drainOrderTransport struct {
+	inner  Transport
+	events chan string
+}
+
+func (transport *drainOrderTransport) Write(payload []byte) (int, error) {
+	transport.events <- "write:" + string(payload)
+	return transport.inner.Write(payload)
+}
+
+func (transport *drainOrderTransport) Read(buffer []byte) (int, error) {
+	return transport.inner.Read(buffer)
+}
+
+func (transport *drainOrderTransport) Drain() error {
+	transport.events <- "drain"
+	return transport.inner.Drain()
+}
+
+func (transport *drainOrderTransport) ResetInputBuffer() error {
+	return transport.inner.ResetInputBuffer()
+}
+
+func (transport *drainOrderTransport) SetReadTimeout(timeout time.Duration) error {
+	return transport.inner.SetReadTimeout(timeout)
+}
+
+func (transport *drainOrderTransport) Close() error {
+	return transport.inner.Close()
+}
+
+// WWAN transports discard stale bytes left over from a timed-out command
+// inside Drain, so the session must call it before writing the next command;
+// otherwise a late reply (e.g. a slow CGSN response) would be mis-parsed as
+// the new command's output.
+func TestSessionDrainsBeforeWritingCommand(t *testing.T) {
+	inner := &transcriptTransport{steps: []transportStep{{
+		write:  "AT+CSQ\r",
+		chunks: []string{"\r\n+CSQ: 24,99\r\nOK\r\n"},
+	}}}
+	events := make(chan string, 8)
+	session := newTestSession(t, &drainOrderTransport{inner: inner, events: events})
+	if _, err := session.Execute(context.Background(), "AT+CSQ"); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if first := <-events; first != "drain" {
+		t.Fatalf("first transport event = %q, want drain before the command write", first)
+	}
+	if second := <-events; second != "write:AT+CSQ\r" {
+		t.Fatalf("second transport event = %q, want the command write", second)
 	}
 }
 

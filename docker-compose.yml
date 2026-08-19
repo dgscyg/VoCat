@@ -20,7 +20,7 @@ services:
   vocat:
     # Use the prebuilt multi-arch image from GHCR. Override with
     # --build to compile from the local Dockerfile instead.
-    image: ghcr.io/mengmengcode/vocat:latest
+    image: ghcr.io/dgscyg/vocat:latest
     pull_policy: missing
     build:
       context: .

@@ -149,14 +149,14 @@ Pour un hôte Linux qui doit découvrir chaque modem Quectel pris en charge conn
 continuer à voir les événements de branchement à chaud USB, exécutez Vocat en mode d'accès matériel :
 
 ```bash
-docker pull ghcr.io/mengmengcode/vocat:latest
+docker pull ghcr.io/dgscyg/vocat:latest
 
 read -rsp "Admin password: " VOCAT_BOOTSTRAP_PASSWORD; echo
 printf '%s\n' "$VOCAT_BOOTSTRAP_PASSWORD" | docker run --rm -i \
   --user 0:0 \
   -v vocat-data:/opt/vocat/data \
   --entrypoint /opt/vocat/bin/vocat \
-  ghcr.io/mengmengcode/vocat:latest bootstrap-admin
+  ghcr.io/dgscyg/vocat:latest bootstrap-admin
 unset VOCAT_BOOTSTRAP_PASSWORD
 
 docker run -d \
@@ -168,7 +168,7 @@ docker run -d \
   -v vocat-data:/opt/vocat/data \
   -v /dev:/dev \
   -v /sys:/sys:ro \
-  ghcr.io/mengmengcode/vocat:latest
+  ghcr.io/dgscyg/vocat:latest
 ```
 
 Ouvrez `http://<adresse-du-serveur>:7575` après le démarrage du conteneur. Le réseau de l'hôte
@@ -237,7 +237,7 @@ L'updater télécharge le binaire correspondant à l'architecture Linux actuelle
 Pour les installations Docker :
 
 ```bash
-docker pull ghcr.io/mengmengcode/vocat:latest
+docker pull ghcr.io/dgscyg/vocat:latest
 ```
 
 Recréez le conteneur après avoir tiré la nouvelle image.
@@ -340,4 +340,4 @@ cd web && npm run build
 
 Voir [LICENSE](../LICENSE).
 
-[![GitHub stars](https://img.shields.io/github/stars/dgscyg/VoCat)](https://github.com/dgscyg/VoCat)
+[![MengMengCode/VoCat Star History](https://mengmeng.meteor-history.com/api/embed/MengMengCode/VoCat.svg?sig=sdeXRVxAoY3yLWgXL7JViY2USYIN3t9neJ6ScPvgUAo&theme=light&style=xkcd&color=dd4528&background=ffffff&textColor=000000&width=900&height=600&lineWidth=3&showTitle=true&showLegend=true&showDots=false&v=0.0.14)](https://meteor-history.com)

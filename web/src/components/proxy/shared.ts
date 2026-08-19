@@ -20,8 +20,13 @@ export interface UpstreamProbeResult {
   reachable?: boolean;
   handshakeOk?: boolean;
   udpAssociateOk?: boolean;
+  udpExchangeOk?: boolean;
   authMethod?: string;
   relayAddr?: string;
+  dnsServer?: string;
+  dnsName?: string;
+  dnsRcode?: number;
+  roundTripMs?: number;
   diagnosis?: string;
   hint?: string;
   error?: string;
@@ -29,6 +34,7 @@ export interface UpstreamProbeResult {
 
 export interface UpstreamRow extends UpstreamProxy {
   bindingCount: number;
+  countryNames: string[];
 }
 
 export function ipv6Hint(): string {

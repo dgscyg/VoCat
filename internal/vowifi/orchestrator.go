@@ -241,6 +241,7 @@ func (orchestrator *Orchestrator) Enable(ctx context.Context) (State, error) {
 			orchestrator.addWarning("SIM SMS service-centre address is unavailable; IMS receive remains available: " + smscErr.Error())
 		}
 	}
+	carrierProfile := ResolveCarrierProfile(identity)
 	orchestrator.mutate(func(state *State) {
 		state.Phase = PhaseSIMReady
 		state.ICCID = strings.TrimSpace(identity.ICCID)
@@ -248,6 +249,8 @@ func (orchestrator *Orchestrator) Enable(ctx context.Context) (State, error) {
 		state.SIMReady = true
 		state.HomeMCC = strings.TrimSpace(identity.HomeMCC)
 		state.HomeMNC = strings.TrimSpace(identity.HomeMNC)
+		state.CarrierProfile = carrierProfile.ID
+		state.CarrierProfileFrom = carrierProfile.MatchSource
 		state.LastReason = "sim_and_aka_ready"
 	})
 
@@ -645,8 +648,12 @@ func DeriveEPDG(identity SIMIdentity) (string, error) {
 		}
 		return strings.ToLower(configured), nil
 	}
-	if IsATT310280(identity) {
-		return att310280EPDG, nil
+	profile := ResolveCarrierProfile(identity)
+	if profile.EPDG != "" {
+		return profile.EPDG, nil
+	}
+	if profile.RouteMCC != "" {
+		return standardEPDGHostname(profile.RouteMCC, profile.RouteMNC), nil
 	}
 	if err := identity.validate(); err != nil {
 		return "", err

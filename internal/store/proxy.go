@@ -357,23 +357,11 @@ func upstreamProxy(row rowScanner) (UpstreamProxy, error) {
 }
 
 func (s *Store) UpsertDeviceProxyBinding(ctx context.Context, value DeviceProxyBinding) error {
-	value.DeviceID = strings.TrimSpace(value.DeviceID)
-	value.ICCID = strings.TrimSpace(value.ICCID)
-	value.ProfileName = strings.TrimSpace(value.ProfileName)
-	value.UpstreamProxyID = strings.TrimSpace(value.UpstreamProxyID)
-	if value.DeviceID == "" || value.ICCID == "" || value.UpstreamProxyID == "" {
-		return errors.New("profile proxy binding requires device ID, ICCID, and upstream proxy ID")
+	value, err := normalizeDeviceProxyBinding(value)
+	if err != nil {
+		return err
 	}
-	now := time.Now().UTC()
-	createdAt := value.CreatedAt
-	if createdAt.IsZero() {
-		createdAt = now
-	}
-	updatedAt := value.UpdatedAt
-	if updatedAt.IsZero() {
-		updatedAt = now
-	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO device_proxy_bindings (
 			iccid, device_id, profile_name, upstream_proxy_id, created_at, updated_at
 		) VALUES (?, ?, ?, ?, ?, ?)
@@ -382,11 +370,52 @@ func (s *Store) UpsertDeviceProxyBinding(ctx context.Context, value DeviceProxyB
 			profile_name = excluded.profile_name,
 			upstream_proxy_id = excluded.upstream_proxy_id,
 			updated_at = excluded.updated_at
-	`, value.ICCID, value.DeviceID, value.ProfileName, value.UpstreamProxyID, createdAt.Unix(), updatedAt.Unix())
+	`, value.ICCID, value.DeviceID, value.ProfileName, value.UpstreamProxyID, value.CreatedAt.Unix(), value.UpdatedAt.Unix())
 	if err != nil {
 		return fmt.Errorf("upsert proxy binding for ICCID %q: %w", value.ICCID, err)
 	}
 	return nil
+}
+
+// InsertDeviceProxyBindingIfAbsent materializes a default route without ever
+// replacing an explicit (or concurrently-created) ICCID binding.
+func (s *Store) InsertDeviceProxyBindingIfAbsent(ctx context.Context, value DeviceProxyBinding) (bool, error) {
+	value, err := normalizeDeviceProxyBinding(value)
+	if err != nil {
+		return false, err
+	}
+	result, err := s.db.ExecContext(ctx, `
+		INSERT INTO device_proxy_bindings (
+			iccid, device_id, profile_name, upstream_proxy_id, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(iccid) DO NOTHING
+	`, value.ICCID, value.DeviceID, value.ProfileName, value.UpstreamProxyID, value.CreatedAt.Unix(), value.UpdatedAt.Unix())
+	if err != nil {
+		return false, fmt.Errorf("insert proxy binding for ICCID %q if absent: %w", value.ICCID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read inserted proxy binding result for ICCID %q: %w", value.ICCID, err)
+	}
+	return affected > 0, nil
+}
+
+func normalizeDeviceProxyBinding(value DeviceProxyBinding) (DeviceProxyBinding, error) {
+	value.DeviceID = strings.TrimSpace(value.DeviceID)
+	value.ICCID = strings.TrimSpace(value.ICCID)
+	value.ProfileName = strings.TrimSpace(value.ProfileName)
+	value.UpstreamProxyID = strings.TrimSpace(value.UpstreamProxyID)
+	if value.DeviceID == "" || value.ICCID == "" || value.UpstreamProxyID == "" {
+		return DeviceProxyBinding{}, errors.New("profile proxy binding requires device ID, ICCID, and upstream proxy ID")
+	}
+	now := time.Now().UTC()
+	if value.CreatedAt.IsZero() {
+		value.CreatedAt = now
+	}
+	if value.UpdatedAt.IsZero() {
+		value.UpdatedAt = now
+	}
+	return value, nil
 }
 
 func (s *Store) DeviceProxyBinding(ctx context.Context, iccid string) (DeviceProxyBinding, error) {

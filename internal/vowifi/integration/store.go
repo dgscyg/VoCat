@@ -32,6 +32,7 @@ func (resolver ProxyResolver) Resolve(
 		return vowifi.ProxyRoute{Mode: vowifi.ProxyModeDirect}, nil
 	}
 	var upstreamID string
+	matchedCountryRule := false
 	if iccid != "" {
 		binding, err := resolver.Store.DeviceProxyBinding(ctx, iccid)
 		if err == nil {
@@ -43,7 +44,10 @@ func (resolver ProxyResolver) Resolve(
 	if upstreamID == "" {
 		country, found := device.CountryForMCC(strings.TrimSpace(request.HomeMCC))
 		if !found {
-			return vowifi.ProxyRoute{Mode: vowifi.ProxyModeDirect}, nil
+			country = strings.ToUpper(strings.TrimSpace(request.CountryCode))
+			if len(country) != 2 {
+				return vowifi.ProxyRoute{Mode: vowifi.ProxyModeDirect}, nil
+			}
 		}
 		rule, ruleErr := resolver.Store.CountryRule(ctx, country)
 		if errors.Is(ruleErr, store.ErrNotFound) || (ruleErr == nil && !rule.Enabled) {
@@ -53,6 +57,7 @@ func (resolver ProxyResolver) Resolve(
 			return vowifi.ProxyRoute{}, fmt.Errorf("resolve proxy country rule for MCC %s: %w", request.HomeMCC, ruleErr)
 		}
 		upstreamID = rule.UpstreamProxyID
+		matchedCountryRule = true
 	}
 	upstream, err := resolver.Store.UpstreamProxy(ctx, upstreamID)
 	if err != nil {
@@ -64,11 +69,42 @@ func (resolver ProxyResolver) Resolve(
 		)
 	}
 	if !upstream.Enabled {
+		if matchedCountryRule {
+			return vowifi.ProxyRoute{Mode: vowifi.ProxyModeDirect}, nil
+		}
 		return vowifi.ProxyRoute{}, fmt.Errorf(
 			"upstream proxy %q for device %s is disabled",
 			upstream.ID,
 			deviceID,
 		)
+	}
+	if matchedCountryRule && iccid != "" {
+		created, bindErr := resolver.Store.InsertDeviceProxyBindingIfAbsent(ctx, store.DeviceProxyBinding{
+			DeviceID:        deviceID,
+			ICCID:           iccid,
+			ProfileName:     iccid,
+			UpstreamProxyID: upstream.ID,
+		})
+		if bindErr != nil {
+			return vowifi.ProxyRoute{}, fmt.Errorf("materialize MCC proxy route for ICCID %s: %w", iccid, bindErr)
+		}
+		if !created {
+			// Another request or an administrator may have created an explicit
+			// binding after our first lookup. The persisted ICCID route wins.
+			binding, bindingErr := resolver.Store.DeviceProxyBinding(ctx, iccid)
+			if bindingErr != nil {
+				return vowifi.ProxyRoute{}, fmt.Errorf("reload proxy binding for ICCID %s: %w", iccid, bindingErr)
+			}
+			if binding.UpstreamProxyID != upstream.ID {
+				upstream, err = resolver.Store.UpstreamProxy(ctx, binding.UpstreamProxyID)
+				if err != nil {
+					return vowifi.ProxyRoute{}, fmt.Errorf("load materialized upstream proxy %q for device %s: %w", binding.UpstreamProxyID, deviceID, err)
+				}
+				if !upstream.Enabled {
+					return vowifi.ProxyRoute{}, fmt.Errorf("upstream proxy %q for device %s is disabled", upstream.ID, deviceID)
+				}
+			}
+		}
 	}
 	return vowifi.ProxyRoute{
 		Mode:     vowifi.ProxyModeSOCKS5,
@@ -198,6 +234,8 @@ func (projector StateProjector) Save(
 		"pure_airplane_policy": state.PureAirplanePolicy,
 		"home_mcc":             state.HomeMCC,
 		"home_mnc":             state.HomeMNC,
+		"carrier_profile":      state.CarrierProfile,
+		"carrier_profile_from": state.CarrierProfileFrom,
 		"warnings":             state.Warnings,
 		"cleanup_errors":       state.CleanupErrors,
 		"attempt":              state.Attempt,

@@ -57,6 +57,15 @@ func TestSMSThreadAllDevicesUsesIMSIFilter(t *testing.T) {
 	}
 }
 
+func TestNative410DoesNotUseModemSMSStorage(t *testing.T) {
+	if supportsModemSMSStorage(store.Device{DeviceType: store.DeviceTypeWiFi410}) {
+		t.Fatal("native OpenStick 410 unexpectedly enabled modem SMS storage polling")
+	}
+	if !supportsModemSMSStorage(store.Device{DeviceType: store.DeviceTypePCIeEC20EC25}) {
+		t.Fatal("EC20 modem SMS storage polling was disabled")
+	}
+}
+
 func TestSMSThreadConfiguredDeviceUsesStableIMEI(t *testing.T) {
 	ctx := context.Background()
 	database, err := store.Open(ctx, ":memory:")

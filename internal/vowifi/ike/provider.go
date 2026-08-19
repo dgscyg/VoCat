@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -20,17 +21,19 @@ import (
 )
 
 type Config struct {
-	Random             io.Reader
-	Resolver           *net.Resolver
-	Dialer             *net.Dialer
-	RootCAs            *x509.CertPool
-	ResponderPublicKey crypto.PublicKey
-	ServerName         string
-	Timeout            time.Duration
-	KeepaliveInterval  time.Duration
-	Installer          ChildSAInstaller
-	IdentityType       uint8
-	APN                string
+	Random               io.Reader
+	Resolver             *net.Resolver
+	Dialer               *net.Dialer
+	RootCAs              *x509.CertPool
+	ResponderPublicKey   crypto.PublicKey
+	ServerName           string
+	Timeout              time.Duration
+	KeepaliveInterval    time.Duration
+	Installer            ChildSAInstaller
+	IdentityType         uint8
+	APN                  string
+	AutoProposalFallback bool
+	Logger               *slog.Logger
 }
 
 type Provider struct {
@@ -41,6 +44,9 @@ type Provider struct {
 func NewProvider(config Config) (*Provider, error) {
 	if config.Random == nil {
 		config.Random = rand.Reader
+	}
+	if config.Logger == nil {
+		config.Logger = slog.Default()
 	}
 	if config.Resolver == nil {
 		config.Resolver = net.DefaultResolver
@@ -80,6 +86,30 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 	if provider == nil {
 		return nil, errors.New("ike: nil provider")
 	}
+	session, err := provider.start(ctx, request, false)
+	if err == nil || !provider.config.AutoProposalFallback {
+		return session, err
+	}
+	profile := vowifi.ResolveCarrierProfile(request.Identity)
+	if profile.ID != vowifi.CarrierProfileStandard || !retryableLegacyProposal(err) {
+		return nil, err
+	}
+	provider.config.Logger.Warn("IKE ePDG rejected modern proposal; trying bounded legacy fallback",
+		"carrier_profile", profile.ID, "from_proposal", vowifi.IKEProposalModern,
+		"to_proposal", vowifi.IKEProposalLegacy, "error", err)
+	session, fallbackErr := provider.start(ctx, request, true)
+	if fallbackErr != nil {
+		return nil, errors.Join(err, fmt.Errorf("ike: legacy proposal fallback failed: %w", fallbackErr))
+	}
+	provider.config.Logger.Info("IKE automatic legacy proposal fallback succeeded",
+		"carrier_profile", profile.ID, "proposal", vowifi.IKEProposalLegacy)
+	return session, nil
+}
+
+func (provider *Provider) start(ctx context.Context, request vowifi.TunnelRequest, forceLegacy bool) (vowifi.TunnelSession, error) {
+	if provider == nil {
+		return nil, errors.New("ike: nil provider")
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -110,8 +140,12 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 	}()
 
 	group := uint16(dhMODP2048)
-	legacyFirst := legacyIKEProfile(request.Identity.HomeMCC, request.Identity.HomeMNC)
-	advertiseEAPOnly := advertiseEAPOnlyAuthentication(request.Identity.HomeMCC, request.Identity.HomeMNC)
+	carrierProfile := vowifi.ResolveCarrierProfile(request.Identity)
+	legacyFirst := carrierProfile.IKEProposal == vowifi.IKEProposalLegacy
+	if forceLegacy {
+		legacyFirst = true
+	}
+	advertiseEAPOnly := carrierProfile.AdvertiseEAPOnly
 	if legacyFirst {
 		group = dhMODP1024
 	}
@@ -582,30 +616,6 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 	return session, nil
 }
 
-func legacyIKEProfile(mcc, mnc string) bool {
-	// Vodafone's UK and Netherlands ePDGs use the legacy group-2/SHA-1-first
-	// proposal ordering. Some Lebara UK subscriptions carry a 204-04 IMSI from
-	// that Vodafone NL core; treating them as a generic modern network causes
-	// IKE_SA_INIT to fail before EAP-AKA even begins.
-	plmn := strings.TrimSpace(mcc) + strings.TrimLeft(strings.TrimSpace(mnc), "0")
-	return plmn == "23415" || plmn == "2044"
-}
-
-func advertiseEAPOnlyAuthentication(mcc, mnc string) bool {
-	// Android exposes the ePDG authentication method as carrier policy rather
-	// than unconditionally requesting RFC 5998 EAP-only authentication. O2
-	// Germany's 262-03 ePDG rejects an initial IKE_AUTH that explicitly carries
-	// EAP_ONLY_AUTHENTICATION, but then implicitly defers responder AUTH when the
-	// notify is omitted. Do not advertise RFC 5998 for that PLMN; the final
-	// responder AUTH derived from the EAP-AKA MSK remains mandatory.
-	return !o2GermanyIKECompatibility(mcc, mnc)
-}
-
-func o2GermanyIKECompatibility(mcc, mnc string) bool {
-	plmn := strings.TrimSpace(mcc) + strings.TrimLeft(strings.TrimSpace(mnc), "0")
-	return plmn == "2623"
-}
-
 func buildInitialEAPAuth(
 	idi payload,
 	requestedIDr payload,
@@ -719,6 +729,27 @@ func decryptAndValidate(
 	return header, payloads, nil
 }
 
+var errNoProposalChosen = errors.New("ike: responder reported NO_PROPOSAL_CHOSEN")
+
+type invalidKEPayloadError struct {
+	group uint16
+}
+
+func (err *invalidKEPayloadError) Error() string {
+	if err.group != 0 {
+		return fmt.Sprintf("ike: responder requires DH group %d", err.group)
+	}
+	return "ike: responder reported INVALID_KE_PAYLOAD"
+}
+
+func retryableLegacyProposal(err error) bool {
+	if errors.Is(err, errNoProposalChosen) {
+		return true
+	}
+	var invalidKE *invalidKEPayloadError
+	return errors.As(err, &invalidKE) && (invalidKE.group == 0 || invalidKE.group == dhMODP1024)
+}
+
 func rejectFatalNotifications(payloads []payload) error {
 	for _, item := range payloadsOfType(payloads, payloadNotify) {
 		kind, data, err := parseNotify(item)
@@ -727,12 +758,12 @@ func rejectFatalNotifications(payloads []payload) error {
 		}
 		switch kind {
 		case notifyNoProposal:
-			return errors.New("ike: responder reported NO_PROPOSAL_CHOSEN")
+			return errNoProposalChosen
 		case notifyInvalidKE:
 			if len(data) == 2 {
-				return fmt.Errorf("ike: responder requires DH group %d", binary.BigEndian.Uint16(data))
+				return &invalidKEPayloadError{group: binary.BigEndian.Uint16(data)}
 			}
-			return errors.New("ike: responder reported INVALID_KE_PAYLOAD")
+			return &invalidKEPayloadError{}
 		}
 		if kind < 16384 {
 			return fmt.Errorf("ike: responder reported fatal notification %d", kind)

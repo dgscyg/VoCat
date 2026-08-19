@@ -33,6 +33,22 @@ func TestCardMCCMNC(t *testing.T) {
 	}
 }
 
+func TestPlaceholderIMSIIsNotTreatedAsARealCarrier(t *testing.T) {
+	t.Parallel()
+	if !IsPlaceholderIMSI("460000000000000") {
+		t.Fatal("all-zero subscriber identity should be treated as an unprovisioned placeholder")
+	}
+	if IsPlaceholderIMSI("460001234567890") {
+		t.Fatal("real subscriber identity was classified as a placeholder")
+	}
+	if mcc, mnc := CardMCCMNC("460000000000000"); mcc != "" || mnc != "" {
+		t.Fatalf("placeholder MCC/MNC = %q/%q, want empty", mcc, mnc)
+	}
+	if reason := RegionBlockReason("460000000000000"); reason != "" {
+		t.Fatalf("placeholder identity was region-blocked: %s", reason)
+	}
+}
+
 func TestRegionBlockReason(t *testing.T) {
 	t.Parallel()
 	for _, imsi := range []string{"460001234567890", "461001234567890"} {

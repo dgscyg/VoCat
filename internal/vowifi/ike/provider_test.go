@@ -25,12 +25,34 @@ func TestLegacyIKEProfileIncludesVodafoneHostedLebaraCore(t *testing.T) {
 		{mcc: "204", mnc: "04"},
 		{mcc: "204", mnc: "004"},
 	} {
-		if !legacyIKEProfile(item.mcc, item.mnc) {
-			t.Errorf("legacyIKEProfile(%q, %q) = false", item.mcc, item.mnc)
+		profile := vowifi.ResolveCarrierProfile(vowifi.SIMIdentity{HomeMCC: item.mcc, HomeMNC: item.mnc})
+		if profile.IKEProposal != vowifi.IKEProposalLegacy {
+			t.Errorf("carrier profile IKE proposal for %q/%q = %q", item.mcc, item.mnc, profile.IKEProposal)
 		}
 	}
-	if legacyIKEProfile("234", "87") {
+	if profile := vowifi.ResolveCarrierProfile(vowifi.SIMIdentity{HomeMCC: "234", HomeMNC: "87"}); profile.IKEProposal == vowifi.IKEProposalLegacy {
 		t.Fatal("Lebara's 234-87 core must use the modern IKE profile")
+	}
+}
+
+func TestLegacyProposalFallbackIsLimitedToNegotiationFailures(t *testing.T) {
+	for _, err := range []error{
+		errNoProposalChosen,
+		&invalidKEPayloadError{},
+		&invalidKEPayloadError{group: dhMODP1024},
+	} {
+		if !retryableLegacyProposal(err) {
+			t.Errorf("negotiation failure %v was not retryable", err)
+		}
+	}
+	for _, err := range []error{
+		&invalidKEPayloadError{group: dhMODP2048},
+		errors.New("ike: authentication failed"),
+		vowifi.ErrEAPAuthenticationRejected,
+	} {
+		if retryableLegacyProposal(err) {
+			t.Errorf("unsafe failure %v enabled legacy retry", err)
+		}
 	}
 }
 

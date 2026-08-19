@@ -128,8 +128,8 @@ func TestDeriveEPDGUsesExplicitPLMNAndNeverIMSIHeuristics(t *testing.T) {
 		{
 			name: "AT&T 310280 uses carrier endpoint",
 			identity: SIMIdentity{
-				ICCID:   "89012804332291663965",
-				IMSI:    "310280229187733",
+				ICCID:   "8901000000000000001",
+				IMSI:    "310280000000001",
 				HomeMCC: "310",
 				HomeMNC: "280",
 			},

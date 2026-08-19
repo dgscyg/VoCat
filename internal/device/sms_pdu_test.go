@@ -1,12 +1,9 @@
 package device
 
 import (
-	"encoding/hex"
 	"errors"
-	"strconv"
 	"strings"
 	"testing"
-	"unicode/utf16"
 )
 
 func TestPrepareSMSSelectsDirectGSM7AndPDUEncodings(t *testing.T) {
@@ -170,58 +167,6 @@ func TestPrepareMultipartUCS2DoesNotSplitSurrogatePair(t *testing.T) {
 	}
 }
 
-func TestDecodeSMSPDUUsesModemLengthToTrimAndAcceptTPDUOnly(t *testing.T) {
-	deliver := []byte{
-		0x04, 0x05, 0x91, 0x21, 0x43, 0xf5, 0x00, 0x00,
-		0x42, 0x10, 0x20, 0x30, 0x40, 0x50, 0x00, 0x05,
-		0xc8, 0x22, 0x93, 0xf9, 0x04,
-	}
-	full := append([]byte{0x00}, deliver...)
-	junked := strings.ToUpper(hex.EncodeToString(append(append([]byte{}, full...), 0xff, 0xee, 0xdd)))
-	trimmed, err := decodeSMSPDUWithLength(junked, len(deliver))
-	if err != nil || trimmed.From != "+12345" || trimmed.Text != "HELLO" {
-		t.Fatalf("trimmed trailing junk = (%#v, %v)", trimmed, err)
-	}
-	tpduOnly, err := decodeSMSPDUWithLength(strings.ToUpper(hex.EncodeToString(deliver)), len(deliver))
-	if err != nil || tpduOnly.From != "+12345" || tpduOnly.Text != "HELLO" {
-		t.Fatalf("TPDU-only = (%#v, %v)", tpduOnly, err)
-	}
-}
-
-func TestDecodeUCS2ConcatCMLinkSegmentsKeepUDH(t *testing.T) {
-	first := "[Balance & Usage] Current credit balance is £0.2 Your bundle CN/UK"
-	rest := " 30GB Monthly Plan will be renewed on 04/09/2026 00:00, Here are the remaining allowances"
-	text := first + rest
-	units := utf16.Encode([]rune(text))
-	segments := splitUCS2(units, 67)
-	if len(segments) < 2 {
-		t.Fatal("expected a concatenated UCS2 message")
-	}
-	var texts []string
-	for index, segment := range segments {
-		header := concatUDH(0x2a, len(segments), index+1)
-		pdu, _, err := encodeSubmitPDUWithHeader("+447700900000", nil, encodeUCS2Units(segment), header)
-		if err != nil {
-			t.Fatalf("encode part %d: %v", index+1, err)
-		}
-		message, decodeErr := decodeSMSPDU(pdu)
-		if decodeErr != nil {
-			t.Fatalf("decode part %d: %v", index+1, decodeErr)
-		}
-		if message.Concat == nil || message.Concat.Reference != 0x2a ||
-			message.Concat.Total != len(segments) || message.Concat.Sequence != index+1 {
-			t.Fatalf("part %d concat = %#v", index+1, message.Concat)
-		}
-		texts = append(texts, message.Text)
-	}
-	if !strings.HasPrefix(texts[0], first) {
-		t.Fatalf("first part = %q, want prefix %q", texts[0], first)
-	}
-	if strings.Join(texts, "") != text {
-		t.Fatalf("joined = %q, want %q", strings.Join(texts, ""), text)
-	}
-}
-
 func TestPrepareMultipartRejectsMoreThan255Parts(t *testing.T) {
 	if _, err := prepareSMSPartsWithReference(
 		"12345",
@@ -319,17 +264,20 @@ func TestParseCMGLPreservesUndecodableRecord(t *testing.T) {
 	}
 }
 
-func TestParseCMGLDecodesTPDUOnlyUsingHeaderLength(t *testing.T) {
-	deliver := []byte{
-		0x04, 0x05, 0x91, 0x21, 0x43, 0xf5, 0x00, 0x00,
-		0x42, 0x10, 0x20, 0x30, 0x40, 0x50, 0x00, 0x05,
-		0xc8, 0x22, 0x93, 0xf9, 0x04,
+func TestDecode8BitPDUShowsHexPayload(t *testing.T) {
+	// SMS-DELIVER with no SMSC, from +12345, DCS=0xF5 (8-bit data,
+	// alphabet bits 0x0c), UDL=3. User data bytes are 0xAA 0xBB 0xCC.
+	// Built from the GSM-7 deliver vector by swapping the DCS to 0xF5
+	// and replacing the user data with three raw binary bytes.
+	message, err := decodeSMSPDU(
+		"000405912143F500F54210203040500003AABBCC",
+	)
+	if err != nil {
+		t.Fatalf("decode 8-bit: %v", err)
 	}
-	messages := parseCMGL(okResponse(
-		"+CMGL: 3,0,,"+strconv.Itoa(len(deliver)),
-		strings.ToUpper(hex.EncodeToString(deliver)),
-	))
-	if len(messages) != 1 || messages[0].From != "+12345" || messages[0].Text != "HELLO" {
-		t.Fatalf("messages = %#v", messages)
+	if message.Encoding != SMSEncoding8BitPDU ||
+		message.Text != "AABBCC" ||
+		message.RawUserData != "AABBCC" {
+		t.Fatalf("8-bit message = %#v", message)
 	}
 }

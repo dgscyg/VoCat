@@ -422,7 +422,7 @@ func TestAssignedHomePLMNIncludesLebaraUKCores(t *testing.T) {
 		"204040123456789": "204/04",
 		"234150123456789": "234/15",
 		"234870123456789": "234/87",
-		"310280229187733": "310/280",
+		"310280000000001": "310/280",
 	}
 	for imsi, want := range tests {
 		mcc, mnc, ok := assignedHomePLMN(imsi)
@@ -434,7 +434,7 @@ func TestAssignedHomePLMNIncludesLebaraUKCores(t *testing.T) {
 
 func TestEC20AdapterTreatsATT310280AsThreeDigitMNC(t *testing.T) {
 	t.Parallel()
-	transcript := &ec20Transcript{t: t, steps: identityTranscriptStepsWithoutEFAD("310280229187733")}
+	transcript := &ec20Transcript{t: t, steps: identityTranscriptStepsWithoutEFAD("310280000000001")}
 	adapter, err := NewEC20Adapter(transcript, EC20AdapterOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -657,11 +657,11 @@ func TestEC20AdapterISIMStrictUsesCUADFullAID(t *testing.T) {
 		t: t,
 		steps: []ec20TranscriptStep{
 			{command: "AT+CPIN?", lines: []string{"+CPIN: READY"}},
-			{command: "AT+CIMI", lines: []string{"310280229187733"}},
-			{command: "AT+CCID", lines: []string{"+CCID: 89012804332291663965"}},
-			{command: "AT+CGSN", lines: []string{"863212060022487"}},
+			{command: "AT+CIMI", lines: []string{"310280000000001"}},
+			{command: "AT+CCID", lines: []string{"+CCID: 8901000000000000001"}},
+			{command: "AT+CGSN", lines: []string{"860000000000001"}},
 			{command: "AT+CUAD", lines: []string{`+CUAD: "` + cuad + `"`}},
-			{command: "AT+CCID", lines: []string{"+CCID: 89012804332291663965"}},
+			{command: "AT+CCID", lines: []string{"+CCID: 8901000000000000001"}},
 			{command: `AT+CCHO="` + fullISIM + `"`, lines: []string{"+CCHO: 1"}},
 			{
 				command:   authCommand,

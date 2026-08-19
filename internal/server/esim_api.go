@@ -11,6 +11,7 @@ import (
 
 	"vocat/internal/device"
 	"vocat/internal/store"
+	"vocat/internal/vowifi"
 )
 
 func esimUnavailable(w http.ResponseWriter) {
@@ -400,15 +401,41 @@ func (s *Server) handleEsimSwitch(w http.ResponseWriter, r *http.Request, config
 		writeError(w, http.StatusBadRequest, "invalid_request", "iccid is required")
 		return
 	}
+	endMaintenance := func() {}
+	if maintenance, ok := s.vowifi.(VoWiFiMaintenanceController); ok {
+		if err := maintenance.BeginMaintenance(configuredID); err != nil {
+			s.writeDeviceError(w, fmt.Errorf("prepare VoWiFi for profile switch: %w", err))
+			return
+		}
+		released := false
+		endMaintenance = func() {
+			if !released {
+				released = true
+				maintenance.EndMaintenance(configuredID)
+			}
+		}
+		defer endMaintenance()
+	}
+	// A live VoWiFi runtime owns the SIM/QMI session while AKA, IMS and SMS are
+	// active. Tear it down before touching flight mode or the ISD-R logical
+	// channel; otherwise native-WWAN devices wait on the QMI lease until the HTTP
+	// request times out. This only changes the runtime desired state. The saved
+	// per-ICCID policy is left intact and the target profile's policy is restored
+	// after the verified switch below.
+	if err := s.quiesceVoWiFiForProfileSwitch(r.Context(), configuredID); err != nil {
+		s.writeDeviceError(w, err)
+		return
+	}
 	// Profile operations run with RF disabled. The eUICC remains accessible in
-	// CFUN=4, and the recovery path reapplies CFUN=4 as soon as the AT port comes
-	// back after the mandatory modem reset.
+	// CFUN=4. Devices that consume the requested eUICC REFRESH stay online;
+	// older AT modems enter the reset recovery path and reapply CFUN=4 when the
+	// port returns.
 	if _, err := s.devices.SetFlight(r.Context(), physicalID, true); err != nil {
 		s.writeDeviceError(w, err)
 		return
 	}
-	// A confirmed profile switch includes the EC20 reset and a live ICCID read,
-	// which normally takes longer than the server's ordinary response deadline.
+	// A confirmed profile switch always includes a live ICCID read and may also
+	// include the EC20 reset fallback, so it can exceed the ordinary deadline.
 	controller := http.NewResponseController(w)
 	_ = controller.SetWriteDeadline(time.Time{})
 	aidHex := firstNonEmpty(request.AIDHex, request.AIDHexCamel)
@@ -454,6 +481,10 @@ func (s *Server) handleEsimSwitch(w http.ResponseWriter, r *http.Request, config
 		s.writeStoreError(w, err)
 		return
 	}
+	// The target profile is now active and its persisted policy has replaced the
+	// old runtime configuration. Allow reconciliation again before requesting
+	// the target profile's desired VoWiFi state.
+	endMaintenance()
 	canRestoreFlightImmediately := s.vowifi == nil
 	if s.vowifi != nil {
 		state, stateErr := s.vowifi.State(configuredID)
@@ -482,6 +513,40 @@ func (s *Server) handleEsimSwitch(w http.ResponseWriter, r *http.Request, config
 		"status": "switched", "iccid": iccid, "verified": true,
 		"card_policy": cardPolicyResponse(policy),
 	}})
+}
+
+func (s *Server) quiesceVoWiFiForProfileSwitch(ctx context.Context, configuredID string) error {
+	if s.vowifi == nil {
+		return nil
+	}
+	state, err := s.vowifi.State(configuredID)
+	if err != nil {
+		return fmt.Errorf("stop VoWiFi before switching profile: %w", err)
+	}
+	if !state.Enabled && !state.Active && state.Phase == vowifi.PhaseIdle {
+		return nil
+	}
+	if _, err := s.vowifi.RequestEnabled(configuredID, false); err != nil {
+		return fmt.Errorf("stop VoWiFi before switching profile: %w", err)
+	}
+	waitContext, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		state, err = s.vowifi.State(configuredID)
+		if err != nil {
+			return fmt.Errorf("wait for VoWiFi to stop before switching profile: %w", err)
+		}
+		if !state.Enabled && !state.Active && state.Phase == vowifi.PhaseIdle {
+			return nil
+		}
+		select {
+		case <-waitContext.Done():
+			return fmt.Errorf("wait for VoWiFi to stop before switching profile: %w", waitContext.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 func (s *Server) handleEsimDisable(w http.ResponseWriter, r *http.Request, physicalID string, physicalPresent bool) {

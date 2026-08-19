@@ -1,5 +1,5 @@
 import { useEffect, type ReactNode } from "react";
-import { SaveRegular } from "@fluentui/react-icons";
+import { ArrowSyncRegular, SaveRegular } from "@fluentui/react-icons";
 import { cx } from "../../lib/utils";
 import { Button, Input, Modal, Select, Spinner, Tag } from "../ui";
 import { isQmiControl } from "./shared";
@@ -17,6 +17,7 @@ export interface DeviceAddDialogProps {
   addConfig: AddDeviceForm;
   addSaving: boolean;
   onClose: () => void;
+  onRefresh: () => void;
   onSelectDevice: (d: DiscoveredDevice) => void;
   onConfigChange: (next: AddDeviceForm) => void;
   onSave: () => void;
@@ -85,7 +86,12 @@ export function DeviceAddDialog(props: DeviceAddDialogProps) {
         </div>
       }
     >
-      <div className="mb-3 text-sm text-gray-500">{t("选择一个“未配置”的设备，系统将自动填充 AT 端口与识别信息。")}</div>
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div className="text-sm text-gray-500">{t("选择一个“未配置”的设备，系统将自动填充 AT 端口与识别信息。")}</div>
+        <Button size="small" loading={props.discovering} onClick={props.onRefresh} icon={<ArrowSyncRegular />}>
+          {t("刷新设备")}
+        </Button>
+      </div>
       <div className="max-h-[260px] space-y-2 overflow-auto pr-1">
         {props.discovering ? (
           <div className="flex flex-col items-center justify-center py-10 text-gray-400">

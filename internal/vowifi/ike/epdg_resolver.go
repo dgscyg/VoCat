@@ -10,18 +10,11 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"vocat/internal/vowifi"
 )
 
 const googleDNSOverHTTPS = "https://dns.google/resolve"
-
-// A small number of operators publish the standard ePDG CNAME globally but
-// return its A records only when the recursive DNS query appears to originate
-// in the home country. Keep this list deliberately narrow: ordinary ePDGs must
-// continue to use the host resolver, and a fallback is attempted only after
-// that resolver has failed.
-var geoRestrictedEPDGSubnets = map[string]string{
-	"epdg.epc.mnc002.mcc262.pub.3gppnetwork.org": "109.192.0.0/24", // Vodafone Germany
-}
 
 type dnsOverHTTPSResponse struct {
 	Status int `json:"Status"`
@@ -41,7 +34,7 @@ func resolveEPDG(ctx context.Context, resolver *net.Resolver, host string) ([]ne
 	}
 
 	normalized := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
-	subnet := geoRestrictedEPDGSubnets[normalized]
+	subnet := vowifi.EPDGDNSClientSubnet(normalized)
 	if subnet == "" {
 		if systemErr != nil {
 			return nil, systemErr

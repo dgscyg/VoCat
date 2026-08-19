@@ -53,7 +53,7 @@ func (adapter *PCSCAdapter) ReadIdentity(ctx context.Context, deviceID string) (
 	mncLength := identity.MNCLength
 	if mncLength != 2 && mncLength != 3 {
 		if mcc, mnc, ok := assignedHomePLMN(identity.IMSI); ok {
-			return applyAssignedCarrierRoute(SIMIdentity{ICCID: identity.ICCID, IMSI: identity.IMSI, HomeMCC: mcc, HomeMNC: mnc, SMSC: identity.SMSC}), nil
+			return applyAssignedCarrierRoute(SIMIdentity{ICCID: identity.ICCID, IMSI: identity.IMSI, HomeMCC: mcc, HomeMNC: mnc, SMSC: identity.SMSC, SPN: identity.SPN}), nil
 		}
 		return SIMIdentity{}, ErrEC20MNCUnavailable
 	}
@@ -63,7 +63,7 @@ func (adapter *PCSCAdapter) ReadIdentity(ctx context.Context, deviceID string) (
 	return applyAssignedCarrierRoute(SIMIdentity{
 		ICCID: identity.ICCID, IMSI: identity.IMSI,
 		HomeMCC: identity.IMSI[:3], HomeMNC: identity.IMSI[3 : 3+mncLength],
-		SMSC: identity.SMSC,
+		SMSC: identity.SMSC, SPN: identity.SPN,
 	}), nil
 }
 

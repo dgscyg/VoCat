@@ -27,6 +27,7 @@ import (
 	"vocat/internal/extensions"
 	"vocat/internal/httpsmode"
 	"vocat/internal/loghub"
+	"vocat/internal/modem"
 	"vocat/internal/pcsc"
 	"vocat/internal/server"
 	"vocat/internal/store"
@@ -76,6 +77,16 @@ func main() {
 			logger.Error("update failed", "error", err)
 			os.Exit(1)
 		}
+	case "doctor":
+		if err := runDoctor(rest); err != nil {
+			logger.Error("doctor failed", "error", err)
+			os.Exit(1)
+		}
+	case "carrier":
+		if err := runCarrier(rest, os.Stdout); err != nil {
+			logger.Error("carrier command failed", "error", err)
+			os.Exit(1)
+		}
 	case "menu":
 		if err := runMenu(logger); err != nil {
 			logger.Error("menu failed", "error", err)
@@ -118,6 +129,10 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("load configuration: %w", err)
+	}
+	carrierProfileDir := filepath.Join(filepath.Dir(cfg.DatabasePath), "carrier-profiles.d")
+	if err := vowifi.LoadCarrierProfileDirectory(carrierProfileDir); err != nil {
+		return fmt.Errorf("load installed carrier profiles: %w", err)
 	}
 	instanceLock, err := lockServerInstance(cfg.DatabasePath)
 	if err != nil {
@@ -190,7 +205,7 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	}
 
 	cardReaders := pcsc.New()
-	deviceManager, err := device.NewManager(device.Options{CardReaders: cardReaders})
+	deviceManager, err := device.NewManager(device.Options{CardReaders: cardReaders, Logger: logger})
 	if err != nil {
 		return fmt.Errorf("create device manager: %w", err)
 	}
@@ -536,6 +551,13 @@ func configureVoWiFiRuntime(
 	if err != nil {
 		return nil, err
 	}
+	nativeQMIAdapter, err := vowifi.NewNativeQMIAdapter(nativeQMIControllerMapper{Mapper: mapper, Devices: deviceManager}, func(deviceID string) bool {
+		deviceConfig, configErr := database.Device(context.Background(), deviceID)
+		return configErr == nil && deviceConfig.VoWiFiEnabled
+	})
+	if err != nil {
+		return nil, err
+	}
 	pcscAdapter, err := vowifi.NewPCSCAdapter(cardReaders, func(ctx context.Context, deviceID string) (pcsc.Selector, string, error) {
 		config, resolveErr := database.Device(ctx, strings.TrimSpace(deviceID))
 		if resolveErr != nil {
@@ -561,8 +583,10 @@ func configureVoWiFiRuntime(
 			adapter := vowifiDeviceAdapter(ec20Adapter)
 			if deviceConfig.DeviceType == store.DeviceTypeUSBSIMReader {
 				adapter = pcscAdapter
+			} else if deviceConfig.DeviceType == store.DeviceTypeWiFi410 {
+				adapter = nativeQMIAdapter
 			}
-			return newVoWiFiOrchestrator(deviceConfig, database, adapter)
+			return newVoWiFiOrchestrator(deviceConfig, database, adapter, logger)
 		},
 	})
 
@@ -661,26 +685,25 @@ func newVoWiFiOrchestrator(
 	deviceConfig store.Device,
 	database *store.Store,
 	adapter vowifiDeviceAdapter,
+	logger *slog.Logger,
 ) (*vowifi.Orchestrator, error) {
 	apn := deviceConfig.APN
 	if apn == "" {
 		apn = "ims"
 	}
-	tunnelProvider, err := ike.NewProvider(ike.Config{APN: apn})
+	tunnelProvider, err := ike.NewProvider(ike.Config{
+		APN: apn, Logger: logger, AutoProposalFallback: true,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("device %q IKE provider: %w", deviceConfig.ID, err)
 	}
 	imsProvider, err := ims.NewProvider(adapter, ims.Config{
-		// The userspace SWu data plane carries protected P-CSCF signalling over
-		// TCP by default. UK PLMN 234-10 exposes its P-CSCF over UDP/5060 on SWu.
-		Transport: "tcp",
-		TransportByPLMN: map[string]string{
-			"23410":  "udp",
-			"234010": "udp",
-		},
-		// Some Vodafone UK SIM profiles leave AT+CSCA empty; Vodafone publishes
-		// this service-centre number for manual SMS setup.
-		SMSCenter: "+447785016005",
+		Logger: logger,
+		// Carrier-specific transport and SMSC defaults live in the shared data
+		// profile. Prefer network-provided P-CSCF hints, then safely try the
+		// alternate transport only if no SIP response was observed.
+		Transport:             "tcp",
+		AutoTransportFallback: true,
 		OnSMS: func(ctx context.Context, message ims.ReceivedSMS) error {
 			extra, _ := json.Marshal(map[string]any{
 				"transport":                "ims",
@@ -792,9 +815,9 @@ func provisionDiscoveredDevices(
 	}
 	for _, discovered := range manager.List() {
 		candidate := discovered.Candidate
+		deviceType := provisionedDeviceType(candidate)
 		backend := "at"
 		control := candidate.ATPort.OpenPath()
-		deviceType := store.DeviceTypePCIeEC20EC25
 		esimTransport := backend
 		if candidate.QMIControl != "" {
 			backend = "qmi"
@@ -811,6 +834,7 @@ func provisionDiscoveredDevices(
 		if name == "" || strings.EqualFold(name, "Android") {
 			name = "Quectel EC20 / EC25"
 		}
+		supportsSMS := deviceType != store.DeviceTypeWiFi410
 		if err := database.UpsertDevice(ctx, store.Device{
 			ID:             discovered.ID,
 			Name:           name,
@@ -827,13 +851,22 @@ func provisionDiscoveredDevices(
 			DeviceBackend:  backend,
 			ESIMTransport:  esimTransport,
 			NetworkEnabled: false,
-			SMSEnabled:     true,
+			SMSEnabled:     supportsSMS,
 			VoWiFiEnabled:  true,
 		}); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func provisionedDeviceType(candidate modem.Candidate) string {
+	controlName := filepath.Base(filepath.Clean(candidate.QMIControl))
+	if candidate.HardwareKind == "wwan" &&
+		strings.HasPrefix(controlName, "wwan") && strings.Contains(controlName, "qmi") {
+		return store.DeviceTypeWiFi410
+	}
+	return store.DeviceTypePCIeEC20EC25
 }
 
 // persistLogsToStore subscribes to the live log hub and durably appends every

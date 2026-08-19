@@ -82,6 +82,7 @@ type Server struct {
 	updateApplying      bool
 	https               *httpsmode.Manager
 	netTraffic          *liveNetTracker
+	hostStats           *hostStatsSampler
 	publicIPMu          sync.RWMutex
 	publicIPs           map[string]cachedPublicIP
 	automaticTasks      *automaticTaskScheduler
@@ -133,6 +134,7 @@ func New(options Options) (*Server, error) {
 		updateToken:         strings.TrimSpace(options.UpdateToken),
 		https:               options.HTTPS,
 		netTraffic:          newLiveNetTracker(),
+		hostStats:           newHostStatsSampler(),
 		publicIPs:           make(map[string]cachedPublicIP),
 		updateCheck:         update.CheckLatest,
 		updateApply:         update.ApplyLatest,
@@ -142,6 +144,9 @@ func New(options Options) (*Server, error) {
 	server.loadUILanguage(context.Background())
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", server.handleLiveness)
+	mux.HandleFunc("/readyz", server.handleReadiness)
+	mux.HandleFunc("/metrics", server.handleMetrics)
 	mux.HandleFunc("/api/health", server.handleHealth)
 	mux.HandleFunc("/api/auth/login", server.handleLogin)
 	mux.HandleFunc("/api/auth/session", server.handleSession)
@@ -165,6 +170,11 @@ type VoWiFiController interface {
 	State(string) (vowifi.State, error)
 	RequestEnabled(string, bool) (vowifi.State, error)
 	RequestReconnect(string) (vowifi.State, error)
+}
+
+type VoWiFiMaintenanceController interface {
+	BeginMaintenance(string) error
+	EndMaintenance(string)
 }
 
 type VoWiFiCallController interface {

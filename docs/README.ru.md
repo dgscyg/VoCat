@@ -149,14 +149,14 @@ sudo env \
 продолжать видеть события горячего подключения USB, запустите Vocat в режиме доступа к оборудованию:
 
 ```bash
-docker pull ghcr.io/mengmengcode/vocat:latest
+docker pull ghcr.io/dgscyg/vocat:latest
 
 read -rsp "Admin password: " VOCAT_BOOTSTRAP_PASSWORD; echo
 printf '%s\n' "$VOCAT_BOOTSTRAP_PASSWORD" | docker run --rm -i \
   --user 0:0 \
   -v vocat-data:/opt/vocat/data \
   --entrypoint /opt/vocat/bin/vocat \
-  ghcr.io/mengmengcode/vocat:latest bootstrap-admin
+  ghcr.io/dgscyg/vocat:latest bootstrap-admin
 unset VOCAT_BOOTSTRAP_PASSWORD
 
 docker run -d \
@@ -168,7 +168,7 @@ docker run -d \
   -v vocat-data:/opt/vocat/data \
   -v /dev:/dev \
   -v /sys:/sys:ro \
-  ghcr.io/mengmengcode/vocat:latest
+  ghcr.io/dgscyg/vocat:latest
 ```
 
 Откройте `http://<адрес-сервера>:7575` после запуска контейнера. Сеть хоста
@@ -236,7 +236,7 @@ sudo vocat update --repo dgscyg/VoCat
 Для установок Docker:
 
 ```bash
-docker pull ghcr.io/mengmengcode/vocat:latest
+docker pull ghcr.io/dgscyg/vocat:latest
 ```
 
 Пересоздайте контейнер после загрузки нового образа.
@@ -339,4 +339,4 @@ cd web && npm run build
 
 См. [LICENSE](../LICENSE).
 
-[![GitHub stars](https://img.shields.io/github/stars/dgscyg/VoCat)](https://github.com/dgscyg/VoCat)
+[![MengMengCode/VoCat Star History](https://mengmeng.meteor-history.com/api/embed/MengMengCode/VoCat.svg?sig=sdeXRVxAoY3yLWgXL7JViY2USYIN3t9neJ6ScPvgUAo&theme=light&style=xkcd&color=dd4528&background=ffffff&textColor=000000&width=900&height=600&lineWidth=3&showTitle=true&showLegend=true&showDots=false&v=0.0.14)](https://meteor-history.com)

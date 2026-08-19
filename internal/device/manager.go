@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ type Options struct {
 	SMSTimeout     time.Duration
 	ScanTimeout    time.Duration
 	CardReaders    *pcsc.Service
+	Logger         *slog.Logger
 }
 
 type Manager struct {
@@ -38,9 +40,15 @@ type Manager struct {
 	smsTimeout     time.Duration
 	scanTimeout    time.Duration
 	cardReaders    *pcsc.Service
-	started        bool
-	devices        map[string]*managedDevice
-	ussdSessions   map[string]ussdSession
+	logger         *slog.Logger
+
+	qmiRadioOpener                qmiRadioSessionOpener
+	nativeQMIRegistrationMu       sync.Mutex
+	nativeQMIRegistrationInFlight map[string]struct{}
+
+	started      bool
+	devices      map[string]*managedDevice
+	ussdSessions map[string]ussdSession
 }
 
 // LockUICC and UnlockUICC allow another in-process UICC client (currently the
@@ -115,6 +123,11 @@ func NewManager(options Options) (*Manager, error) {
 		smsTimeout:     options.SMSTimeout,
 		scanTimeout:    options.ScanTimeout,
 		cardReaders:    options.CardReaders,
+		logger:         options.Logger,
+
+		qmiRadioOpener:                openQMIRadioSession,
+		nativeQMIRegistrationInFlight: make(map[string]struct{}),
+
 		devices:        make(map[string]*managedDevice),
 		ussdSessions:   make(map[string]ussdSession),
 		esimRecoveries: make(map[string]chan struct{}),
@@ -232,7 +245,20 @@ func (manager *Manager) Discover(ctx context.Context) ([]Device, error) {
 		state.opMu.Unlock()
 	}
 	manager.resetChangedClients()
-	return manager.List(), nil
+
+	// List retains previously discovered devices so configured hardware can be
+	// rendered as offline after it is unplugged. Discover, however, is a fresh
+	// physical scan and must only return devices that are present now. Returning
+	// the retained entries here allowed an unplugged modem to be selected and
+	// added again from the device discovery screen.
+	devices := manager.List()
+	present := devices[:0]
+	for _, entry := range devices {
+		if entry.Discovered {
+			present = append(present, entry)
+		}
+	}
+	return present, nil
 }
 
 func (manager *Manager) resetChangedClients() {
@@ -351,10 +377,11 @@ func (manager *Manager) setResult(
 	err error,
 ) {
 	manager.mu.Lock()
-	defer manager.mu.Unlock()
 	if manager.devices[id] != state {
+		manager.mu.Unlock()
 		return
 	}
+	previousError := state.lastError
 	if snapshot != nil {
 		value := *snapshot
 		value.Warnings = append([]string(nil), snapshot.Warnings...)
@@ -365,6 +392,19 @@ func (manager *Manager) setResult(
 		state.lastError = err.Error()
 	} else {
 		state.lastError = ""
+	}
+	shouldLog := err != nil && manager.logger != nil && previousError != err.Error()
+	backend := state.backend
+	hardwareKind := state.candidate.HardwareKind
+	manager.mu.Unlock()
+	if shouldLog {
+		manager.logger.Warn(
+			"hardware operation failed",
+			"device_id", id,
+			"backend", backend,
+			"hardware_kind", hardwareKind,
+			"error", HardwareErrorDetail(err),
+		)
 	}
 }
 

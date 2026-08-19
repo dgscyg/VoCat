@@ -12,8 +12,6 @@ import { DeviceOverviewTab } from "../components/devices/DeviceOverviewTab";
 import { DeviceEsimTab } from "../components/devices/DeviceEsimTab";
 import { DeviceAtTab } from "../components/devices/DeviceAtTab";
 import { DeviceUssdTab } from "../components/devices/DeviceUssdTab";
-import { DeviceCallTab, IncomingCallBanner } from "../components/devices/DeviceCallTab";
-import { useDeviceCalls } from "../components/devices/useDeviceCalls";
 import { DeviceConfigTab } from "../components/devices/DeviceConfigTab";
 import { CardPolicyPanel } from "../components/devices/CardPolicyPanel";
 import { DeviceAddDialog } from "../components/devices/DeviceAddDialog";
@@ -22,7 +20,7 @@ import { copyText, isDeviceOnline, isQmiControl, isRecoveringPhase, readEventStr
 import type { AddDeviceForm, DeviceDetail, LoadError } from "../components/devices/types";
 import { tf, useI18n } from "../lib/i18n";
 
-const VALID_TABS = new Set(["overview", "esim", "call", "at", "ussd", "config", "card"]);
+const VALID_TABS = new Set(["overview", "esim", "at", "ussd", "config", "card"]);
 const EMPTY_ADD: AddDeviceForm = {
   id: "",
   name: "",
@@ -138,11 +136,17 @@ export default function DevicesPage() {
 
   const loadDiscovered = useCallback(async () => {
     setDiscovering(true);
+    // Never leave a previous physical scan visible while a new scan is in
+    // progress or after it fails.
+    setDiscovered([]);
+    setAddSelected(null);
+    setAddConfig(EMPTY_ADD);
     try {
       const res = await api<{ devices?: DiscoveredDevice[] }>("/devices/discovered?with_imei=1");
-      setDiscovered(Array.isArray(res?.devices) ? res!.devices! : []);
+      const devices = Array.isArray(res?.devices) ? res!.devices! : [];
+      setDiscovered(devices);
     } catch {
-      /* ignore */
+      setDiscovered([]);
     } finally {
       setDiscovering(false);
     }
@@ -298,21 +302,18 @@ export default function DevicesPage() {
     try {
       await api("/devices/actions/rescan", { method: "POST" });
       message.success(t("设备重新扫描完成"));
-      await loadDevices(true);
+      await Promise.all([loadDevices(true), loadDiscovered()]);
     } catch (e) {
       message.error(apiMessage(e) || t("重新扫描失败"));
     } finally {
       setRescanning(false);
     }
-  }, [loadDevices]);
+  }, [loadDevices, loadDiscovered]);
 
   const handleOpenSms = useCallback(() => {
     const id = selectedIdRef.current;
     if (id) navigate(`/sms?device=${id}`);
   }, [navigate]);
-  const handleOpenCall = useCallback(() => {
-    handleTabChange("call");
-  }, [handleTabChange]);
   const handleSaveConfig = useCallback(async () => {
     const id = selectedIdRef.current.trim();
     if (!id || !editConfig) return;
@@ -397,7 +398,7 @@ export default function DevicesPage() {
         modemImei: d.imei || "",
         usbPath: d.usbPath || "",
         deviceBackend: backend,
-		deviceType: isReader ? "usb_sim_reader" : prev.deviceType,
+		deviceType: d.deviceType || (isReader ? "usb_sim_reader" : prev.deviceType),
 		esimTransport: isReader ? "pcsc" : backend,
       };
     });
@@ -592,7 +593,7 @@ export default function DevicesPage() {
 
   const detailOnline = isDeviceOnline(detail);
 	const isReader = detail?.deviceType === "usb_sim_reader";
-  const callSession = useDeviceCalls(selectedId, !!detail && detailOnline);
+	const isNative410 = detail?.deviceType === "wifi_410";
 	useEffect(() => {
 		if (isReader && ["at", "ussd"].includes(activeTab)) setActiveTab("overview");
 	}, [isReader, activeTab]);
@@ -600,7 +601,6 @@ export default function DevicesPage() {
   const tabItems = [
     { key: "overview", label: t("概览") },
     { key: "esim", label: t("eSIM") },
-    { key: "call", label: t("通话") },
     { key: "at", label: t("AT 终端") },
     { key: "ussd", label: t("USSD") },
     { key: "config", label: t("配置") },
@@ -696,21 +696,9 @@ export default function DevicesPage() {
                 onReconnectVowifi={handleReconnectVoWiFi}
                 onRebootModem={handleRebootModem}
                 onOpenSms={handleOpenSms}
-                onOpenCall={handleOpenCall}
 				wifiCallingOnly={isReader}
+				modemControlOnly={isNative410}
               />
-              {callSession.incoming && activeTab !== "call" ? (
-                <IncomingCallBanner
-                  call={callSession.incoming}
-                  busy={callSession.busy}
-                  onAnswer={() => {
-                    handleTabChange("call");
-                    void callSession.answer(callSession.incoming!.id);
-                  }}
-                  onHangup={() => void callSession.hangup(callSession.incoming!.id)}
-                  onOpenTab={() => handleTabChange("call")}
-                />
-              ) : null}
               <div className="device-detail-tabs ui-card p-6">
                 <Tabs tabs={tabItems} value={activeTab} onChange={handleTabChange} />
                 <div className="mt-5">
@@ -729,7 +717,6 @@ export default function DevicesPage() {
                   {activeTab === "at" ? (
                     <DeviceAtTab deviceId={detail.id} backendMode={detail.backendMode} atPort={detail.atPort} running={detail.running} />
                   ) : null}
-                  {activeTab === "call" ? <DeviceCallTab device={detail} online={detailOnline} session={callSession} /> : null}
                   {activeTab === "ussd" ? <DeviceUssdTab deviceId={detail.id} /> : null}
                   {activeTab === "config" ? (
                     <DeviceConfigTab editConfig={editConfig} deviceStatus={detail} saving={saving} deleting={deleting} onSave={handleSaveConfig} onDelete={handleDeleteDevice} onEditConfig={setEditConfig} />
@@ -757,6 +744,7 @@ export default function DevicesPage() {
         addConfig={addConfig}
         addSaving={addSaving}
         onClose={() => setAddOpen(false)}
+        onRefresh={() => void loadDiscovered()}
         onSelectDevice={selectDiscovered}
         onConfigChange={setAddConfig}
         onSave={saveAdd}

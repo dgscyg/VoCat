@@ -142,6 +142,9 @@ func (s *Server) routeDeviceAPI(w http.ResponseWriter, r *http.Request) bool {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"data": s.dashboardDevices()})
 		return true
+	case "dashboard/host":
+		s.handleDashboardHost(w, r)
+		return true
 	case "devices":
 		return s.handleDevices(w, r)
 	case "devices/discovered":
@@ -239,10 +242,14 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) bool {
 			return true
 		}
 		config := payload.toStoreDevice()
+		isNative410 := config.DeviceType == store.DeviceTypeWiFi410
 		// Newly added hardware starts fail-closed: RF is disabled immediately and
-		// VoWiFi becomes the desired service. Cellular registration is only
-		// restored by the user's later airplane-mode-off action.
+		// VoWiFi becomes the desired service on supported devices. Native 410
+		// uses its QMI UIM/DMS/NAS adapter; only cellular SMS remains unavailable.
 		config.VoWiFiEnabled = true
+		if isNative410 {
+			config.SMSEnabled = false
+		}
 		config.NetworkEnabled = false
 		fillConfigFromPhysical(&config, *selected)
 		if pinSetter, ok := s.devices.(interface{ SetSIMPin(string, string) error }); ok {
@@ -281,7 +288,7 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) bool {
 				}
 			}
 		}
-		if s.vowifi != nil {
+		if s.vowifi != nil && config.VoWiFiEnabled {
 			if _, err := s.vowifi.RequestEnabled(config.ID, true); err != nil {
 				s.logger.Warn("new device saved in safe airplane mode but VoWiFi start was not queued", "device_id", config.ID, "error", err)
 			}
@@ -341,7 +348,14 @@ func (s *Server) handleDiscoveredDevices(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"devices": []any{}}})
 		return true
 	}
-	devices := s.devices.List()
+	// This endpoint backs the add-device dialog. Always perform a new physical
+	// scan instead of serving Manager.List(), which intentionally retains
+	// unplugged configured devices so the main device list can show them offline.
+	devices, err := s.devices.Discover(r.Context())
+	if err != nil {
+		s.writeDeviceError(w, err)
+		return true
+	}
 	configured, err := s.store.ListDevices(r.Context())
 	if err != nil {
 		s.writeStoreError(w, err)
@@ -349,6 +363,9 @@ func (s *Server) handleDiscoveredDevices(w http.ResponseWriter, r *http.Request)
 	}
 	result := make([]map[string]any, 0, len(devices))
 	for _, entry := range devices {
+		if !entry.Discovered {
+			continue
+		}
 		candidate := entry.Candidate
 		atPorts := make([]string, 0, len(candidate.Ports))
 		for _, port := range candidate.Ports {
@@ -370,6 +387,7 @@ func (s *Server) handleDiscoveredDevices(w http.ResponseWriter, r *http.Request)
 		result = append(result, map[string]any{
 			"hardware_kind":   candidate.HardwareKind,
 			"reader_name":     candidate.ReaderName,
+			"device_type":     discoveredDeviceType(candidate),
 			"discovery_key":   entry.ID,
 			"control_path":    controlPath,
 			"net_interface":   candidate.NetworkInterface,
@@ -458,10 +476,9 @@ func (s *Server) handleDevicePath(
 			next := payload.toStoreDevice()
 			next.ID = id
 			next.CreatedAt = config.CreatedAt
-			// VoWiFi/airplane/roaming transitions are transactional device
-			// actions. A general config save must not silently bypass them.
+			// VoWiFi/airplane transitions are transactional device actions. A
+			// general config save must not silently bypass their RF-safe ordering.
 			next.VoWiFiEnabled = config.VoWiFiEnabled
-			next.NetworkEnabled = config.NetworkEnabled
 			if next.Name == id && strings.TrimSpace(payload.Name) == "" {
 				next.Name = config.Name
 			}
@@ -497,6 +514,10 @@ func (s *Server) handleDevicePath(
 	}
 
 	entry, physicalID, physicalPresent := s.physicalForConfig(config)
+	if config.DeviceType == store.DeviceTypeWiFi410 && native410UnsupportedOperation(tail) {
+		writeError(w, http.StatusNotImplemented, "device_feature_unsupported", "this feature is not supported by the native OpenStick 410 backend")
+		return true
+	}
 	if config.DeviceType == store.DeviceTypeUSBSIMReader && len(tail) > 0 {
 		operation := strings.Join(tail, "/")
 		unsupported := tail[0] == "network" || tail[0] == "operator_selection" ||
@@ -646,6 +667,14 @@ func (s *Server) handleDevicePath(
 		return false
 	}
 	return true
+}
+
+func native410UnsupportedOperation(tail []string) bool {
+	if len(tail) == 0 {
+		return false
+	}
+	operation := strings.Join(tail, "/")
+	return tail[0] == "calls" || operation == "actions/reboot"
 }
 
 func (s *Server) handleUSBNetMode(w http.ResponseWriter, r *http.Request, physicalID string) bool {
@@ -1024,6 +1053,26 @@ func (s *Server) handleAT(w http.ResponseWriter, r *http.Request, id string) boo
 	defer cancel()
 	response, err := s.devices.ExecuteAT(ctx, id, command)
 	if err != nil {
+		var commandErr *modem.CommandError
+		if errors.As(err, &commandErr) {
+			// The modem answered with ERROR / +CME ERROR. An AT terminal must
+			// surface that text (including the CME detail) as a normal response;
+			// folding it into a 502 hides the real reason from the user.
+			text := strings.Join(commandErr.Lines, "\n")
+			if text != "" {
+				text += "\n"
+			}
+			text += commandErr.Final
+			writeJSON(w, http.StatusOK, map[string]any{
+				"data": map[string]any{
+					"response":    text,
+					"final":       commandErr.Final,
+					"duration_ms": 0,
+					"urcs":        []string{},
+				},
+			})
+			return true
+		}
 		s.writeDeviceError(w, err)
 		return true
 	}
@@ -1389,9 +1438,9 @@ func (s *Server) writeDeviceError(w http.ResponseWriter, err error) {
 	case errors.Is(err, context.Canceled):
 		writeError(w, http.StatusRequestTimeout, "request_canceled", "the modem request was canceled")
 	default:
-		// Device errors may echo an AT command. Authentication commands can
-		// contain APN credentials, so keep raw errors out of logs and responses.
-		s.logger.Warn("device operation failed")
+		// Preserve the hardware failure reason in the operator-visible log while
+		// keeping AT payloads and long APDU material out of it.
+		s.logger.Warn("device operation failed", "error", device.HardwareErrorDetail(err))
 		writeError(w, http.StatusBadGateway, "modem_error", "the device operation failed")
 	}
 }
@@ -1466,7 +1515,13 @@ func physicalMatchesConfig(entry device.Device, config store.Device) bool {
 		return config.ModemIMEI == entry.Snapshot.IMEI
 	}
 	if config.USBPath != "" && candidate.USBPath != "" {
-		return config.USBPath == candidate.USBPath
+		if config.USBPath == candidate.USBPath {
+			return true
+		}
+		// Sysfs paths may be stored through /sys/class symlinks while a
+		// subsequent discovery returns the resolved device path. Keep checking
+		// the selected AT/QMI nodes instead of rejecting a modem whose physical
+		// path spelling changed but whose control plane is unchanged.
 	}
 	// Control and serial device nodes are allocation-order dependent. They are
 	// only legacy fallbacks when no physical USB path or readable IMEI exists.
@@ -1573,7 +1628,14 @@ func (s *Server) configuredDeviceOverview(
 	result["id"] = config.ID
 	result["name"] = config.Name
 	result["interface"] = config.Interface
-	result["at_port"] = config.ATPort
+	// ttyUSB allocation changes across USB reconnects and boot cycles. The AT
+	// terminal must use only the currently discovered physical port; a stored
+	// path may point at another modem after enumeration order changes.
+	liveATPort := ""
+	if present {
+		liveATPort = entry.Candidate.ATPort.OpenPath()
+	}
+	result["at_port"] = liveATPort
 	result["audio_device"] = config.AudioDevice
 	result["backend_mode"] = config.DeviceBackend
 	result["control_device"] = config.ControlDevice
@@ -1647,56 +1709,60 @@ func storedVoWiFiRuntime(runtime store.VoWiFiRuntime) map[string]any {
 	enabled, _ := extra["enabled"].(bool)
 	active, _ := extra["active"].(bool)
 	return map[string]any{
-		"device_id":           runtime.DeviceID,
-		"phase":               runtime.Phase,
-		"enabled":             enabled,
-		"active":              active,
-		"dataplane_mode":      runtime.DataplaneMode,
-		"iccid":               runtime.ICCID,
-		"imsi":                runtime.IMSI,
-		"sim_ready":           runtime.SIMReady,
-		"access_ready":        runtime.AccessReady,
-		"tunnel_ready":        runtime.TunnelReady,
-		"ims_ready":           runtime.IMSReady,
-		"sms_ready":           runtime.SMSReady,
-		"reg_status":          runtime.RegStatus,
-		"reg_status_text":     runtime.RegStatusText,
-		"network_mode":        runtime.NetworkMode,
-		"local_phone":         runtime.LocalPhone,
-		"phone_number_source": runtime.PhoneNumberSource,
-		"last_error_class":    runtime.LastErrorClass,
-		"last_error":          runtime.LastError,
-		"last_reason":         runtime.LastReason,
-		"updated_at":          runtime.UpdatedAt,
-		"tunnel":              rawJSONObject(runtime.Tunnel),
-		"imscore":             rawJSONObject(runtime.IMSCore),
-		"smsip":               rawJSONObject(runtime.SMSIP),
+		"device_id":            runtime.DeviceID,
+		"phase":                runtime.Phase,
+		"enabled":              enabled,
+		"active":               active,
+		"carrier_profile":      extra["carrier_profile"],
+		"carrier_profile_from": extra["carrier_profile_from"],
+		"dataplane_mode":       runtime.DataplaneMode,
+		"iccid":                runtime.ICCID,
+		"imsi":                 runtime.IMSI,
+		"sim_ready":            runtime.SIMReady,
+		"access_ready":         runtime.AccessReady,
+		"tunnel_ready":         runtime.TunnelReady,
+		"ims_ready":            runtime.IMSReady,
+		"sms_ready":            runtime.SMSReady,
+		"reg_status":           runtime.RegStatus,
+		"reg_status_text":      runtime.RegStatusText,
+		"network_mode":         runtime.NetworkMode,
+		"local_phone":          runtime.LocalPhone,
+		"phone_number_source":  runtime.PhoneNumberSource,
+		"last_error_class":     runtime.LastErrorClass,
+		"last_error":           runtime.LastError,
+		"last_reason":          runtime.LastReason,
+		"updated_at":           runtime.UpdatedAt,
+		"tunnel":               rawJSONObject(runtime.Tunnel),
+		"imscore":              rawJSONObject(runtime.IMSCore),
+		"smsip":                rawJSONObject(runtime.SMSIP),
 	}
 }
 
 func liveVoWiFiRuntime(runtime vowifi.State) map[string]any {
 	return map[string]any{
-		"device_id":           runtime.DeviceID,
-		"phase":               string(runtime.Phase),
-		"enabled":             runtime.Enabled,
-		"active":              runtime.Active,
-		"dataplane_mode":      runtime.DataplaneMode,
-		"iccid":               runtime.ICCID,
-		"imsi":                runtime.IMSI,
-		"sim_ready":           runtime.SIMReady,
-		"access_ready":        runtime.AccessReady,
-		"tunnel_ready":        runtime.TunnelReady,
-		"ims_ready":           runtime.IMSReady,
-		"sms_ready":           runtime.SMSReady,
-		"reg_status":          map[bool]int{true: 1, false: 0}[runtime.IMSReady],
-		"reg_status_text":     map[bool]string{true: "registered", false: "not registered"}[runtime.IMSReady],
-		"network_mode":        "Wi-Fi",
-		"local_phone":         runtime.PhoneNumber,
-		"phone_number_source": runtime.PhoneNumberSource,
-		"last_error_class":    runtime.LastErrorClass,
-		"last_error":          runtime.LastError,
-		"last_reason":         runtime.LastReason,
-		"updated_at":          runtime.UpdatedAt,
+		"device_id":            runtime.DeviceID,
+		"phase":                string(runtime.Phase),
+		"enabled":              runtime.Enabled,
+		"active":               runtime.Active,
+		"carrier_profile":      runtime.CarrierProfile,
+		"carrier_profile_from": runtime.CarrierProfileFrom,
+		"dataplane_mode":       runtime.DataplaneMode,
+		"iccid":                runtime.ICCID,
+		"imsi":                 runtime.IMSI,
+		"sim_ready":            runtime.SIMReady,
+		"access_ready":         runtime.AccessReady,
+		"tunnel_ready":         runtime.TunnelReady,
+		"ims_ready":            runtime.IMSReady,
+		"sms_ready":            runtime.SMSReady,
+		"reg_status":           map[bool]int{true: 1, false: 0}[runtime.IMSReady],
+		"reg_status_text":      map[bool]string{true: "registered", false: "not registered"}[runtime.IMSReady],
+		"network_mode":         "Wi-Fi",
+		"local_phone":          runtime.PhoneNumber,
+		"phone_number_source":  runtime.PhoneNumberSource,
+		"last_error_class":     runtime.LastErrorClass,
+		"last_error":           runtime.LastError,
+		"last_reason":          runtime.LastReason,
+		"updated_at":           runtime.UpdatedAt,
 		"tunnel": map[string]any{
 			"established":    runtime.TunnelReady,
 			"name":           runtime.TunnelName,
@@ -1870,6 +1936,8 @@ func fillConfigFromPhysical(config *store.Device, entry device.Device) {
 		config.NetworkEnabled = false
 		config.SMSEnabled = true
 		config.VoWiFiEnabled = true
+	} else if modem.IsDJI4GUSB(candidate.VendorID, candidate.ProductID) {
+		config.DeviceType = store.DeviceTypeDJI4G
 	}
 	if config.Interface == "" {
 		config.Interface = candidate.NetworkInterface
@@ -1892,6 +1960,16 @@ func fillConfigFromPhysical(config *store.Device, entry device.Device) {
 	if config.ESIMTransport == "" {
 		config.ESIMTransport = config.DeviceBackend
 	}
+}
+
+func discoveredDeviceType(candidate modem.Candidate) string {
+	if candidate.HardwareKind == "pcsc" {
+		return store.DeviceTypeUSBSIMReader
+	}
+	if modem.IsDJI4GUSB(candidate.VendorID, candidate.ProductID) {
+		return store.DeviceTypeDJI4G
+	}
+	return ""
 }
 
 func modemSummary(snapshot *device.Snapshot, phone string, phoneSource string) map[string]any {

@@ -1,0 +1,98 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "id": "xesim-lebara-vodafone-uk",
+      "match": {
+        "home_plmns": ["20404"],
+        "imsi_prefixes": ["204047"],
+        "iccid_prefixes": ["894416"]
+      },
+      "route": { "mcc": "234", "mnc": "15" },
+      "ike": { "proposal": "legacy-sha1-modp1024" }
+    },
+    {
+      "id": "ee-uk-hosted-23433",
+      "match": {
+        "home_plmns": ["23433"],
+        "imsi_prefixes": ["23433"],
+        "iccid_prefixes": ["894430"]
+      },
+      "route": { "mcc": "234", "mnc": "30" },
+      "ims": {
+        "pani_country": "GB",
+        "pani_node": "000000000000",
+        "dial_uri_scheme": "sip",
+        "voice_codecs": ["PCMA", "PCMU"]
+      }
+    },
+    {
+      "id": "att-us",
+      "match": {
+        "home_plmns": ["310280"],
+        "imsi_prefixes": ["310280"]
+      },
+      "epdg": { "hostname": "epdg.epc.att.net" },
+      "ims": {
+        "identity_profile": "att",
+        "register_profile": "att",
+        "ipsec_encryption": "aes-cbc"
+      }
+    },
+    {
+      "id": "o2-germany",
+      "match": { "home_plmns": ["26203"] },
+      "ike": { "advertise_eap_only": false },
+      "ims": {
+        "register_profile": "o2-germany",
+        "ipsec_encryption": "null"
+      }
+    },
+    {
+      "id": "vodafone-uk",
+      "match": { "home_plmns": ["23415"] },
+      "ike": { "proposal": "legacy-sha1-modp1024" },
+      "ims": { "sms_center": "+447785016005" }
+    },
+    {
+      "id": "vodafone-netherlands",
+      "match": { "home_plmns": ["20404"] },
+      "ike": { "proposal": "legacy-sha1-modp1024" }
+    },
+    {
+      "id": "giffgaff-o2-uk",
+      "match_any": [
+        {
+          "home_plmns": ["23410"],
+          "gid1_prefixes": ["508"]
+        },
+        {
+          "home_plmns": ["23410"],
+          "spns": ["giffgaff"]
+        }
+      ],
+      "ims": {
+        "transport": "udp",
+        "sms_center": "+447802002606",
+        "user_eq_phone": true
+      }
+    },
+    {
+      "id": "o2-uk",
+      "match": { "home_plmns": ["23410"] },
+      "ims": {
+        "transport": "udp",
+        "sms_center": "+447802000332",
+        "user_eq_phone": true
+      }
+    },
+    {
+      "id": "vodafone-germany",
+      "match": { "home_plmns": ["26202"] },
+      "epdg": {
+        "dns_hosts": ["epdg.epc.mnc002.mcc262.pub.3gppnetwork.org"],
+        "dns_client_subnet": "109.192.0.0/24"
+      }
+    }
+  ]
+}

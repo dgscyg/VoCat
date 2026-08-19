@@ -14,11 +14,12 @@ export interface CardPolicyPanelProps {
   iccid?: string;
   policy: CardPolicy | null;
   deviceOnline: boolean;
-  onPolicyChanged: () => void | Promise<void>;
+	onPolicyChanged: () => void | Promise<void>;
 	wifiCallingOnly?: boolean;
+	vowifiUnsupported?: boolean;
 }
 
-export function CardPolicyPanel({ deviceId, iccid, policy, deviceOnline, onPolicyChanged, wifiCallingOnly = false }: CardPolicyPanelProps) {
+export function CardPolicyPanel({ deviceId, iccid, policy, deviceOnline, onPolicyChanged, wifiCallingOnly = false, vowifiUnsupported = false }: CardPolicyPanelProps) {
   const { t } = useI18n();
   const operable = deviceOnline && !!iccid;
   const currentPolicy = policy?.iccid === iccid ? policy : null;
@@ -120,7 +121,7 @@ export function CardPolicyPanel({ deviceId, iccid, policy, deviceOnline, onPolic
             </div>
           </div>
           <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-			<PolicySwitchCard
+			{!vowifiUnsupported ? <PolicySwitchCard
               title="VoWiFi"
               subtitle={t("启用时强制关闭蜂窝射频；关闭 VoWiFi 后仍保持飞行模式")}
               tone="orange"
@@ -129,7 +130,7 @@ export function CardPolicyPanel({ deviceId, iccid, policy, deviceOnline, onPolic
               pending={toggles.vowifiPending}
               failed={toggles.vowifiFailed}
               onToggle={toggles.onVoWiFiToggle}
-            />
+			/> : null}
 			{!wifiCallingOnly ? <PolicySwitchCard
               title={t("飞行模式")}
               subtitle={t("只有手动关闭此开关才允许设备连接基站")}

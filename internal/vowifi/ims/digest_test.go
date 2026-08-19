@@ -127,7 +127,7 @@ func TestAuthenticateAKAUsesPreferredApplicationWhenSupported(t *testing.T) {
 	_, err := authenticateAKA(
 		context.Background(),
 		aka,
-		vowifi.SIMIdentity{IMSI: "310280229187733"},
+		vowifi.SIMIdentity{IMSI: "310280000000001"},
 		digestChallenge{Nonce: nonce},
 		"isim_strict",
 	)

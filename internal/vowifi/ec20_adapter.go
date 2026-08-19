@@ -173,6 +173,13 @@ func (adapter *EC20Adapter) ReadIdentity(
 		HomeMCC: homeMCC,
 		HomeMNC: homeMNC,
 	}
+	if reader, ok := adapter.executor.(SIMMetadataReader); ok {
+		if metadata, metadataErr := reader.ReadSIMMetadata(ctx, deviceID); metadataErr == nil {
+			identity.SPN = strings.TrimSpace(metadata.SPN)
+			identity.GID1 = strings.TrimSpace(metadata.GID1)
+			identity.GID2 = strings.TrimSpace(metadata.GID2)
+		}
+	}
 	identity = applyAssignedCarrierRoute(identity)
 	adapter.mu.Lock()
 	adapter.bindings[iccid] = ec20SIMBinding{

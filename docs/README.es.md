@@ -149,14 +149,14 @@ Para un host Linux que debe descubrir cada módem Quectel compatible conectado y
 seguir viendo los eventos de conexión en caliente USB, ejecute Vocat en modo de acceso a hardware:
 
 ```bash
-docker pull ghcr.io/mengmengcode/vocat:latest
+docker pull ghcr.io/dgscyg/vocat:latest
 
 read -rsp "Admin password: " VOCAT_BOOTSTRAP_PASSWORD; echo
 printf '%s\n' "$VOCAT_BOOTSTRAP_PASSWORD" | docker run --rm -i \
   --user 0:0 \
   -v vocat-data:/opt/vocat/data \
   --entrypoint /opt/vocat/bin/vocat \
-  ghcr.io/mengmengcode/vocat:latest bootstrap-admin
+  ghcr.io/dgscyg/vocat:latest bootstrap-admin
 unset VOCAT_BOOTSTRAP_PASSWORD
 
 docker run -d \
@@ -168,7 +168,7 @@ docker run -d \
   -v vocat-data:/opt/vocat/data \
   -v /dev:/dev \
   -v /sys:/sys:ro \
-  ghcr.io/mengmengcode/vocat:latest
+  ghcr.io/dgscyg/vocat:latest
 ```
 
 Abra `http://<dirección-del-servidor>:7575` después de que el contenedor se inicie. La red del host
@@ -237,7 +237,7 @@ El actualizador descarga el binario que coincide con la arquitectura Linux actua
 Para instalaciones Docker:
 
 ```bash
-docker pull ghcr.io/mengmengcode/vocat:latest
+docker pull ghcr.io/dgscyg/vocat:latest
 ```
 
 Recrear el contenedor después de descargar la nueva imagen.
@@ -340,4 +340,4 @@ cd web && npm run build
 
 Consulte [LICENSE](../LICENSE).
 
-[![GitHub stars](https://img.shields.io/github/stars/dgscyg/VoCat)](https://github.com/dgscyg/VoCat)
+[![MengMengCode/VoCat Star History](https://mengmeng.meteor-history.com/api/embed/MengMengCode/VoCat.svg?sig=sdeXRVxAoY3yLWgXL7JViY2USYIN3t9neJ6ScPvgUAo&theme=light&style=xkcd&color=dd4528&background=ffffff&textColor=000000&width=900&height=600&lineWidth=3&showTitle=true&showLegend=true&showDots=false&v=0.0.14)](https://meteor-history.com)

@@ -141,14 +141,14 @@ sudo env \
 接続されているすべてのサポート対象 Quectel モデムを検出し、USB ホットプラグイベントを継続的に認識する必要がある Linux ホストでは、Vocat をハードウェアアクセスモードで実行します:
 
 ```bash
-docker pull ghcr.io/mengmengcode/vocat:latest
+docker pull ghcr.io/dgscyg/vocat:latest
 
 read -rsp "Admin password: " VOCAT_BOOTSTRAP_PASSWORD; echo
 printf '%s\n' "$VOCAT_BOOTSTRAP_PASSWORD" | docker run --rm -i \
   --user 0:0 \
   -v vocat-data:/opt/vocat/data \
   --entrypoint /opt/vocat/bin/vocat \
-  ghcr.io/mengmengcode/vocat:latest bootstrap-admin
+  ghcr.io/dgscyg/vocat:latest bootstrap-admin
 unset VOCAT_BOOTSTRAP_PASSWORD
 
 docker run -d \
@@ -160,7 +160,7 @@ docker run -d \
   -v vocat-data:/opt/vocat/data \
   -v /dev:/dev \
   -v /sys:/sys:ro \
-  ghcr.io/mengmengcode/vocat:latest
+  ghcr.io/dgscyg/vocat:latest
 ```
 
 コンテナの起動後に `http://<サーバーアドレス>:7575` を開きます。QMI ネットワークインターフェースが Vocat から見えるようにするにはホストネットワークが必要であり、シリアルポート、QMI 制御ノード、TUN インターフェース、ネットワーク設定、コンテナ起動後に追加されたデバイスには特権デバイスアクセスが必要です。`/dev` バインドマウントにより、コンテナを再作成せずに新しい `ttyUSB*`、`ttyACM*`、`cdc-wdm*` ノードが見えるようになります。
@@ -219,7 +219,7 @@ sudo vocat update --repo dgscyg/VoCat
 Docker インストールの場合:
 
 ```bash
-docker pull ghcr.io/mengmengcode/vocat:latest
+docker pull ghcr.io/dgscyg/vocat:latest
 ```
 
 新しいイメージをプルした後、コンテナを再作成します。
@@ -322,4 +322,4 @@ cd web && npm run build
 
 [LICENSE](../LICENSE) を参照してください。
 
-[![GitHub stars](https://img.shields.io/github/stars/dgscyg/VoCat)](https://github.com/dgscyg/VoCat)
+[![MengMengCode/VoCat Star History](https://mengmeng.meteor-history.com/api/embed/MengMengCode/VoCat.svg?sig=sdeXRVxAoY3yLWgXL7JViY2USYIN3t9neJ6ScPvgUAo&theme=light&style=xkcd&color=dd4528&background=ffffff&textColor=000000&width=900&height=600&lineWidth=3&showTitle=true&showLegend=true&showDots=false&v=0.0.14)](https://meteor-history.com)

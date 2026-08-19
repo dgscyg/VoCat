@@ -24,6 +24,8 @@
 
 **English** | [العربية](docs/README.ar.md) | [简体中文](docs/README.zh-CN.md) | [繁體中文](docs/README.zh-TW.md) | [Français](docs/README.fr.md) | [Русский](docs/README.ru.md) | [Español](docs/README.es.md) | [日本語](docs/README.ja.md)
 
+This fork is maintained at [dgscyg/VoCat](https://github.com/dgscyg/VoCat) (`dev` branch). Upstream project: [MengMengCode/VoCat](https://github.com/MengMengCode/VoCat).
+
 Vocat is an open-source web control panel and engineering toolkit for Quectel EC20/EC25-class cellular modems. It combines modem discovery, live radio status, AT and USSD terminals, SMS, WiFi Calling, eSIM management, network selection, proxy routing, notifications, audit logs, and release automation in one self-contained service.
 
 The backend is written in Go, the interface is built with React and TypeScript, and the production frontend is embedded into the Go binary. A single executable contains the web application and uses SQLite for persistent state.
@@ -149,14 +151,14 @@ For a Linux host that must discover every attached supported Quectel modem and
 continue seeing USB hot-plug events, run Vocat in hardware-access mode:
 
 ```bash
-docker pull ghcr.io/mengmengcode/vocat:latest
+docker pull ghcr.io/dgscyg/vocat:latest
 
 read -rsp "Admin password: " VOCAT_BOOTSTRAP_PASSWORD; echo
 printf '%s\n' "$VOCAT_BOOTSTRAP_PASSWORD" | docker run --rm -i \
   --user 0:0 \
   -v vocat-data:/opt/vocat/data \
   --entrypoint /opt/vocat/bin/vocat \
-  ghcr.io/mengmengcode/vocat:latest bootstrap-admin
+  ghcr.io/dgscyg/vocat:latest bootstrap-admin
 unset VOCAT_BOOTSTRAP_PASSWORD
 
 docker run -d \
@@ -168,7 +170,7 @@ docker run -d \
   -v vocat-data:/opt/vocat/data \
   -v /dev:/dev \
   -v /sys:/sys:ro \
-  ghcr.io/mengmengcode/vocat:latest
+  ghcr.io/dgscyg/vocat:latest
 ```
 
 Open `http://<server-address>:7575` after the container starts. Host networking
@@ -197,6 +199,18 @@ managers. On Debian/Ubuntu, the equivalent manual setup is
 VoCat keeps the reader visible in the add-device dialog and reports the missing
 service or driver instead of silently hiding it.
 
+### QMI command-line utilities
+
+VoCat uses `qmicli` to verify that a QMI control channel is ready and
+`qmi-network` to manage packet-data sessions. The one-click installer installs
+and verifies the corresponding utilities automatically. For manual deployment,
+Debian/Ubuntu uses `apt install libqmi-utils`; Arch Linux uses
+`pacman -S libqmi`, and Alpine uses `apk add qmi-utils`.
+
+`vocat doctor --repair-dji-qmi` checks for `qmicli` before changing any USB
+driver binding or asserting DTR. If the utility is unavailable, the command
+stops with an installation hint and leaves the current device state untouched.
+
 ## Configuration
 
 Vocat reads an optional JSON configuration file from `VOCAT_CONFIG`, then applies `VOCAT_*` environment variables. Environment variables take precedence.
@@ -211,6 +225,10 @@ Vocat reads an optional JSON configuration file from `VOCAT_CONFIG`, then applie
 | `VOCAT_MAX_REQUEST_BODY_BYTES` | `1048576` | Maximum API request body size. |
 | `VOCAT_REPO` | `dgscyg/VoCat` | Trusted GitHub repository used by the self-updater, in `owner/name` form. |
 | `GITHUB_TOKEN` | empty | Optional GitHub token for private repositories or higher API limits. |
+
+User-supplied Apple carrier bundles can be converted into reviewable,
+allow-listed carrier profiles with `vocat carrier import-ipcc`; see
+[docs/CARRIER_IPCC_IMPORT.md](docs/CARRIER_IPCC_IMPORT.md).
 
 Administrator credentials are stored only in SQLite. Initialize an empty
 database once with `vocat bootstrap-admin`; environment variables and JSON
@@ -251,7 +269,7 @@ The updater downloads the binary matching the current Linux architecture, verifi
 For Docker installations:
 
 ```bash
-docker pull ghcr.io/mengmengcode/vocat:latest
+docker pull ghcr.io/dgscyg/vocat:latest
 ```
 
 Recreate the container after pulling the new image.
@@ -354,4 +372,4 @@ cd web && npm run build
 
 See [LICENSE](LICENSE).
 
-[![GitHub stars](https://img.shields.io/github/stars/dgscyg/VoCat)](https://github.com/dgscyg/VoCat)
+[![MengMengCode/VoCat Star History](https://mengmeng.meteor-history.com/api/embed/MengMengCode/VoCat.svg?sig=sdeXRVxAoY3yLWgXL7JViY2USYIN3t9neJ6ScPvgUAo&theme=light&style=xkcd&color=dd4528&background=ffffff&textColor=000000&width=900&height=600&lineWidth=3&showTitle=true&showLegend=true&showDots=false&v=0.0.14)](https://meteor-history.com)

@@ -140,14 +140,14 @@ sudo env \
 如果 Linux 主机需要发现每一个接入的受支持 Quectel 模组,并持续感知 USB 热插拔事件,请以硬件访问模式运行 Vocat:
 
 ```bash
-docker pull ghcr.io/mengmengcode/vocat:latest
+docker pull ghcr.io/dgscyg/vocat:latest
 
 read -rsp "管理员密码: " VOCAT_BOOTSTRAP_PASSWORD; echo
 printf '%s\n' "$VOCAT_BOOTSTRAP_PASSWORD" | docker run --rm -i \
   --user 0:0 \
   -v vocat-data:/opt/vocat/data \
   --entrypoint /opt/vocat/bin/vocat \
-  ghcr.io/mengmengcode/vocat:latest bootstrap-admin
+  ghcr.io/dgscyg/vocat:latest bootstrap-admin
 unset VOCAT_BOOTSTRAP_PASSWORD
 
 docker run -d \
@@ -159,7 +159,7 @@ docker run -d \
   -v vocat-data:/opt/vocat/data \
   -v /dev:/dev \
   -v /sys:/sys:ro \
-  ghcr.io/mengmengcode/vocat:latest
+  ghcr.io/dgscyg/vocat:latest
 ```
 
 容器启动后打开 `http://<服务器地址>:7575`。主机网络是必需的,这样 QMI 网络接口才能对 Vocat 可见;而特权设备访问是串口、QMI 控制节点、TUN 接口、网络配置以及容器启动后新增设备所必需的。`/dev` 挂载使新的 `ttyUSB*`、`ttyACM*` 和 `cdc-wdm*` 节点无需重建容器即可见。
@@ -174,6 +174,16 @@ USB SIM 读卡器通过 Linux PC/SC 服务访问。一键安装脚本会在支�
 自动安装并启动 `pcscd` 和 CCID 驱动；Debian/Ubuntu 手动安装命令为
 `apt install pcscd libccid`。如果 USB 已识别 CCID 读卡器但 PC/SC 尚未就绪，
 VoCat 会继续在添加设备窗口显示该硬件，并明确提示缺少服务或驱动，不再静默隐藏。
+
+### QMI 命令行工具
+
+VoCat 使用 `qmicli` 验证 QMI 控制通道是否就绪，并使用 `qmi-network` 管理
+分组数据会话。一键安装脚本会自动安装并验证对应工具。手动部署时，
+Debian/Ubuntu 使用 `apt install libqmi-utils`；Arch Linux 使用
+`pacman -S libqmi`，Alpine 使用 `apk add qmi-utils`。
+
+`vocat doctor --repair-dji-qmi` 会在修改 USB 驱动绑定或触发 DTR 之前检查
+`qmicli`。如果工具不可用，命令会给出安装提示并停止，保持设备当前状态不变。
 
 ## 配置
 
@@ -194,6 +204,25 @@ Vocat 先从 `VOCAT_CONFIG` 读取可选的 JSON 配置文件,再应用 `VOCAT_*
 `vocat bootstrap-admin` 完成初始化；环境变量和 JSON 配置都不能设置或覆盖管理员凭据。
 
 请勿将 Telegram token、SMTP 密码、Webhook 密钥、SIM 凭据或其他私密数据存放在仓库中。请通过应用设置或受保护的环境文件来配置它们。
+
+## Apple IPCC 运营商规则导入
+
+VoCat 可以离线解析用户提供的 `.ipcc`，将 Apple 的 XML/二进制 plist
+转换为可审查的运营商 Profile。默认只预览，不会修改配置：
+
+```bash
+vocat carrier import-ipcc Carrier_iPhone.ipcc
+```
+
+确认警告和匹配范围后，使用 `--install` 安装；重启 VoCat 后生效：
+
+```bash
+vocat carrier import-ipcc --install Carrier_iPhone.ipcc
+```
+
+导入器不会复制关闭证书验证、绕过运营商授权、APN 凭据、紧急呼叫或
+设备型号专属媒体参数。完整字段和冲突处理说明见
+[CARRIER_IPCC_IMPORT.md](CARRIER_IPCC_IMPORT.md)。
 
 ## Telegram 机器人
 
@@ -228,7 +257,7 @@ sudo vocat update --repo dgscyg/VoCat
 Docker 安装的更新方式:
 
 ```bash
-docker pull ghcr.io/mengmengcode/vocat:latest
+docker pull ghcr.io/dgscyg/vocat:latest
 ```
 
 拉取新镜像后重建容器。

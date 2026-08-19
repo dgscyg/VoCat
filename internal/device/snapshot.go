@@ -39,6 +39,19 @@ func (manager *Manager) readSnapshot(
 	if snapshot.Model == "" && !strings.EqualFold(candidate.Product, "Android") {
 		snapshot.Model = candidate.Product
 	}
+	// Native MHI/QMI devices expose their immutable modem identity through DMS.
+	// Read it before any SIM-dependent AT probes: a missing/bad card can make
+	// those commands slow or fail, but must never prevent IMEI from appearing.
+	if strings.EqualFold(strings.TrimSpace(backend), "qmi") && isNativeQMICandidate(candidate) {
+		qmiContext, cancelQMI := manager.withTimeout(ctx, manager.commandTimeout*5)
+		qmiIMEI, qmiErr := manager.readNativeQMIIMEI(qmiContext, candidate)
+		cancelQMI()
+		if qmiErr == nil {
+			snapshot.IMEI = qmiIMEI
+		} else {
+			snapshot.Warnings = append(snapshot.Warnings, "read IMEI via QMI DMS: "+qmiErr.Error())
+		}
+	}
 
 	optional := func(command string) (modem.Response, bool) {
 		response, commandErr := manager.command(ctx, client, command)
@@ -56,10 +69,28 @@ func (manager *Manager) readSnapshot(
 	if ccidErr != nil {
 		ccid, ccidErr = manager.command(ctx, client, "AT+QCCID")
 	}
+	if ccidErr != nil && strings.EqualFold(strings.TrimSpace(backend), "qmi") && isNativeQMICandidate(candidate) &&
+		strings.EqualFold(strings.TrimSpace(snapshot.SIMStatus), "READY") {
+		// Without a READY SIM the QMI UIM ICCID read blocks until its (long)
+		// timeout, and every refresh holds the device lock while it does so,
+		// starving the AT terminal. Only fall back to QMI when the AT CPIN
+		// probe already proved a card is present.
+		qmiContext, cancelQMI := manager.withTimeout(ctx, manager.commandTimeout*5)
+		qmiICCID, qmiErr := manager.readNativeQMIICCID(qmiContext, candidate)
+		cancelQMI()
+		if qmiErr == nil {
+			snapshot.ICCID = qmiICCID
+			ccidErr = nil
+		} else {
+			snapshot.Warnings = append(snapshot.Warnings, "read ICCID via QMI UIM: "+qmiErr.Error())
+		}
+	}
 	if ccidErr != nil {
 		snapshot.Warnings = append(snapshot.Warnings, "read ICCID: "+ccidErr.Error())
 	} else {
-		snapshot.ICCID = parseICCIDIdentifier(ccid, []string{"+CCID:", "+QCCID:"}, 18, 22)
+		if snapshot.ICCID == "" {
+			snapshot.ICCID = parseICCIDIdentifier(ccid, []string{"+CCID:", "+QCCID:"}, 18, 22)
+		}
 	}
 	previousICCID = strings.TrimSpace(previousICCID)
 	if previousICCID != "" && snapshot.ICCID != "" && !strings.EqualFold(previousICCID, snapshot.ICCID) {
@@ -159,15 +190,36 @@ func (manager *Manager) readSnapshot(
 		snapshot.RegistrationStatus = 1
 		snapshot.RegistrationSource = "COPS"
 	}
-	if response, ok := optional("AT+CGSN"); ok {
-		snapshot.IMEI = parseIdentifier(
-			response,
-			[]string{"+CGSN:", "+GSN:"},
-			14,
-			17,
-		)
+	if snapshot.IMEI == "" {
+		// AT+CGSN on some MHI modems (the UFI dongle behind the OpenStick 410)
+		// returns the IMEI line but never a final OK, so it would block until the
+		// caller's deadline (30s during a periodic refresh) and starve every other
+		// device operation behind the lock. Give it an independent short timeout
+		// and let the WWAN transport's drain discard the trailing stale bytes.
+		cgsnCtx, cancelCGSN := context.WithTimeout(ctx, manager.commandTimeout)
+		cgsnResponse, cgsnErr := manager.command(cgsnCtx, client, "AT+CGSN")
+		cancelCGSN()
+		if cgsnErr == nil {
+			if imei := parseIdentifier(cgsnResponse, []string{"+CGSN:", "+GSN:"}, 14, 17); imei != "" {
+				snapshot.IMEI = imei
+			}
+		}
 	}
-
+	if snapshot.IMEI == "" && strings.EqualFold(strings.TrimSpace(backend), "qmi") && isNativeQMICandidate(candidate) {
+		qmiContext, cancelQMI := manager.withTimeout(ctx, manager.commandTimeout*5)
+		qmiIMEI, qmiErr := manager.readNativeQMIIMEI(qmiContext, candidate)
+		cancelQMI()
+		if qmiErr == nil {
+			snapshot.IMEI = qmiIMEI
+		} else {
+			snapshot.Warnings = append(snapshot.Warnings, "read IMEI via QMI DMS: "+qmiErr.Error())
+		}
+	}
+	if snapshot.IMEI == "" && previousSnapshot != nil {
+		// IMEI is hardware identity and does not change with the inserted card.
+		// Preserve a prior successful read across a transient QMI/AT failure.
+		snapshot.IMEI = previousSnapshot.IMEI
+	}
 	if response, ok := optional("AT+CFUN?"); ok {
 		if mode, found := parseCFUN(response); found {
 			snapshot.OperatingMode = mode

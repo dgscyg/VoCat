@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
@@ -17,6 +19,40 @@ import (
 type evidenceTunnel struct {
 	evidence vowifi.TunnelEvidence
 }
+
+type immediateTimeoutError struct{}
+
+func (immediateTimeoutError) Error() string   { return "test timeout" }
+func (immediateTimeoutError) Timeout() bool   { return true }
+func (immediateTimeoutError) Temporary() bool { return true }
+
+type registerRetransmitConn struct {
+	writes   int
+	response []byte
+}
+
+func (connection *registerRetransmitConn) Read(destination []byte) (int, error) {
+	if connection.writes < 2 {
+		return 0, immediateTimeoutError{}
+	}
+	return copy(destination, connection.response), nil
+}
+
+func (connection *registerRetransmitConn) Write(source []byte) (int, error) {
+	connection.writes++
+	return len(source), nil
+}
+
+func (*registerRetransmitConn) Close() error { return nil }
+func (*registerRetransmitConn) LocalAddr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 5060}
+}
+func (*registerRetransmitConn) RemoteAddr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4(192, 0, 2, 20), Port: 5060}
+}
+func (*registerRetransmitConn) SetDeadline(time.Time) error      { return nil }
+func (*registerRetransmitConn) SetReadDeadline(time.Time) error  { return nil }
+func (*registerRetransmitConn) SetWriteDeadline(time.Time) error { return nil }
 
 func (tunnel evidenceTunnel) Evidence() vowifi.TunnelEvidence {
 	return tunnel.evidence
@@ -69,6 +105,82 @@ func TestTransportForIdentityPreservesLeadingZeroMNCs(t *testing.T) {
 	} {
 		if got := transportForIdentity(config, vowifi.SIMIdentity{HomeMCC: "310", HomeMNC: test.mnc}); got != test.want {
 			t.Errorf("PLMN 310-%s transport = %q, want %q", test.mnc, got, test.want)
+		}
+	}
+}
+
+func TestCarrierProfileSuppliesTransportWithoutCodeMap(t *testing.T) {
+	t.Parallel()
+	identity := vowifi.SIMIdentity{HomeMCC: "234", HomeMNC: "10"}
+	if got := transportForIdentity(Config{Transport: "tcp"}, identity); got != "udp" {
+		t.Fatalf("O2 UK profile transport = %q, want udp", got)
+	}
+	if got := transportForIdentity(Config{
+		Transport: "udp", TransportByPLMN: map[string]string{"23410": "tcp"},
+	}, identity); got != "tcp" {
+		t.Fatalf("explicit configuration did not override profile: %q", got)
+	}
+}
+
+func TestProviderCachesSuccessfulTransportPerSIM(t *testing.T) {
+	t.Parallel()
+	provider := &Provider{transportCache: make(map[string]string)}
+	first := vowifi.SIMIdentity{ICCID: "8901000000000000001", HomeMCC: "001", HomeMNC: "01"}
+	second := vowifi.SIMIdentity{ICCID: "8901000000000000002", HomeMCC: "001", HomeMNC: "01"}
+	provider.rememberTransport(first, "udp")
+	if got := provider.cachedTransport(first); got != "udp" {
+		t.Fatalf("cached first transport = %q", got)
+	}
+	if got := provider.cachedTransport(second); got != "" {
+		t.Fatalf("second SIM inherited cached transport %q", got)
+	}
+}
+
+func TestUDPRegisterRetransmitsBeforeTransactionTimeout(t *testing.T) {
+	t.Parallel()
+	connection := &registerRetransmitConn{response: []byte(strings.Join([]string{
+		"SIP/2.0 200 OK",
+		"Call-ID: register-retransmit-test",
+		"CSeq: 7 REGISTER",
+		"Content-Length: 0",
+		"",
+		"",
+	}, "\r\n"))}
+	session := &Session{
+		provider: &Provider{config: Config{
+			TransactionTimeout: 3 * time.Second,
+			Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}},
+		request:   vowifi.IMSRequest{Identity: vowifi.SIMIdentity{HomeMCC: "001", HomeMNC: "01"}},
+		transport: "udp",
+		conn:      connection,
+		callID:    "register-retransmit-test",
+	}
+	response, err := session.exchange(context.Background(), []byte("REGISTER test"), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != 200 || connection.writes != 2 {
+		t.Fatalf("response=%#v writes=%d, want SIP 200 after one retransmission", response, connection.writes)
+	}
+}
+
+func TestNormalizeConfigValidatesSMSCentersByPLMN(t *testing.T) {
+	config, err := normalizeConfig(Config{SMSCenterByPLMN: map[string]string{
+		" 23410 ": " +447802000332 ",
+	}})
+	if err != nil {
+		t.Fatalf("normalizeConfig() error = %v", err)
+	}
+	if got := config.SMSCenterByPLMN["23410"]; got != "+447802000332" {
+		t.Fatalf("normalized O2 SMSC = %q", got)
+	}
+	for _, invalid := range []Config{
+		{SMSCenterByPLMN: map[string]string{"234": "+447802000332"}},
+		{SMSCenterByPLMN: map[string]string{"23410": "not-a-number"}},
+	} {
+		if _, err := normalizeConfig(invalid); err == nil {
+			t.Fatalf("normalizeConfig(%#v) succeeded", invalid.SMSCenterByPLMN)
 		}
 	}
 }
@@ -263,7 +375,6 @@ func serveRegistration(listener *net.UDPConn, nonce string, confirmSMS bool) err
 			return fmt.Errorf("unexpected start line %q", startLine)
 		}
 		for _, forbidden := range []string{
-			"p-access-network-info",
 			"p-visited-network-id",
 			"p-preferred-identity",
 		} {
@@ -274,6 +385,13 @@ func serveRegistration(listener *net.UDPConn, nonce string, confirmSMS bool) err
 					headers[forbidden],
 				)
 			}
+		}
+		if headers["p-access-network-info"] != "IEEE-802.11;i-wlan-node-id=000000000000;network-provided" {
+			return fmt.Errorf("REGISTER P-Access-Network-Info = %q", headers["p-access-network-info"])
+		}
+		if !strings.Contains(headers["allow"], "MESSAGE") ||
+			!strings.Contains(string(packet[:count]), "Accept-Contact: *;+g.3gpp.smsip") {
+			return fmt.Errorf("REGISTER omitted SMS-over-IMS capability: Allow=%q", headers["allow"])
 		}
 		if step == 0 {
 			if headers["authorization"] != "" {
@@ -444,14 +562,14 @@ func TestO2GermanyInitialRegisterMatchesSupportedIMSProfile(t *testing.T) {
 
 func TestATT310280DeriveIdentitiesUsesISIMDomains(t *testing.T) {
 	identities, err := deriveIdentities(vowifi.SIMIdentity{
-		IMSI: "310280229187733", HomeMCC: "310", HomeMNC: "280",
+		IMSI: "310280000000001", HomeMCC: "310", HomeMNC: "280",
 	}, Config{})
 	if err != nil {
 		t.Fatalf("deriveIdentities() error = %v", err)
 	}
 	if identities.domain != "one.att.net" ||
-		identities.private != "310280229187733@private.att.net" ||
-		identities.public != "sip:310280229187733@one.att.net" {
+		identities.private != "310280000000001@private.att.net" ||
+		identities.public != "sip:310280000000001@one.att.net" {
 		t.Fatalf("AT&T identities = %#v", identities)
 	}
 }
@@ -462,7 +580,7 @@ func TestATT310280InitialRegisterMatchesProvisionedProfile(t *testing.T) {
 	defer server.Close()
 
 	identity := vowifi.SIMIdentity{
-		IMSI: "310280229187733", HomeMCC: "310", HomeMNC: "280",
+		IMSI: "310280000000001", HomeMCC: "310", HomeMNC: "280",
 	}
 	identities, err := deriveIdentities(identity, Config{})
 	if err != nil {
@@ -496,13 +614,13 @@ func TestATT310280InitialRegisterMatchesProvisionedProfile(t *testing.T) {
 		"Supported: path,sec-agree,gruu",
 		"User-Agent: SimAdmin VoWiFi",
 		`+g.3gpp.accesstype="wlan1";audio;+g.3gpp.smsip`,
-		"P-Preferred-Identity: <sip:310280229187733@one.att.net>",
+		"P-Preferred-Identity: <sip:310280000000001@one.att.net>",
 		`P-Visited-Network-ID: "one.att.net"`,
 		"P-Access-Network-Info: IEEE-802.11;i-wlan-node-id=000000000000;network-provided",
 		"Cellular-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=3102800000000;cell-info-age=0",
 		"Accept-Contact: *;+g.3gpp.smsip",
 		"Security-Client: ipsec-3gpp; alg=hmac-sha-1-96; ealg=aes-cbc; prot=esp; mod=trans; spi-c=1546543; spi-s=1546542; port-c=32773; port-s=6000",
-		`username="310280229187733@private.att.net"`,
+		`username="310280000000001@private.att.net"`,
 		`uri="sip:one.att.net"`,
 	} {
 		if !strings.Contains(request, want) {

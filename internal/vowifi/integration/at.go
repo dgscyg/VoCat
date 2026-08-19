@@ -8,6 +8,7 @@ import (
 	"vocat/internal/device"
 	"vocat/internal/modem"
 	"vocat/internal/store"
+	"vocat/internal/vowifi"
 )
 
 type ATDeviceController interface {
@@ -71,6 +72,28 @@ func (mapper ATMapper) ExecuteSensitiveAT(
 		return modem.Response{}, err
 	}
 	return mapper.Devices.ExecuteSensitiveAT(ctx, physicalID, command)
+}
+
+// ReadSIMMetadata reuses the device manager's per-ICCID EF cache. VoWiFi
+// identity discovery therefore gains Android-style SPN/GID MVNO selectors
+// without issuing duplicate APDUs on every reconnect.
+func (mapper ATMapper) ReadSIMMetadata(ctx context.Context, configuredID string) (vowifi.SIMMetadata, error) {
+	physicalID, err := mapper.resolve(ctx, configuredID)
+	if err != nil {
+		return vowifi.SIMMetadata{}, err
+	}
+	entry, err := mapper.Devices.Get(physicalID)
+	if err != nil {
+		return vowifi.SIMMetadata{}, err
+	}
+	if entry.Snapshot == nil {
+		return vowifi.SIMMetadata{}, nil
+	}
+	return vowifi.SIMMetadata{
+		SPN:  strings.TrimSpace(entry.Snapshot.SPN),
+		GID1: strings.TrimSpace(entry.Snapshot.GID1),
+		GID2: strings.TrimSpace(entry.Snapshot.GID2),
+	}, nil
 }
 
 func (mapper ATMapper) resolve(

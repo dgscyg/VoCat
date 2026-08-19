@@ -2,10 +2,17 @@ package ims
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"mime"
+	"mime/multipart"
+	"mime/quotedprintable"
 	"net"
 	"strconv"
 	"strings"
@@ -15,7 +22,11 @@ import (
 	"vocat/internal/vowifi"
 )
 
-const smsContentType = "application/vnd.3gpp.sms"
+const (
+	smsContentType          = "application/vnd.3gpp.sms"
+	sipMessageRetransmitT1  = 500 * time.Millisecond
+	sipMessageRetransmitMax = 4 * time.Second
+)
 
 var (
 	ErrSMSCUnavailable = errors.New("ims: SMS service-centre address is unavailable")
@@ -80,11 +91,14 @@ func (session *Session) startRuntimeReceivers() error {
 
 	session.receiveDone.Add(1)
 	go session.readMainConnection()
-	if session.securityActive && session.transport == "tcp" && session.protectedTCP != nil {
+	// Vodafone UK (and others) deliver MT SMS as SIP MESSAGE to the
+	// ipsec-3gpp UE server port over UDP even when REGISTER used TCP.
+	// Always read both sockets when they were reserved.
+	if session.securityActive && session.protectedTCP != nil {
 		session.receiveDone.Add(1)
 		go session.acceptProtectedTCP()
 	}
-	if session.securityActive && session.transport == "udp" && session.protectedUDP != nil {
+	if session.securityActive && session.protectedUDP != nil {
 		session.receiveDone.Add(1)
 		go session.readProtectedUDP()
 	}
@@ -129,6 +143,8 @@ func (session *Session) acceptProtectedTCP() {
 			return
 		}
 		if !session.validProtectedTCPSource(connection.RemoteAddr()) {
+			session.logInboundSMS(slog.LevelWarn, "IMS inbound TCP rejected", nil,
+				"stage", "source_filter", "remote", connection.RemoteAddr().String())
 			_ = connection.Close()
 			continue
 		}
@@ -152,6 +168,11 @@ func (session *Session) readInboundTCP(connection net.Conn) {
 	for {
 		packet, err := readSIPPacket(reader)
 		if err != nil {
+			if !session.isClosed() && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+				session.logInboundSMS(slog.LevelWarn, "IMS protected SIP packet read failed", nil,
+					"stage", "sip_parse", "transport", "tcp",
+					"remote", connection.RemoteAddr().String(), "error", err)
+			}
 			return
 		}
 		session.dispatchPacket(packet, func(response []byte) error {
@@ -170,10 +191,15 @@ func (session *Session) readProtectedUDP() {
 			return
 		}
 		if !session.validProtectedUDPSource(remote) {
+			session.logInboundSMS(slog.LevelWarn, "IMS inbound UDP rejected", nil,
+				"stage", "source_filter", "remote", remote.String(), "packet_bytes", count)
 			continue
 		}
 		packet, err := parseSIPPacket(buffer[:count])
 		if err != nil {
+			session.logInboundSMS(slog.LevelWarn, "IMS protected SIP packet parse failed", nil,
+				"stage", "sip_parse", "transport", "udp", "remote", remote.String(),
+				"packet_bytes", count, "error", err)
 			continue
 		}
 		session.dispatchPacket(packet, func(response []byte) error {
@@ -189,8 +215,9 @@ func (session *Session) validProtectedTCPSource(address net.Addr) bool {
 		return false
 	}
 	expected := addressIP(session.conn.RemoteAddr())
-	return expected != nil && expected.Equal(remote.IP) &&
-		remote.Port == session.securityAgreement.selected.portClient
+	// Require P-CSCF IP. Do not require port-c (50601): some cores originate
+	// MESSAGE from an ephemeral port on the same P-CSCF.
+	return expected != nil && expected.Equal(remote.IP)
 }
 
 func (session *Session) dispatchPacket(packet sipPacket, respond func([]byte) error) {
@@ -198,6 +225,8 @@ func (session *Session) dispatchPacket(packet sipPacket, respond func([]byte) er
 		response := packet.Response
 		cseq, method, err := cseqNumber(response.value("CSeq"))
 		if err != nil {
+			session.logOutboundSMS(slog.LevelWarn, "IMS SIP response could not be matched",
+				"stage", "sip_response", "sip_status", response.StatusCode, "error", err)
 			return
 		}
 		key := sipTransactionKey{
@@ -213,6 +242,10 @@ func (session *Session) dispatchPacket(packet sipPacket, respond func([]byte) er
 			case channel <- response:
 			default:
 			}
+		} else if method == "MESSAGE" {
+			session.logOutboundSMS(slog.LevelWarn, "IMS SIP MESSAGE response was unmatched",
+				"stage", "sip_response", "call_id", key.callID,
+				"cseq", key.cseq, "sip_status", response.StatusCode)
 		}
 		return
 	}
@@ -240,22 +273,64 @@ func (session *Session) exchangeRuntime(
 		session.transactionsMu.Unlock()
 	}()
 
-	session.writeMu.Lock()
-	_, err := session.conn.Write(request)
-	session.writeMu.Unlock()
-	if err != nil {
+	writeRequest := func() error {
+		session.writeMu.Lock()
+		defer session.writeMu.Unlock()
+		_, err := session.conn.Write(request)
+		return err
+	}
+	if err := writeRequest(); err != nil {
 		return nil, fmt.Errorf("ims: send SIP %s: %w", key.method, err)
 	}
 	timer := time.NewTimer(session.provider.config.TransactionTimeout)
 	defer timer.Stop()
+	var retransmitTimer *time.Timer
+	var retransmit <-chan time.Time
+	retransmitInterval := sipMessageRetransmitT1
+	retransmitCount := 0
+	if session.transport == "udp" && key.method == "MESSAGE" {
+		retransmitTimer = time.NewTimer(retransmitInterval)
+		retransmit = retransmitTimer.C
+		defer retransmitTimer.Stop()
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-timer.C:
+			if retransmitTimer != nil {
+				return nil, fmt.Errorf(
+					"ims: SIP %s transaction timed out after %d retransmissions",
+					key.method,
+					retransmitCount,
+				)
+			}
 			return nil, fmt.Errorf("ims: SIP %s transaction timed out", key.method)
+		case <-retransmit:
+			if err := writeRequest(); err != nil {
+				return nil, fmt.Errorf("ims: retransmit SIP %s: %w", key.method, err)
+			}
+			retransmitCount++
+			session.logOutboundSMS(slog.LevelDebug, "IMS SIP MESSAGE retransmitted",
+				"stage", "sip_retransmit", "call_id", key.callID,
+				"cseq", key.cseq, "attempt", retransmitCount)
+			retransmitInterval *= 2
+			if retransmitInterval > sipMessageRetransmitMax {
+				retransmitInterval = sipMessageRetransmitMax
+			}
+			retransmitTimer.Reset(retransmitInterval)
 		case response := <-responses:
 			if response.StatusCode >= 100 && response.StatusCode < 200 {
+				if retransmitTimer != nil {
+					if !retransmitTimer.Stop() {
+						select {
+						case <-retransmitTimer.C:
+						default:
+						}
+					}
+					retransmitInterval = sipMessageRetransmitMax
+					retransmitTimer.Reset(retransmitInterval)
+				}
 				continue
 			}
 			return response, nil
@@ -271,21 +346,42 @@ func (session *Session) handleSIPRequest(request *sipRequest, respond func([]byt
 	switch request.Method {
 	case "OPTIONS":
 	case "MESSAGE":
-		contentType := strings.ToLower(strings.TrimSpace(strings.SplitN(request.value("Content-Type"), ";", 2)[0]))
-		if contentType != smsContentType {
+		if !supportsSMSContentType(request.value("Content-Type")) {
 			status = 415
 		}
 	default:
 		status = 405
 	}
 	response, err := buildSIPResponse(request, status, session.fromTag)
-	if err == nil {
-		_ = respond(response)
+	if err != nil {
+		session.logInboundSMS(slog.LevelWarn, "IMS inbound SIP request response failed", request,
+			"stage", "sip_response_build", "error", err)
+	} else if err = respond(response); err != nil {
+		session.logInboundSMS(slog.LevelWarn, "IMS inbound SIP request response failed", request,
+			"stage", "sip_response_send", "sip_status", status, "error", err)
 	}
 	if status != 200 || request.Method != "MESSAGE" {
+		if request.Method == "MESSAGE" {
+			session.logInboundSMS(slog.LevelWarn, "IMS inbound SMS MESSAGE rejected", request,
+				"stage", "content_type", "sip_status", status)
+		}
 		return
 	}
+	session.logInboundSMS(slog.LevelInfo, "IMS inbound SMS MESSAGE received", request,
+		"stage", "sip_accepted")
 	go session.processSMSMessage(request)
+}
+
+func supportsSMSContentType(value string) bool {
+	mediaType, parameters, err := mime.ParseMediaType(strings.TrimSpace(value))
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(mediaType, smsContentType) {
+		return true
+	}
+	return strings.EqualFold(mediaType, "multipart/mixed") &&
+		strings.TrimSpace(parameters["boundary"]) != ""
 }
 
 func buildSIPResponse(request *sipRequest, status int, tag string) ([]byte, error) {
@@ -325,24 +421,46 @@ func buildSIPResponse(request *sipRequest, status int, tag string) ([]byte, erro
 }
 
 func (session *Session) processSMSMessage(request *sipRequest) {
-	rpdu, err := parseRPDU(request.Body)
+	payload, payloadSource, err := extractSMSPayload(request)
 	if err != nil {
-		session.sendDeliveryReport(request, buildRPError(0, 95))
+		session.logInboundSMS(slog.LevelWarn, "IMS inbound SMS decode failed", request,
+			"stage", "mime", "error", err)
+		session.sendLoggedDeliveryReport(request, buildRPError(0, 95), "rp_error")
+		return
+	}
+	rpdu, err := parseRPDU(payload)
+	if err != nil {
+		reference := byte(0)
+		if len(payload) > 1 {
+			reference = payload[1]
+		}
+		session.logInboundSMS(slog.LevelWarn, "IMS inbound SMS decode failed", request,
+			"stage", "rpdu", "payload_source", payloadSource,
+			"rp_reference", int(reference), "payload_bytes", len(payload), "error", err)
+		session.sendLoggedDeliveryReport(request, buildRPError(reference, 95), "rp_error")
 		return
 	}
 	if rpdu.messageType != 1 { // RP-DATA, network to MS.
+		session.logInboundSMS(slog.LevelInfo, "IMS inbound SMS control message received", request,
+			"stage", "rpdu", "payload_source", payloadSource,
+			"rp_message_type", int(rpdu.messageType), "rp_reference", int(rpdu.reference))
 		return
 	}
 	message, err := device.DecodeSMSDeliverTPDU(rpdu.tpdu)
 	if err != nil {
-		session.sendDeliveryReport(request, buildRPError(rpdu.reference, 95))
+		session.logInboundSMS(slog.LevelWarn, "IMS inbound SMS decode failed", request,
+			"stage", "tpdu", "payload_source", payloadSource,
+			"rp_reference", int(rpdu.reference), "tpdu_bytes", len(rpdu.tpdu), "error", err)
+		session.sendLoggedDeliveryReport(request, buildRPError(rpdu.reference, 95), "rp_error")
 		return
 	}
 	receivedAt := time.Now().UTC()
 	callID := strings.TrimSpace(request.value("Call-ID"))
 	if message.Direction == device.SMSDirectionStatusReport {
 		if message.MessageReference == nil || message.StatusCode == nil {
-			session.sendDeliveryReport(request, buildRPError(rpdu.reference, 95))
+			session.logInboundSMS(slog.LevelWarn, "IMS inbound SMS status report is incomplete", request,
+				"stage", "tpdu", "rp_reference", int(rpdu.reference))
+			session.sendLoggedDeliveryReport(request, buildRPError(rpdu.reference, 95), "rp_error")
 			return
 		}
 		status := ReceivedSMSStatus{
@@ -357,7 +475,7 @@ func (session *Session) processSMSMessage(request *sipRequest) {
 			Timestamp:              receivedAt,
 			RPReference:            int(rpdu.reference),
 			CallID:                 callID,
-			RawRPDU:                strings.ToUpper(hex.EncodeToString(request.Body)),
+			RawRPDU:                strings.ToUpper(hex.EncodeToString(payload)),
 			RawTPDU:                strings.ToUpper(hex.EncodeToString(rpdu.tpdu)),
 		}
 		if session.provider.config.OnSMSStatus != nil {
@@ -366,14 +484,21 @@ func (session *Session) processSMSMessage(request *sipRequest) {
 			cancel()
 		}
 		if err != nil {
-			session.sendDeliveryReport(request, buildRPError(rpdu.reference, 22))
+			session.logInboundSMS(slog.LevelWarn, "IMS inbound SMS status persistence failed", request,
+				"stage", "status_callback", "rp_reference", int(rpdu.reference), "error", err)
+			session.sendLoggedDeliveryReport(request, buildRPError(rpdu.reference, 22), "rp_error")
 			return
 		}
-		session.sendDeliveryReport(request, []byte{0x02, rpdu.reference})
+		session.logInboundSMS(slog.LevelInfo, "IMS inbound SMS status report processed", request,
+			"stage", "status_callback", "rp_reference", int(rpdu.reference),
+			"status_code", *message.StatusCode)
+		session.sendLoggedDeliveryReport(request, []byte{0x02, rpdu.reference}, "rp_ack")
 		return
 	}
 	if message.Direction != device.SMSDirectionReceived {
-		session.sendDeliveryReport(request, buildRPError(rpdu.reference, 95))
+		session.logInboundSMS(slog.LevelWarn, "IMS inbound SMS has unexpected TPDU direction", request,
+			"stage", "tpdu", "rp_reference", int(rpdu.reference), "direction", message.Direction)
+		session.sendLoggedDeliveryReport(request, buildRPError(rpdu.reference, 95), "rp_error")
 		return
 	}
 	var serviceCenterTimestamp *time.Time
@@ -396,7 +521,7 @@ func (session *Session) processSMSMessage(request *sipRequest) {
 		Concat:                 message.Concat,
 		RPReference:            int(rpdu.reference),
 		CallID:                 callID,
-		RawRPDU:                strings.ToUpper(hex.EncodeToString(request.Body)),
+		RawRPDU:                strings.ToUpper(hex.EncodeToString(payload)),
 		RawTPDU:                strings.ToUpper(hex.EncodeToString(rpdu.tpdu)),
 	}
 	if session.provider.config.OnSMS != nil {
@@ -405,26 +530,130 @@ func (session *Session) processSMSMessage(request *sipRequest) {
 		cancel()
 	}
 	if err != nil {
-		session.sendDeliveryReport(request, buildRPError(rpdu.reference, 22))
+		session.logInboundSMS(slog.LevelWarn, "IMS inbound SMS persistence failed", request,
+			"stage", "sms_callback", "rp_reference", int(rpdu.reference), "error", err)
+		session.sendLoggedDeliveryReport(request, buildRPError(rpdu.reference, 22), "rp_error")
 		return
 	}
-	session.sendDeliveryReport(request, []byte{0x02, rpdu.reference})
+	session.logInboundSMS(slog.LevelInfo, "IMS inbound SMS processed", request,
+		"stage", "sms_callback", "payload_source", payloadSource,
+		"rp_reference", int(rpdu.reference), "encoding", message.Encoding,
+		"concatenated", message.Concat != nil)
+	session.sendLoggedDeliveryReport(request, []byte{0x02, rpdu.reference}, "rp_ack")
 }
 
-func (session *Session) sendDeliveryReport(request *sipRequest, report []byte) {
+func extractSMSPayload(request *sipRequest) ([]byte, string, error) {
+	if request == nil {
+		return nil, "", errors.New("ims: SMS MESSAGE is nil")
+	}
+	mediaType, parameters, err := mime.ParseMediaType(strings.TrimSpace(request.value("Content-Type")))
+	if err != nil {
+		return nil, "", fmt.Errorf("ims: parse SMS Content-Type: %w", err)
+	}
+	if strings.EqualFold(mediaType, smsContentType) {
+		payload, decodeErr := decodeSMSTransfer(request.Body, request.value("Content-Transfer-Encoding"))
+		return payload, smsContentType, decodeErr
+	}
+	if !strings.EqualFold(mediaType, "multipart/mixed") {
+		return nil, "", fmt.Errorf("ims: unsupported SMS Content-Type %q", mediaType)
+	}
+	boundary := strings.TrimSpace(parameters["boundary"])
+	if boundary == "" {
+		return nil, "", errors.New("ims: multipart SMS has no boundary")
+	}
+	reader := multipart.NewReader(bytes.NewReader(request.Body), boundary)
+	for {
+		part, nextErr := reader.NextRawPart()
+		if errors.Is(nextErr, io.EOF) {
+			break
+		}
+		if nextErr != nil {
+			return nil, "", fmt.Errorf("ims: read multipart SMS: %w", nextErr)
+		}
+		partType, _, parseErr := mime.ParseMediaType(strings.TrimSpace(part.Header.Get("Content-Type")))
+		if parseErr != nil || !strings.EqualFold(partType, smsContentType) {
+			_ = part.Close()
+			continue
+		}
+		body, readErr := io.ReadAll(part)
+		_ = part.Close()
+		if readErr != nil {
+			return nil, "", fmt.Errorf("ims: read multipart SMS payload: %w", readErr)
+		}
+		payload, decodeErr := decodeSMSTransfer(body, part.Header.Get("Content-Transfer-Encoding"))
+		return payload, "multipart/mixed", decodeErr
+	}
+	return nil, "", errors.New("ims: multipart MESSAGE omitted application/vnd.3gpp.sms payload")
+}
+
+func decodeSMSTransfer(body []byte, encoding string) ([]byte, error) {
+	switch strings.ToLower(strings.TrimSpace(encoding)) {
+	case "", "binary", "8bit":
+		return append([]byte(nil), body...), nil
+	case "base64":
+		decoded, err := io.ReadAll(base64.NewDecoder(base64.StdEncoding, bytes.NewReader(body)))
+		if err != nil {
+			return nil, fmt.Errorf("ims: decode base64 SMS payload: %w", err)
+		}
+		return decoded, nil
+	case "quoted-printable":
+		decoded, err := io.ReadAll(quotedprintable.NewReader(bytes.NewReader(body)))
+		if err != nil {
+			return nil, fmt.Errorf("ims: decode quoted-printable SMS payload: %w", err)
+		}
+		return decoded, nil
+	default:
+		return nil, fmt.Errorf("ims: unsupported SMS Content-Transfer-Encoding %q", encoding)
+	}
+}
+
+func (session *Session) logInboundSMS(level slog.Level, message string, request *sipRequest, attributes ...any) {
+	logger := slog.Default()
+	if session != nil && session.provider != nil && session.provider.config.Logger != nil {
+		logger = session.provider.config.Logger
+	}
+	base := []any{"device_id", session.request.DeviceID}
+	if request != nil {
+		base = append(base,
+			"call_id", strings.TrimSpace(request.value("Call-ID")),
+			"content_type", strings.TrimSpace(request.value("Content-Type")),
+			"body_bytes", len(request.Body),
+		)
+	}
+	logger.Log(context.Background(), level, message, append(base, attributes...)...)
+}
+
+func (session *Session) sendLoggedDeliveryReport(request *sipRequest, report []byte, reportType string) {
+	if err := session.sendDeliveryReport(request, report); err != nil {
+		session.logInboundSMS(slog.LevelWarn, "IMS inbound SMS delivery report failed", request,
+			"stage", "delivery_report", "report_type", reportType, "error", err)
+		return
+	}
+	session.logInboundSMS(slog.LevelDebug, "IMS inbound SMS delivery report sent", request,
+		"stage", "delivery_report", "report_type", reportType)
+}
+
+func (session *Session) sendDeliveryReport(request *sipRequest, report []byte) error {
 	target := firstURI(request.value("P-Asserted-Identity"))
 	if target == "" {
 		target = firstURI(request.value("From"))
 	}
 	if target == "" {
-		return
+		return errors.New("ims: SMS MESSAGE omitted a delivery-report target")
 	}
-	_, _ = session.sendSIPMessage(
+	response, err := session.sendSIPMessage(
 		context.Background(),
 		target,
 		report,
 		strings.TrimSpace(request.value("Call-ID")),
 	)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("ims: SMS delivery report returned SIP %d", response.StatusCode)
+	}
+	return nil
 }
 
 func (session *Session) SendSMS(ctx context.Context, request vowifi.SMSSubmitRequest) (vowifi.SMSSubmitResult, error) {
@@ -441,14 +670,21 @@ func (session *Session) SendSMS(ctx context.Context, request vowifi.SMSSubmitReq
 	}
 	smsc := strings.TrimSpace(session.request.Identity.SMSC)
 	session.mu.Unlock()
+	smscSource := "sim"
 	if smsc == "" {
+		smscSource = "sim_reader"
 		reader, ok := session.provider.aka.(smsCenterReader)
 		var readErr error
 		if ok {
 			smsc, readErr = reader.ReadSMSCenter(ctx, session.request.DeviceID)
 		}
 		if strings.TrimSpace(smsc) == "" {
+			smsc = smsCenterForIdentity(session.provider.config, session.request.Identity)
+			smscSource = "plmn_fallback"
+		}
+		if strings.TrimSpace(smsc) == "" {
 			smsc = session.provider.config.SMSCenter
+			smscSource = "configured_fallback"
 		}
 		if strings.TrimSpace(smsc) == "" {
 			return vowifi.SMSSubmitResult{}, errors.Join(ErrSMSCUnavailable, readErr)
@@ -471,6 +707,9 @@ func (session *Session) SendSMS(ctx context.Context, request vowifi.SMSSubmitReq
 		SubmissionStatus: "pending",
 		PartResults:      make([]vowifi.SMSSubmitPart, 0, len(parts)),
 	}
+	session.logOutboundSMS(slog.LevelInfo, "IMS outbound SMS submission started",
+		"stage", "prepare", "parts", len(parts), "smsc_source", smscSource,
+		"recipient_type", smsRecipientType(parts[0].To))
 	psi := "tel:" + normalizeE164(smsc)
 	for _, part := range parts {
 		reference := session.allocateRPReference()
@@ -501,17 +740,61 @@ func (session *Session) SendSMS(ctx context.Context, request vowifi.SMSSubmitReq
 		}
 		result.PartResults = append(result.PartResults, partResult)
 		if sendErr != nil {
+			session.logOutboundSMS(slog.LevelWarn, "IMS outbound SMS submission failed",
+				"stage", "sip_transaction", "part", part.Part,
+				"rp_reference", int(reference), "error", sendErr)
 			result.SubmissionStatus = "failed"
 			return result, sendErr
 		}
 		if !partResult.Accepted {
+			session.logOutboundSMS(slog.LevelWarn, "IMS outbound SMS was rejected",
+				"stage", "sip_response", "part", part.Part,
+				"rp_reference", int(reference), "sip_status", response.StatusCode)
 			result.SubmissionStatus = "rejected"
 			return result, fmt.Errorf("%w: SIP %d", ErrSMSRejected, response.StatusCode)
 		}
 	}
 	result.AllPartsAccepted = true
 	result.SubmissionStatus = "accepted_by_ims"
+	session.logOutboundSMS(slog.LevelInfo, "IMS outbound SMS submission accepted",
+		"stage", "sip_response", "parts", result.PartsAccepted)
 	return result, nil
+}
+
+func smsCenterForIdentity(config Config, identity vowifi.SIMIdentity) string {
+	plmn := strings.TrimSpace(identity.HomeMCC) + strings.TrimSpace(identity.HomeMNC)
+	if configured := strings.TrimSpace(config.SMSCenterByPLMN[plmn]); configured != "" {
+		return configured
+	}
+	return strings.TrimSpace(vowifi.ResolveCarrierProfile(identity).SMSCenter)
+}
+
+func smsRecipientType(recipient string) string {
+	recipient = strings.TrimSpace(recipient)
+	digits := strings.TrimPrefix(recipient, "+")
+	switch {
+	case strings.HasPrefix(recipient, "+"):
+		return "international"
+	case len(digits) <= 6:
+		return "short_code"
+	default:
+		return "national"
+	}
+}
+
+func (session *Session) logOutboundSMS(level slog.Level, message string, attributes ...any) {
+	logger := slog.Default()
+	if session != nil && session.provider != nil && session.provider.config.Logger != nil {
+		logger = session.provider.config.Logger
+	}
+	plmn := strings.TrimSpace(session.request.Identity.HomeMCC) + strings.TrimSpace(session.request.Identity.HomeMNC)
+	base := []any{
+		"device_id", session.request.DeviceID,
+		"home_plmn", plmn,
+		"transport", session.transport,
+		"security", session.effectiveSecurityMode(),
+	}
+	logger.Log(context.Background(), level, message, append(base, attributes...)...)
 }
 
 func (session *Session) allocateRPReference() byte {
@@ -567,6 +850,8 @@ func (session *Session) sendSIPMessage(
 		fmt.Sprintf("CSeq: %d MESSAGE", cseq),
 		"P-Preferred-Identity: <"+session.identity.public+">",
 		"Accept-Contact: *;+g.3gpp.smsip",
+		"Request-Disposition: no-fork",
+		"Allow: MESSAGE",
 	)
 	if inReplyTo != "" {
 		lines = append(lines, "In-Reply-To: "+inReplyTo)
@@ -578,7 +863,23 @@ func (session *Session) sendSIPMessage(
 		"", "",
 	)
 	request := append([]byte(strings.Join(lines, "\r\n")), body...)
-	return session.exchangeRuntime(ctx, request, sipTransactionKey{callID: callID, cseq: cseq, method: "MESSAGE"})
+	session.logOutboundSMS(slog.LevelDebug, "IMS SIP MESSAGE transaction started",
+		"stage", "sip_send", "call_id", callID, "cseq", cseq,
+		"body_bytes", len(body), "service_routes", len(serviceRoutes))
+	response, exchangeErr := session.exchangeRuntime(
+		ctx,
+		request,
+		sipTransactionKey{callID: callID, cseq: cseq, method: "MESSAGE"},
+	)
+	if exchangeErr != nil {
+		session.logOutboundSMS(slog.LevelWarn, "IMS SIP MESSAGE transaction failed",
+			"stage", "sip_transaction", "call_id", callID, "cseq", cseq, "error", exchangeErr)
+		return response, exchangeErr
+	}
+	session.logOutboundSMS(slog.LevelDebug, "IMS SIP MESSAGE response received",
+		"stage", "sip_response", "call_id", callID, "cseq", cseq,
+		"sip_status", response.StatusCode)
+	return response, nil
 }
 
 func runtimeSecurityHeaders(active bool, verifyValue string) []string {

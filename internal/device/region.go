@@ -34,6 +34,9 @@ func CardMCCMNCWithLength(imsi string, mncLength int) (mcc string, mnc string) {
 		strings.IndexFunc(digits, func(r rune) bool { return !unicode.IsDigit(r) }) >= 0 {
 		return "", ""
 	}
+	if IsPlaceholderIMSI(digits) {
+		return "", ""
+	}
 	mcc = digits[:3]
 	mnc = digits[3:]
 	if mncLength != 2 && mncLength != 3 {
@@ -43,6 +46,18 @@ func CardMCCMNCWithLength(imsi string, mncLength int) (mcc string, mnc string) {
 		mnc = mnc[:mncLength]
 	}
 	return mcc, mnc
+}
+
+// IsPlaceholderIMSI recognizes an unprovisioned/test identity structurally,
+// without tying the decision to a vendor-specific hard-coded ICCID. A valid
+// subscriber identity cannot consist of an MCC followed only by zeroes; white
+// cards commonly ship in exactly that state before a real profile is enabled.
+func IsPlaceholderIMSI(imsi string) bool {
+	digits := strings.TrimSpace(imsi)
+	if len(digits) < 10 || strings.IndexFunc(digits, func(r rune) bool { return !unicode.IsDigit(r) }) >= 0 {
+		return false
+	}
+	return strings.Trim(digits[3:], "0") == ""
 }
 
 // RegionBlockReason returns a human-readable reason when the SIM identified by

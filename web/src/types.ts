@@ -33,6 +33,8 @@ export interface VoWiFiRuntime {
   phase: string;
   enabled?: boolean;
   active?: boolean;
+  carrierProfile?: string;
+  carrierProfileFrom?: string;
   dataplaneMode: string;
   iccid: string;
   imsi: string;
@@ -142,6 +144,38 @@ export interface DashboardDevice {
   model?: string;
 }
 
+export interface DashboardHostInfo {
+  cpuModel: string;
+  boardModel: string;
+  memoryModel: string;
+  diskModel: string;
+}
+
+export interface DashboardHostPerf {
+  cpuPercent: number;
+  memoryPercent: number;
+  memoryUsedBytes: number;
+  memoryTotalBytes: number;
+  diskPercent: number;
+  diskUsedBytes: number;
+  diskTotalBytes: number;
+  netRxBps: number;
+  netTxBps: number;
+}
+
+export interface DashboardHost {
+  host: DashboardHostInfo;
+  perf: DashboardHostPerf;
+}
+
+// 仪表盘定时任务卡只关心名字与下次执行时间。
+export interface DashboardUpcomingTask {
+  id: number;
+  name: string;
+  enabled: boolean;
+  nextRunAt: string;
+}
+
 export interface DeviceOverview extends DeviceListItem {
   atPort?: string;
   audioDevice?: string;
@@ -172,6 +206,7 @@ export interface DeviceStatus {
 export interface DiscoveredDevice {
 	 hardwareKind?: string;
 	 readerName?: string;
+  deviceType?: DeviceType;
   discoveryKey: string;
   controlPath: string;
   netInterface: string;
@@ -295,8 +330,13 @@ export interface UpstreamProxyProbe {
   reachable?: boolean;
   handshakeOk?: boolean;
   udpAssociateOk?: boolean;
+  udpExchangeOk?: boolean;
   authMethod?: string;
   relayAddr?: string;
+  dnsServer?: string;
+  dnsName?: string;
+  dnsRcode?: number;
+  roundTripMs?: number;
   diagnosis?: string;
   hint?: string;
   error?: string;
@@ -380,6 +420,7 @@ export interface NotificationSettings {
   email: Record<string, unknown>;
   pushplus: Record<string, unknown>;
   wecom: Record<string, unknown>;
+  lark: Record<string, unknown>;
 }
 
 // 网络访问控制策略：默认仅放行内网网段，可切换到对公网开放。

@@ -856,7 +856,13 @@ func decodeUserData(
 		message.Text = string(utf16.Decode(units))
 		return nil
 	default:
+		// 8-bit (binary) user data has no portable text representation, so the
+		// raw payload bytes are rendered as uppercase hexadecimal after the user
+		// data header is stripped. This keeps the bubble non-empty and gives a
+		// faithful rendering of the delivered content rather than a blank "".
 		message.Encoding = SMSEncoding8BitPDU
+		payload := data[headerBytes:]
+		message.Text = strings.ToUpper(hex.EncodeToString(payload))
 		return nil
 	}
 }

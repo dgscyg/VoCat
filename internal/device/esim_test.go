@@ -1,6 +1,7 @@
 package device
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -206,6 +207,38 @@ func TestVerifySwitchedICCIDReadsLiveModem(t *testing.T) {
 	client.assertDone(t)
 }
 
+func TestVerifySwitchedICCIDAttemptsAllowsProactiveRefreshToSettle(t *testing.T) {
+	const target = "89492026266006792824"
+	client := &transcriptClient{steps: []clientStep{
+		{command: "AT+CCID", response: okResponse("+CCID: 89441000400128014257F")},
+		{command: "AT+CCID", response: okResponse("+CCID: " + target + "F")},
+	}}
+	manager, id := newStartedTestManager(t, client)
+	if !manager.canVerifyProfileSwitchWithoutRestart(id) {
+		t.Fatal("AT modem should be eligible for refresh verification before restart")
+	}
+	if err := manager.verifySwitchedICCIDAttempts(context.Background(), id, target, 2, 0); err != nil {
+		t.Fatalf("verifySwitchedICCIDAttempts: %v", err)
+	}
+	client.assertDone(t)
+}
+
+func TestProfileSwitchRefreshProbeTimeoutIsBounded(t *testing.T) {
+	for _, test := range []struct {
+		command time.Duration
+		want    time.Duration
+	}{
+		{command: 100 * time.Millisecond, want: 3 * time.Second},
+		{command: 3 * time.Second, want: 7 * time.Second},
+		{command: 30 * time.Second, want: 10 * time.Second},
+	} {
+		manager := &Manager{commandTimeout: test.command}
+		if got := profileSwitchRefreshProbeTimeout(manager); got != test.want {
+			t.Fatalf("command timeout %s: probe timeout = %s, want %s", test.command, got, test.want)
+		}
+	}
+}
+
 func TestEUMManufacturerForWatchData(t *testing.T) {
 	if got := eumManufacturerForEID("35840574202500000125000001855764"); got != "WatchData Technologies Ltd." {
 		t.Fatalf("manufacturer = %q", got)
@@ -281,6 +314,41 @@ func TestDiscoverEuiccAIDsFindsXeSIMAlternateISDR(t *testing.T) {
 		t.Fatalf("discovered AIDs = %#v, want XeSIM %s", aids, xesimISDRAID)
 	}
 	client.assertDone(t)
+}
+
+func TestNativeQMIUsesUIMLogicalChannelForEUICC(t *testing.T) {
+	manager, _, id := newStartedNativeQMITestManager(t)
+	if err := manager.SetBackend(id, "qmi"); err != nil {
+		t.Fatal(err)
+	}
+	session := &fakeQMIRadioSession{
+		openChannel:  3,
+		apduResponse: []byte{0xDE, 0xAD, 0x90, 0x00},
+	}
+	manager.qmiRadioOpener = func(context.Context, string) (qmiRadioSession, error) {
+		return session, nil
+	}
+	channel, err := manager.openEuiccAID(context.Background(), id, isdRAID)
+	if err != nil {
+		t.Fatalf("open QMI eUICC: %v", err)
+	}
+	payload, sw, err := channel.transmit(context.Background(), []byte{0x80, 0xCA, 0x00, 0x00, 0x00}, 0x80)
+	if err != nil {
+		t.Fatalf("transmit QMI APDU: %v", err)
+	}
+	if !bytes.Equal(payload, []byte{0xDE, 0xAD}) || sw != 0x9000 {
+		t.Fatalf("QMI APDU response = %X/%04X", payload, sw)
+	}
+	channel.close(context.Background())
+	if len(session.openedAIDs) != 1 || strings.ToUpper(hex.EncodeToString(session.openedAIDs[0])) != isdRAID {
+		t.Fatalf("opened AIDs = %X", session.openedAIDs)
+	}
+	if len(session.apdus) != 1 || session.apdus[0][0] != 0x83 {
+		t.Fatalf("QMI APDUs = %X", session.apdus)
+	}
+	if len(session.closedChannels) != 1 || session.closedChannels[0] != 3 || session.closeCount != 1 {
+		t.Fatalf("closed channels/session = %v/%d", session.closedChannels, session.closeCount)
+	}
 }
 
 func TestEUICCChannelStuckWrapsTransientCME(t *testing.T) {

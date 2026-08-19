@@ -56,6 +56,7 @@ type Manager struct {
 
 type entry struct {
 	orchestrator     *vowifi.Orchestrator
+	maintenance      bool
 	busy             bool
 	reconnectPending bool
 	disablePending   bool
@@ -64,6 +65,36 @@ type entry struct {
 	retryFailures    uint
 	operationCancel  context.CancelFunc
 	stopWatch        func()
+}
+
+// BeginMaintenance temporarily suppresses background enable requests while a
+// caller performs an exclusive SIM operation such as switching eSIM profiles.
+// Disable requests remain allowed so the current runtime can release QMI/UIM.
+func (manager *Manager) BeginMaintenance(deviceID string) error {
+	if err := manager.Ensure(manager.ctx, deviceID); err != nil {
+		return err
+	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if manager.closed {
+		return ErrClosed
+	}
+	item := manager.entries[deviceID]
+	if item == nil {
+		return ErrNotRegistered
+	}
+	item.maintenance = true
+	return nil
+}
+
+// EndMaintenance re-enables ordinary desired-state reconciliation. The caller
+// then applies the newly active profile's persisted policy.
+func (manager *Manager) EndMaintenance(deviceID string) {
+	manager.mu.Lock()
+	if item := manager.entries[deviceID]; item != nil {
+		item.maintenance = false
+	}
+	manager.mu.Unlock()
 }
 
 func New(options Options) *Manager {
@@ -210,6 +241,11 @@ func (manager *Manager) RequestEnabled(deviceID string, enabled bool) (vowifi.St
 	}
 	manager.mu.Lock()
 	item := manager.entries[deviceID]
+	if item.maintenance && enabled {
+		state := item.orchestrator.State()
+		manager.mu.Unlock()
+		return state, nil
+	}
 	item.desiredEnabled = enabled
 	if item.busy {
 		manager.logger.Info(

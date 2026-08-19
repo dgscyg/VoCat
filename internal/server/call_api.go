@@ -32,22 +32,8 @@ func (s *Server) handleCalls(w http.ResponseWriter, r *http.Request, config stor
 			return true
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{
-			"device_id":       config.ID,
-			"transport":       transport,
-			"audio_available": true,
-			"calls":           calls,
+			"device_id": config.ID, "transport": transport, "calls": calls,
 		}})
-		return true
-	}
-	if config.DeviceType == store.DeviceTypeUSBSIMReader {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"data": map[string]any{
-				"device_id":       config.ID,
-				"transport":       transport,
-				"audio_available": false,
-				"calls":           []any{},
-			},
-		})
 		return true
 	}
 	response, err := s.devices.ExecuteAT(r.Context(), physicalID, "AT+CLCC")
@@ -57,10 +43,10 @@ func (s *Server) handleCalls(w http.ResponseWriter, r *http.Request, config stor
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"data": map[string]any{
-			"device_id":       config.ID,
-			"transport":       transport,
-			"audio_available": false,
-			"calls":           normalizeCellularCalls(parseCLCC(response)),
+			"device_id": config.ID,
+			"transport": transport,
+			"calls":     parseCLCC(response),
+			"raw":       response.Text(),
 		},
 	})
 	return true
@@ -254,44 +240,6 @@ func validDialNumber(value string) bool {
 		return false
 	}
 	return true
-}
-
-func normalizeCellularCalls(raw []map[string]any) []map[string]any {
-	result := make([]map[string]any, 0, len(raw))
-	for _, item := range raw {
-		index, _ := item["index"].(int)
-		directionCode, _ := item["direction"].(int)
-		stateCode, _ := item["state"].(int)
-		number, _ := item["number"].(string)
-		direction, state := cellularCallLabels(directionCode, stateCode)
-		result = append(result, map[string]any{
-			"id":          strconv.Itoa(index),
-			"number":      number,
-			"direction":   direction,
-			"state":       state,
-			"media_ready": false,
-		})
-	}
-	return result
-}
-
-func cellularCallLabels(direction, state int) (string, string) {
-	label := "outgoing"
-	if direction == 1 {
-		label = "incoming"
-	}
-	switch state {
-	case 1:
-		return label, "held"
-	case 2:
-		return label, "dialing"
-	case 3:
-		return label, "ringing"
-	case 4, 5:
-		return "incoming", "ringing"
-	default:
-		return label, "active"
-	}
 }
 
 func parseCLCC(response modem.Response) []map[string]any {

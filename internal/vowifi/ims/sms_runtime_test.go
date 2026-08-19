@@ -1,11 +1,14 @@
 package ims
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"mime/multipart"
 	"net"
+	"net/textproto"
 	"strings"
 	"testing"
 	"time"
@@ -97,6 +100,127 @@ func TestRuntimeSecurityHeaders(t *testing.T) {
 	}
 	if headers := runtimeSecurityHeaders(false, verify); len(headers) != 0 {
 		t.Fatalf("disabled security headers = %#v", headers)
+	}
+}
+
+func TestExtractSMSPayload(t *testing.T) {
+	rpdu := []byte{0x01, 0x2a, 0x00, 0x00, 0x03, 0x04, 0x00, 0x00}
+	tests := []struct {
+		name        string
+		request     *sipRequest
+		wantSource  string
+		wantPayload []byte
+	}{
+		{
+			name: "direct binary",
+			request: &sipRequest{Headers: map[string][]string{
+				"content-type":              {smsContentType + "; charset=binary"},
+				"content-transfer-encoding": {"binary"},
+			}, Body: rpdu},
+			wantSource:  smsContentType,
+			wantPayload: rpdu,
+		},
+		{
+			name:        "multipart base64",
+			request:     multipartSMSRequest(t, rpdu),
+			wantSource:  "multipart/mixed",
+			wantPayload: rpdu,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload, source, err := extractSMSPayload(test.request)
+			if err != nil {
+				t.Fatalf("extractSMSPayload() error = %v", err)
+			}
+			if source != test.wantSource || !bytes.Equal(payload, test.wantPayload) {
+				t.Fatalf("extractSMSPayload() = (%x, %q), want (%x, %q)",
+					payload, source, test.wantPayload, test.wantSource)
+			}
+		})
+	}
+}
+
+func TestSupportsSMSContentType(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  bool
+	}{
+		{smsContentType, true},
+		{"Application/Vnd.3gpp.Sms; charset=binary", true},
+		{`multipart/mixed; boundary="vodafone-boundary"`, true},
+		{"multipart/mixed", false},
+		{"text/plain", false},
+	} {
+		if got := supportsSMSContentType(test.value); got != test.want {
+			t.Errorf("supportsSMSContentType(%q) = %v, want %v", test.value, got, test.want)
+		}
+	}
+}
+
+func TestSMSCenterForIdentityUsesExactPLMN(t *testing.T) {
+	config := Config{SMSCenterByPLMN: map[string]string{
+		"23410":  "+447802000332",
+		"234010": "+447802000332",
+		"23415":  "+447785016005",
+	}}
+	for _, test := range []struct {
+		mnc  string
+		want string
+	}{
+		{mnc: "10", want: "+447802000332"},
+		{mnc: "010", want: "+447802000332"},
+		{mnc: "15", want: "+447785016005"},
+		{mnc: "30", want: ""},
+	} {
+		identity := vowifi.SIMIdentity{HomeMCC: "234", HomeMNC: test.mnc}
+		if got := smsCenterForIdentity(config, identity); got != test.want {
+			t.Errorf("smsCenterForIdentity(234/%s) = %q, want %q", test.mnc, got, test.want)
+		}
+	}
+}
+
+func TestSMSCenterForIdentityFallsBackToCarrierProfile(t *testing.T) {
+	for _, test := range []struct {
+		mnc  string
+		want string
+	}{
+		{mnc: "10", want: "+447802000332"},
+		{mnc: "15", want: "+447785016005"},
+		{mnc: "30", want: ""},
+	} {
+		identity := vowifi.SIMIdentity{HomeMCC: "234", HomeMNC: test.mnc}
+		if got := smsCenterForIdentity(Config{}, identity); got != test.want {
+			t.Errorf("profile SMSC for 234/%s = %q, want %q", test.mnc, got, test.want)
+		}
+	}
+}
+
+func multipartSMSRequest(t *testing.T, payload []byte) *sipRequest {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.SetBoundary("vodafone-boundary"); err != nil {
+		t.Fatal(err)
+	}
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Type", smsContentType)
+	header.Set("Content-Transfer-Encoding", "base64")
+	part, err := writer.CreatePart(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = part.Write([]byte(base64.StdEncoding.EncodeToString(payload))); err != nil {
+		t.Fatal(err)
+	}
+	if err = writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return &sipRequest{
+		Headers: map[string][]string{
+			"content-type": {`multipart/mixed; boundary="vodafone-boundary"`},
+		},
+		Body: body.Bytes(),
 	}
 }
 
@@ -202,6 +326,24 @@ func serveInboundSMS(listener *net.UDPConn, nonce string, readyForClose chan<- s
 	}
 	rpdu := []byte{0x01, 0x2a, 0x00, 0x00, byte(len(tpdu))}
 	rpdu = append(rpdu, tpdu...)
+	var messageBody bytes.Buffer
+	mimeWriter := multipart.NewWriter(&messageBody)
+	if err = mimeWriter.SetBoundary("vodafone-delivery"); err != nil {
+		return err
+	}
+	mimeHeader := make(textproto.MIMEHeader)
+	mimeHeader.Set("Content-Type", smsContentType)
+	mimeHeader.Set("Content-Transfer-Encoding", "binary")
+	mimePart, createErr := mimeWriter.CreatePart(mimeHeader)
+	if createErr != nil {
+		return createErr
+	}
+	if _, err = mimePart.Write(rpdu); err != nil {
+		return err
+	}
+	if err = mimeWriter.Close(); err != nil {
+		return err
+	}
 	request := []byte(strings.Join([]string{
 		"MESSAGE sip:001010123456789@ims.mnc001.mcc001.3gppnetwork.org SIP/2.0",
 		"Via: SIP/2.0/UDP " + listener.LocalAddr().String() + ";branch=z9hG4bKdeliver",
@@ -210,10 +352,10 @@ func serveInboundSMS(listener *net.UDPConn, nonce string, readyForClose chan<- s
 		"P-Asserted-Identity: <sip:ipsmgw@example.test>",
 		"Call-ID: network-deliver-1",
 		"CSeq: 1 MESSAGE",
-		"Content-Type: application/vnd.3gpp.sms",
-		fmt.Sprintf("Content-Length: %d", len(rpdu)), "", "",
+		`Content-Type: multipart/mixed; boundary="vodafone-delivery"`,
+		fmt.Sprintf("Content-Length: %d", messageBody.Len()), "", "",
 	}, "\r\n"))
-	request = append(request, rpdu...)
+	request = append(request, messageBody.Bytes()...)
 	if _, err = listener.WriteToUDP(request, remote); err != nil {
 		return err
 	}
@@ -292,12 +434,25 @@ func serveOutboundSMS(listener *net.UDPConn, nonce string, readyForClose chan<- 
 	if err != nil {
 		return err
 	}
+	firstMessage := append([]byte(nil), packet[:count]...)
+	firstRemote := remote.String()
+	// Exercise the RFC SIP/UDP non-INVITE transaction retransmission path by
+	// deliberately dropping the first MESSAGE request.
+	count, remote, err = listener.ReadFromUDP(packet)
+	if err != nil {
+		return err
+	}
+	if remote.String() != firstRemote || !bytes.Equal(packet[:count], firstMessage) {
+		return errors.New("outbound MESSAGE retransmission changed transaction bytes or source")
+	}
 	message, err := parseSIPPacket(packet[:count])
 	if err != nil || message.Request == nil {
 		return fmt.Errorf("outbound MESSAGE parse: %v", err)
 	}
 	if message.Request.Method != "MESSAGE" || message.Request.URI != "tel:+447785016005" ||
-		strings.ToLower(message.Request.value("Content-Type")) != smsContentType {
+		strings.ToLower(message.Request.value("Content-Type")) != smsContentType ||
+		message.Request.value("Request-Disposition") != "no-fork" ||
+		message.Request.value("Allow") != "MESSAGE" {
 		return fmt.Errorf("unexpected outbound MESSAGE %#v", message.Request)
 	}
 	rpdu, err := parseRPDU(message.Request.Body)

@@ -141,14 +141,14 @@ sudo env \
 如果 Linux 主機需要探索每一個接入的受支援 Quectel 模組,並持續感知 USB 熱插拔事件,請以硬體存取模式執行 Vocat:
 
 ```bash
-docker pull ghcr.io/mengmengcode/vocat:latest
+docker pull ghcr.io/dgscyg/vocat:latest
 
 read -rsp "管理員密碼: " VOCAT_BOOTSTRAP_PASSWORD; echo
 printf '%s\n' "$VOCAT_BOOTSTRAP_PASSWORD" | docker run --rm -i \
   --user 0:0 \
   -v vocat-data:/opt/vocat/data \
   --entrypoint /opt/vocat/bin/vocat \
-  ghcr.io/mengmengcode/vocat:latest bootstrap-admin
+  ghcr.io/dgscyg/vocat:latest bootstrap-admin
 unset VOCAT_BOOTSTRAP_PASSWORD
 
 docker run -d \
@@ -160,7 +160,7 @@ docker run -d \
   -v vocat-data:/opt/vocat/data \
   -v /dev:/dev \
   -v /sys:/sys:ro \
-  ghcr.io/mengmengcode/vocat:latest
+  ghcr.io/dgscyg/vocat:latest
 ```
 
 容器啟動後開啟 `http://<伺服器位址>:7575`。主機網路是必需的,這樣 QMI 網路介面才能對 Vocat 可見;而特權裝置存取是序列埠、QMI 控制節點、TUN 介面、網路配置以及容器啟動後新增裝置所必需的。`/dev` 掛載使新的 `ttyUSB*`、`ttyACM*` 和 `cdc-wdm*` 節點無需重建容器即可見。
@@ -219,7 +219,7 @@ sudo vocat update --repo dgscyg/VoCat
 Docker 安裝的更新方式:
 
 ```bash
-docker pull ghcr.io/mengmengcode/vocat:latest
+docker pull ghcr.io/dgscyg/vocat:latest
 ```
 
 拉取新映像後重建容器。
@@ -322,4 +322,4 @@ cd web && npm run build
 
 參見 [LICENSE](../LICENSE)。
 
-[![GitHub stars](https://img.shields.io/github/stars/dgscyg/VoCat)](https://github.com/dgscyg/VoCat)
+[![MengMengCode/VoCat Star History](https://mengmeng.meteor-history.com/api/embed/MengMengCode/VoCat.svg?sig=sdeXRVxAoY3yLWgXL7JViY2USYIN3t9neJ6ScPvgUAo&theme=light&style=xkcd&color=dd4528&background=ffffff&textColor=000000&width=900&height=600&lineWidth=3&showTitle=true&showLegend=true&showDots=false&v=0.0.14)](https://meteor-history.com)

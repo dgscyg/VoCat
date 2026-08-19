@@ -103,6 +103,141 @@ func TestProxyResolverUsesCountryRuleWithoutICCIDBinding(t *testing.T) {
 	}
 }
 
+func TestProxyResolverCountryRuleWithDisabledProxyFallsBackDirect(t *testing.T) {
+	database := testStore(t)
+	ctx := context.Background()
+	if err := database.UpsertUpstreamProxy(ctx, store.UpstreamProxy{
+		ID: "disabled", Name: "Disabled", Addr: "127.0.0.1:1080", Enabled: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpsertCountryRule(ctx, store.CountryRule{
+		CountryCode: "GB", CountryName: "United Kingdom", UpstreamProxyID: "disabled", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	route, err := (ProxyResolver{Store: database}).Resolve(ctx, vowifi.ProxyRequest{DeviceID: "ec20", HomeMCC: "234"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if route.Mode != vowifi.ProxyModeDirect {
+		t.Fatalf("route = %#v, want direct for a disabled country default", route)
+	}
+}
+
+func TestProxyResolverICCIDBindingWithDisabledProxyFailsClosed(t *testing.T) {
+	database := testStore(t)
+	ctx := context.Background()
+	if err := database.UpsertDevice(ctx, store.Device{ID: "ec20", Name: "EC20"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpsertUpstreamProxy(ctx, store.UpstreamProxy{
+		ID: "disabled", Name: "Disabled", Addr: "127.0.0.1:1080", Enabled: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpsertDeviceProxyBinding(ctx, store.DeviceProxyBinding{
+		DeviceID: "ec20", ICCID: "89441000400128014257", ProfileName: "Manual", UpstreamProxyID: "disabled",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := (ProxyResolver{Store: database}).Resolve(ctx, vowifi.ProxyRequest{
+		DeviceID: "ec20", ICCID: "89441000400128014257", HomeMCC: "234",
+	})
+	if err == nil {
+		t.Fatal("disabled explicit ICCID binding unexpectedly fell back to another route")
+	}
+}
+
+func TestProxyResolverMaterializesCountryRuleAsICCIDBinding(t *testing.T) {
+	database := testStore(t)
+	ctx := context.Background()
+	if err := database.UpsertDevice(ctx, store.Device{ID: "ec20", Name: "EC20"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, proxy := range []store.UpstreamProxy{
+		{ID: "first", Name: "First", Addr: "127.0.0.1:1080", Enabled: true},
+		{ID: "later", Name: "Later", Addr: "127.0.0.1:1081", Enabled: true},
+	} {
+		if err := database.UpsertUpstreamProxy(ctx, proxy); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := database.UpsertCountryRule(ctx, store.CountryRule{
+		CountryCode: "GB", CountryName: "United Kingdom", UpstreamProxyID: "first", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := vowifi.ProxyRequest{
+		DeviceID: "ec20", ICCID: "89441000400128014257", HomeMCC: "234",
+	}
+	resolver := ProxyResolver{Store: database}
+	route, err := resolver.Resolve(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if route.ID != "first" {
+		t.Fatalf("first route = %#v, want MCC default", route)
+	}
+	binding, err := database.DeviceProxyBinding(ctx, request.ICCID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.DeviceID != request.DeviceID || binding.UpstreamProxyID != "first" {
+		t.Fatalf("materialized binding = %#v", binding)
+	}
+
+	if err := database.UpsertCountryRule(ctx, store.CountryRule{
+		CountryCode: "GB", CountryName: "United Kingdom", UpstreamProxyID: "later", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	route, err = resolver.Resolve(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if route.ID != "first" {
+		t.Fatalf("route after country rule edit = %#v, want durable ICCID binding", route)
+	}
+}
+
+func TestInsertDeviceProxyBindingIfAbsentDoesNotReplaceExplicitBinding(t *testing.T) {
+	database := testStore(t)
+	ctx := context.Background()
+	if err := database.UpsertDevice(ctx, store.Device{ID: "ec20", Name: "EC20"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, proxyID := range []string{"explicit", "default"} {
+		if err := database.UpsertUpstreamProxy(ctx, store.UpstreamProxy{
+			ID: proxyID, Name: proxyID, Addr: "127.0.0.1:1080", Enabled: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	iccid := "89441000400128014257"
+	if err := database.UpsertDeviceProxyBinding(ctx, store.DeviceProxyBinding{
+		DeviceID: "ec20", ICCID: iccid, ProfileName: "Manual", UpstreamProxyID: "explicit",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := database.InsertDeviceProxyBindingIfAbsent(ctx, store.DeviceProxyBinding{
+		DeviceID: "ec20", ICCID: iccid, ProfileName: "Automatic", UpstreamProxyID: "default",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created {
+		t.Fatal("default binding unexpectedly replaced an explicit binding")
+	}
+	binding, err := database.DeviceProxyBinding(ctx, iccid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.UpstreamProxyID != "explicit" || binding.ProfileName != "Manual" {
+		t.Fatalf("binding = %#v, want explicit binding unchanged", binding)
+	}
+}
+
 func TestProxyResolverPrefersICCIDBindingOverCountryRule(t *testing.T) {
 	database := testStore(t)
 	for _, proxy := range []store.UpstreamProxy{
@@ -216,13 +351,15 @@ func TestStateProjectorPreservesConcreteDataplaneMode(t *testing.T) {
 	}
 	projector := StateProjector{Store: database}
 	if err := projector.Save(context.Background(), vowifi.State{
-		DeviceID:      "ec25",
-		Phase:         vowifi.PhaseIMSReady,
-		TunnelReady:   true,
-		IMSReady:      true,
-		TunnelName:    "vocat-swu-ec25",
-		DataplaneMode: "userspace",
-		UpdatedAt:     time.Now().UTC(),
+		DeviceID:           "ec25",
+		Phase:              vowifi.PhaseIMSReady,
+		TunnelReady:        true,
+		IMSReady:           true,
+		TunnelName:         "vocat-swu-ec25",
+		DataplaneMode:      "userspace",
+		CarrierProfile:     "vodafone-uk",
+		CarrierProfileFrom: "hplmn",
+		UpdatedAt:          time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -239,6 +376,13 @@ func TestStateProjectorPreservesConcreteDataplaneMode(t *testing.T) {
 	}
 	if tunnel["dataplane_mode"] != "userspace" {
 		t.Fatalf("tunnel dataplane mode = %#v", tunnel["dataplane_mode"])
+	}
+	var extra map[string]any
+	if err := json.Unmarshal(runtime.Extra, &extra); err != nil {
+		t.Fatal(err)
+	}
+	if extra["carrier_profile"] != "vodafone-uk" || extra["carrier_profile_from"] != "hplmn" {
+		t.Fatalf("carrier profile projection = %#v", extra)
 	}
 }
 

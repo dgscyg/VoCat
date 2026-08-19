@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
+	"vocat/internal/device"
 	"vocat/internal/i18n"
 	localproxy "vocat/internal/proxy"
 	"vocat/internal/store"
@@ -100,6 +102,48 @@ func (s *Server) handleUpstreamProxy(w http.ResponseWriter, r *http.Request, id 
 		}
 		payload.ID = id
 		s.saveAndProbeUpstream(w, r, payload)
+	case http.MethodPatch:
+		var request struct {
+			Enabled bool `json:"enabled"`
+		}
+		if err := s.decodeJSON(w, r, &request); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		value, err := s.store.UpstreamProxy(r.Context(), id)
+		if err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		value.Enabled = request.Enabled
+		value.UpdatedAt = time.Now().UTC()
+		if err := s.store.UpsertUpstreamProxy(r.Context(), value); err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		bindings, err := s.store.ListDeviceProxyBindings(r.Context())
+		if err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		reconnectRequested := false
+		var reconnectErrors []string
+		for _, binding := range bindings {
+			if binding.UpstreamProxyID != id {
+				continue
+			}
+			requested, reconnectErr := s.requestProfileProxyRouteReconnect(binding.DeviceID, binding.ICCID)
+			reconnectRequested = reconnectRequested || requested
+			if reconnectErr != nil {
+				reconnectErrors = append(reconnectErrors, reconnectErr.Error())
+			}
+		}
+		response := upstreamProxyResponse(value.Redacted())
+		response["reconnect_requested"] = reconnectRequested
+		if len(reconnectErrors) > 0 {
+			response["reconnect_error"] = strings.Join(reconnectErrors, "; ")
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": response})
 	case http.MethodDelete:
 		bindings, listErr := s.store.ListDeviceProxyBindings(r.Context())
 		if listErr != nil {
@@ -117,7 +161,7 @@ func (s *Server) handleUpstreamProxy(w http.ResponseWriter, r *http.Request, id 
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"deleted": true}})
 	default:
-		w.Header().Set("Allow", "PUT, DELETE")
+		w.Header().Set("Allow", "PUT, PATCH, DELETE")
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 	}
 }
@@ -351,8 +395,8 @@ func (s *Server) saveAndProbeUpstream(
 	)
 	probeResponse := probeMap(probe, probeErr)
 	message := i18n.T("代理已保存；UDP ASSOCIATE 尚未通过。")
-	if probeErr == nil && probe.UDPAssociateOK {
-		message = i18n.T("代理已保存，SOCKS5 认证与 UDP ASSOCIATE 均通过。")
+	if probeErr == nil && probe.UDPExchangeOK {
+		message = i18n.T("代理已保存，SOCKS5 认证与真实 UDP 往返均通过。")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"data": map[string]any{
@@ -381,8 +425,8 @@ func (s *Server) handleUpstreamProbe(w http.ResponseWriter, r *http.Request, id 
 		8*time.Second,
 	)
 	message := i18n.T("代理不能承载 VoWiFi 所需的 UDP。")
-	if probeErr == nil && result.UDPAssociateOK {
-		message = i18n.T("SOCKS5 认证与 UDP ASSOCIATE 探测通过。")
+	if probeErr == nil && result.UDPExchangeOK {
+		message = i18n.T("SOCKS5 认证与真实 UDP 往返探测通过。")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"data": map[string]any{
@@ -435,8 +479,8 @@ func (s *Server) handleUpstreamProbeConfig(w http.ResponseWriter, r *http.Reques
 		8*time.Second,
 	)
 	message := i18n.T("代理不能承载 VoWiFi 所需的 UDP。")
-	if probeErr == nil && result.UDPAssociateOK {
-		message = i18n.T("SOCKS5 认证与 UDP ASSOCIATE 探测通过。")
+	if probeErr == nil && result.UDPExchangeOK {
+		message = i18n.T("SOCKS5 认证与真实 UDP 往返探测通过。")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"data": map[string]any{
@@ -589,7 +633,7 @@ func countryNameForMCC(mcc string) string {
 	return ""
 }
 
-var proxyCountries = []proxyCountry{
+var namedProxyCountries = []proxyCountry{
 	{Code: "CN", Name: "中国", MCCs: []string{"460", "461"}},
 	{Code: "HK", Name: "中国香港", MCCs: []string{"454"}},
 	{Code: "MO", Name: "中国澳门", MCCs: []string{"455"}},
@@ -643,4 +687,27 @@ var proxyCountries = []proxyCountry{
 	{Code: "EG", Name: "埃及", MCCs: []string{"602"}},
 	{Code: "NG", Name: "尼日利亚", MCCs: []string{"621"}},
 	{Code: "KE", Name: "肯尼亚", MCCs: []string{"639"}},
+}
+
+var proxyCountries = buildProxyCountries()
+
+func buildProxyCountries() []proxyCountry {
+	byCode := make(map[string]proxyCountry)
+	for _, country := range namedProxyCountries {
+		byCode[country.Code] = country
+	}
+	for code, mccs := range device.MCCsByCountry() {
+		country, found := byCode[code]
+		if !found {
+			country = proxyCountry{Code: code, Name: code}
+		}
+		country.MCCs = append([]string(nil), mccs...)
+		byCode[code] = country
+	}
+	result := make([]proxyCountry, 0, len(byCode))
+	for _, country := range byCode {
+		result = append(result, country)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Code < result[j].Code })
+	return result
 }

@@ -18,25 +18,6 @@ func TestParseCLCC(t *testing.T) {
 	}
 }
 
-func TestNormalizeCellularCalls(t *testing.T) {
-	calls := normalizeCellularCalls(parseCLCC(modem.Response{Lines: []string{
-		`+CLCC: 1,1,4,0,0,"+447700900000",145`,
-		`+CLCC: 2,0,2,0,0,"12345",129`,
-	}}))
-	if len(calls) != 2 {
-		t.Fatalf("normalizeCellularCalls = %#v", calls)
-	}
-	if calls[0]["id"] != "1" || calls[0]["direction"] != "incoming" || calls[0]["state"] != "ringing" {
-		t.Fatalf("incoming ringing = %#v", calls[0])
-	}
-	if calls[1]["id"] != "2" || calls[1]["direction"] != "outgoing" || calls[1]["state"] != "dialing" {
-		t.Fatalf("outgoing dialing = %#v", calls[1])
-	}
-	if calls[0]["media_ready"] != false {
-		t.Fatalf("cellular media_ready = %#v", calls[0]["media_ready"])
-	}
-}
-
 func TestValidDialNumber(t *testing.T) {
 	for _, value := range []string{"+447700900000", "12345", "*100#"} {
 		if !validDialNumber(value) {

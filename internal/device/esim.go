@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
+
 	"vocat/internal/i18n"
 	"vocat/internal/modem"
 	"vocat/internal/pcsc"
@@ -159,12 +161,20 @@ func encodeICCID(digits string) ([]byte, error) {
 }
 
 func buildEnableProfileRequest(iccid string) ([]byte, error) {
+	return buildEnableProfileRequestWithRefresh(iccid, true)
+}
+
+func buildEnableProfileRequestWithRefresh(iccid string, refresh bool) ([]byte, error) {
 	bcd, err := encodeICCID(iccid)
 	if err != nil {
 		return nil, err
 	}
 	profileID := derConstruct(0xA0, derEncode(0x5A, bcd))
-	return derConstruct(0xBF31, profileID, derEncode(0x81, []byte{0xFF})), nil
+	refreshFlag := byte(0x00)
+	if refresh {
+		refreshFlag = 0xFF
+	}
+	return derConstruct(0xBF31, profileID, derEncode(0x81, []byte{refreshFlag})), nil
 }
 
 // parseCSIM extracts the payload and status word from an AT+CSIM response.
@@ -195,7 +205,72 @@ type euiccChannel struct {
 	id           string
 	channel      int
 	pcscSession  *pcsc.Session
+	qmiSession   nativeQMIEuiccSession
+	qmiSlot      uint8
 	resetOnClose bool
+}
+
+func (channel *euiccChannel) registerProfileRefresh(ctx context.Context) (bool, error) {
+	refreshSession, ok := channel.qmiSession.(nativeQMIRefreshSession)
+	if !ok {
+		return false, nil
+	}
+	if err := refreshSession.RegisterUIMRefresh(ctx); err != nil {
+		var unsupported *qmi.NotSupportedError
+		if errors.As(err, &unsupported) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (channel *euiccChannel) completeProfileRefresh(ctx context.Context) error {
+	refreshSession, ok := channel.qmiSession.(nativeQMIRefreshSession)
+	if !ok {
+		return nil
+	}
+	return refreshSession.CompleteUIMRefresh(ctx)
+}
+
+func (channel *euiccChannel) acknowledgeProfileRefresh(ctx context.Context) error {
+	refreshSession, ok := channel.qmiSession.(nativeQMIRefreshSession)
+	if !ok {
+		return nil
+	}
+	return refreshSession.AcknowledgeUIMRefresh(ctx)
+}
+
+func (channel *euiccChannel) recoverCATBusy(ctx context.Context) error {
+	if channel.qmiSession == nil {
+		return nil
+	}
+	// A power cycle must happen while the CAT2 client remains registered, or
+	// the card can issue its first proactive command before VoCat is listening
+	// and immediately become busy again.
+	if channel.channel > 0 {
+		_ = channel.qmiSession.CloseLogicalChannel(ctx, channel.qmiSlot, byte(channel.channel))
+		channel.channel = 0
+	}
+	power, ok := channel.qmiSession.(interface {
+		PowerOffSIM(context.Context, uint8) error
+		PowerOnSIM(context.Context, uint8) error
+	})
+	if !ok {
+		return nil
+	}
+	if err := power.PowerOffSIM(ctx, channel.qmiSlot); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(time.Second):
+	}
+	if err := power.PowerOnSIM(ctx, channel.qmiSlot); err != nil {
+		return err
+	}
+	return channel.completeProfileRefresh(ctx)
 }
 
 // csimAPDUTimeout bounds a single AT+CSIM exchange. Loading a BoundProfilePackage
@@ -289,6 +364,9 @@ func (manager *Manager) openEuiccOnceAID(ctx context.Context, id, aidHex string)
 	if candidate.HardwareKind == pcsc.HardwareKind {
 		return manager.openPCSCEuiccOnceAID(ctx, id, candidate, aidHex)
 	}
+	if strings.EqualFold(manager.backendFor(state), "qmi") && isNativeQMICandidate(candidate) {
+		return manager.openQMIEuiccOnceAID(ctx, id, candidate, aidHex)
+	}
 	// MANAGE CHANNEL (open): 00 70 00 00 01 -> "<channel> 90 00". This EC20
 	// firmware requires the explicit one-byte expected length: Le=00 opens a
 	// channel but then rejects SELECT ISD-R at the AT+CSIM layer.
@@ -325,6 +403,38 @@ func (manager *Manager) openEuiccOnceAID(ctx context.Context, id, aidHex string)
 		return nil, errNoEUICC
 	}
 	return channel, nil
+}
+
+func (manager *Manager) openQMIEuiccOnceAID(ctx context.Context, id string, candidate modem.Candidate, aidHex string) (*euiccChannel, error) {
+	aidHex = strings.ToUpper(strings.TrimSpace(aidHex))
+	aid, err := hex.DecodeString(aidHex)
+	if err != nil || len(aid) == 0 || len(aid) > 255 {
+		return nil, fmt.Errorf("esim: invalid ISD-R AID %q", aidHex)
+	}
+	if manager.qmiRadioOpener == nil {
+		return nil, errors.New("esim: QMI UIM transport is unavailable")
+	}
+	openContext, cancel := context.WithTimeout(ctx, csimAPDUTimeout)
+	defer cancel()
+	radioSession, err := manager.qmiRadioOpener(openContext, candidate.QMIControl)
+	if err != nil {
+		return nil, fmt.Errorf("esim: open QMI UIM transport: %w", err)
+	}
+	session, ok := radioSession.(nativeQMIEuiccSession)
+	if !ok {
+		_ = radioSession.Close()
+		return nil, errors.New("esim: QMI UIM transport does not support logical channels")
+	}
+	const slot uint8 = 1
+	logicalChannel, err := session.OpenLogicalChannel(openContext, slot, aid)
+	if err != nil {
+		_ = session.Close()
+		return nil, fmt.Errorf("%w: %v", errNoEUICC, err)
+	}
+	return &euiccChannel{
+		manager: manager, id: id, channel: int(logicalChannel),
+		qmiSession: session, qmiSlot: slot,
+	}, nil
 }
 
 func (manager *Manager) openPCSCEuiccOnceAID(ctx context.Context, id string, candidate modem.Candidate, aidHex string) (*euiccChannel, error) {
@@ -407,6 +517,14 @@ func isTransientEuiccCME(err error) bool {
 
 // close releases the logical channel (MANAGE CHANNEL close).
 func (channel *euiccChannel) close(ctx context.Context) {
+	if channel.qmiSession != nil {
+		if channel.channel > 0 {
+			_ = channel.qmiSession.CloseLogicalChannel(ctx, channel.qmiSlot, byte(channel.channel))
+		}
+		_ = channel.qmiSession.Close()
+		channel.qmiSession = nil
+		return
+	}
 	closeAPDU := []byte{0x00, 0x70, 0x80, byte(channel.channel), 0x00}
 	_, _, _ = channel.exchange(ctx, closeAPDU)
 	if channel.pcscSession != nil {
@@ -420,6 +538,17 @@ func (channel *euiccChannel) close(ctx context.Context) {
 }
 
 func (channel *euiccChannel) exchange(ctx context.Context, apdu []byte) ([]byte, int, error) {
+	if channel.qmiSession != nil {
+		raw, err := channel.qmiSession.SendAPDU(ctx, channel.qmiSlot, byte(channel.channel), apdu)
+		if err != nil {
+			return nil, 0, err
+		}
+		if len(raw) < 2 {
+			return nil, 0, fmt.Errorf("esim: short QMI UIM APDU response")
+		}
+		sw := int(raw[len(raw)-2])<<8 | int(raw[len(raw)-1])
+		return raw[:len(raw)-2], sw, nil
+	}
 	if channel.pcscSession != nil {
 		payload, sw, err := channel.pcscSession.Transmit(ctx, apdu)
 		return payload, int(sw), err
@@ -652,9 +781,9 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 	if iccid == "" {
 		return errors.New("esim: an ICCID is required")
 	}
-	der, err := buildEnableProfileRequest(iccid)
-	if err != nil {
-		return err
+	_, nativeQMI, nativeErr := manager.nativeQMIControl(id)
+	if nativeErr != nil {
+		return nativeErr
 	}
 	manager.lockESIM()
 	if err := manager.waitForESIMRecovery(ctx, id); err != nil {
@@ -663,6 +792,31 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 	}
 	channel, err := manager.openEuiccAID(ctx, id, targetEuiccAID(aidHex))
 	if err != nil {
+		manager.unlockESIM()
+		return err
+	}
+	refreshRequested := !nativeQMI
+	if nativeQMI {
+		refreshContext, cancelRefresh := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		refreshRequested, err = channel.registerProfileRefresh(refreshContext)
+		cancelRefresh()
+		if err != nil {
+			channel.close(context.Background())
+			manager.unlockESIM()
+			return fmt.Errorf("esim: register QMI UIM refresh: %w", err)
+		}
+		// After a refresh=true attempt reports catBusy, retry without asking the
+		// eUICC to start another REFRESH proactive command. SGP.22 permits the
+		// card to terminate the pre-existing proactive session in this mode; the
+		// native-QMI recovery below performs the required SIM reset and cache
+		// reload on behalf of the device.
+		if attempt, _ := ctx.Value(esimCATBusyRetryKey{}).(int); attempt > 0 {
+			refreshRequested = false
+		}
+	}
+	der, err := buildEnableProfileRequestWithRefresh(iccid, refreshRequested)
+	if err != nil {
+		channel.close(context.Background())
 		manager.unlockESIM()
 		return err
 	}
@@ -675,10 +829,38 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 	// stays a sibling of A0, directly under BF31.
 	// EnableProfile is a non-idempotent commit. Once its APDU starts, a browser
 	// disconnect or reverse-proxy timeout must not cancel it halfway through and
-	// skip the modem reset, otherwise EC20 remains in SIM failure (+CME 13).
+	// skip post-commit recovery; EC20 may otherwise remain in SIM failure
+	// (+CME 13).
 	commitContext, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), csimAPDUTimeout)
 	payload, err := channel.es10(commitContext, der)
 	cancelCommit()
+	// A rejected EnableProfile (for example CAT busy) does not emit REFRESH.
+	// Parse the card-level result before waiting for an indication, otherwise
+	// every retry needlessly waits for the refresh timeout.
+	resultBeforeClose, resultPresentBeforeClose := enableProfileResult(payload)
+	if err == nil && resultPresentBeforeClose && byte(resultBeforeClose) == 5 && nativeQMI {
+		// Registering CAT2 may immediately deliver a proactive command that was
+		// already pending before EnableProfile. Drain it on catBusy so the raw
+		// REFRESH command receives its terminal response before the retry.
+		catContext, cancelCAT := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = channel.completeProfileRefresh(catContext)
+		cancelCAT()
+		if attempt, _ := ctx.Value(esimCATBusyRetryKey{}).(int); attempt == 0 {
+			recoveryContext, cancelRecovery := context.WithTimeout(context.Background(), 12*time.Second)
+			_ = channel.recoverCATBusy(recoveryContext)
+			cancelRecovery()
+		}
+		ackContext, cancelAck := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = channel.acknowledgeProfileRefresh(ackContext)
+		cancelAck()
+	}
+	if err == nil && resultPresentBeforeClose &&
+		enableProfileResponseError(byte(resultBeforeClose), payload) == nil &&
+		refreshRequested && nativeQMI {
+		refreshContext, cancelRefresh := context.WithTimeout(context.Background(), 20*time.Second)
+		_ = channel.completeProfileRefresh(refreshContext)
+		cancelRefresh()
+	}
 	// Release the logical channel before any reset: openEuicc's csim holds
 	// opMu only for the duration of each APDU, so by here the lock is free.
 	closeContext, cancelClose := context.WithTimeout(context.Background(), csimAPDUTimeout)
@@ -703,10 +885,48 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 		return fmt.Errorf("esim: unexpected EnableProfile response %s", strings.ToUpper(hex.EncodeToString(payload)))
 	}
 	if err := enableProfileResponseError(byte(result), payload); err != nil {
+		if errors.Is(err, ErrESIMEnableCATBusy) {
+			attempt, _ := ctx.Value(esimCATBusyRetryKey{}).(int)
+			if attempt < 11 {
+				manager.unlockESIM()
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(2 * time.Second):
+				}
+				return manager.ESIMSwitchProfile(context.WithValue(ctx, esimCATBusyRetryKey{}, attempt+1), id, iccid, aidHex)
+			}
+		}
 		manager.unlockESIM()
 		return err
 	}
 	manager.markCachedProfileEnabled(id, iccid)
+	// EnableProfile already requested an eUICC REFRESH. Some AT modems consume
+	// that proactive command and expose the new subscription immediately, so a
+	// full CFUN=1,1 reset would only add downtime. Give those devices a short
+	// chance to prove that their SIM cache is current; modems that keep reporting
+	// the old ICCID continue through the established reboot/recovery path below.
+	if manager.canVerifyProfileSwitchWithoutRestart(id) {
+		probeContext, cancelProbe := context.WithTimeout(
+			context.WithoutCancel(ctx),
+			profileSwitchRefreshProbeTimeout(manager),
+		)
+		probeErr := manager.verifySwitchedICCIDAttempts(probeContext, id, iccid, 3, time.Second)
+		cancelProbe()
+		if probeErr == nil {
+			// Repopulate the cached snapshot while the AT transport is still live.
+			// Verification above is authoritative, so snapshot refresh remains
+			// best-effort just as it is after the legacy reboot path.
+			refreshContext, cancelRefresh := context.WithTimeout(
+				context.WithoutCancel(ctx),
+				manager.longTimeout,
+			)
+			_, _ = manager.Refresh(refreshContext, id)
+			cancelRefresh()
+			manager.unlockESIM()
+			return nil
+		}
+	}
 	// The eUICC accepted the target profile. Reset and repopulate the modem in
 	// a detached recovery so it survives an HTTP disconnect, but keep this API
 	// call pending until the live modem ICCID proves that the switch took effect.
@@ -720,6 +940,8 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 	}
 	return manager.verifySwitchedICCID(verifyContext, id, iccid)
 }
+
+type esimCATBusyRetryKey struct{}
 
 func (manager *Manager) startProfileSwitchRecovery(id string) {
 	done := make(chan struct{})
@@ -853,6 +1075,18 @@ func (manager *Manager) renameCachedProfile(id, iccid, nickname string) {
 // initiating HTTP request. EC20 commonly drops the AT port while processing
 // CFUN=1,1, so the reset error is intentionally followed by discovery retries.
 func (manager *Manager) recoverAfterProfileSwitch(id string) {
+	resetContext, cancelReset := context.WithTimeout(context.Background(), manager.longTimeout)
+	if native, err := manager.powerCycleNativeQMISIM(resetContext, id); native {
+		cancelReset()
+		if err == nil {
+			time.Sleep(1500 * time.Millisecond)
+		}
+		// Native WWAN identity and profile verification are both QMI-backed.
+		// Do not enter the AT refresh path: OpenStick firmware can accept the
+		// switch while timing out every EC20-specific AT identity command.
+		return
+	}
+	cancelReset()
 	if !manager.isPCSCDevice(id) {
 		resetContext, cancelReset := context.WithTimeout(context.Background(), manager.longTimeout)
 		_ = manager.rebootForProfileSwitch(resetContext, id)
@@ -975,17 +1209,69 @@ func profileSwitchVerificationTimeout(manager *Manager) time.Duration {
 	return timeout
 }
 
+func profileSwitchRefreshProbeTimeout(manager *Manager) time.Duration {
+	// Allow both standard ICCID commands to consume one ordinary command
+	// timeout, plus a small window for the eUICC REFRESH to settle. Keep the
+	// optimisation bounded so an older modem reaches its required reboot soon.
+	timeout := manager.commandTimeout*2 + time.Second
+	if timeout < 3*time.Second {
+		return 3 * time.Second
+	}
+	if timeout > 10*time.Second {
+		return 10 * time.Second
+	}
+	return timeout
+}
+
+func (manager *Manager) canVerifyProfileSwitchWithoutRestart(id string) bool {
+	_, native, err := manager.nativeQMIControl(id)
+	return err == nil && !native && !manager.isPCSCDevice(id)
+}
+
 // verifySwitchedICCID performs a fresh baseband read after recovery. An ES10c
 // result of zero only means the eUICC accepted the operation; the state change
 // is finalized by REFRESH/reset. The UI must not report success until the modem
 // is actually exposing the requested ICCID.
 func (manager *Manager) verifySwitchedICCID(ctx context.Context, id, expected string) error {
+	return manager.verifySwitchedICCIDAttempts(ctx, id, expected, 6, 2*time.Second)
+}
+
+func (manager *Manager) verifySwitchedICCIDAttempts(
+	ctx context.Context,
+	id string,
+	expected string,
+	attempts int,
+	interval time.Duration,
+) error {
 	expected = strings.TrimSpace(expected)
-	const attempts = 6
 	var lastICCID string
 	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
-		if manager.isPCSCDevice(id) {
+		if control, native, nativeErr := manager.nativeQMIControl(id); native {
+			if nativeErr != nil {
+				lastErr = nativeErr
+			} else {
+				state, lookupErr := manager.lookup(id)
+				if lookupErr != nil {
+					lastErr = lookupErr
+				} else {
+					candidate := manager.candidateFor(state)
+					candidate.QMIControl = control
+					live, readErr := manager.readNativeQMIICCID(ctx, candidate)
+					if readErr == nil {
+						lastICCID = strings.TrimSpace(live)
+						if lastICCID == expected {
+							return nil
+						}
+						lastErr = fmt.Errorf("native QMI still reports ICCID %s", lastICCID)
+					} else {
+						lastErr = readErr
+					}
+				}
+			}
+		} else if nativeErr != nil {
+			lastErr = nativeErr
+		} else if manager.isPCSCDevice(id) {
 			snapshot, err := manager.Refresh(ctx, id)
 			if err == nil {
 				lastICCID = strings.TrimSpace(snapshot.ICCID)
@@ -1019,7 +1305,7 @@ func (manager *Manager) verifySwitchedICCID(ctx context.Context, id, expected st
 		}
 		if attempt+1 < attempts {
 			select {
-			case <-time.After(2 * time.Second):
+			case <-time.After(interval):
 			case <-ctx.Done():
 				return fmt.Errorf("esim: verify enabled profile %s: %w", expected, ctx.Err())
 			}

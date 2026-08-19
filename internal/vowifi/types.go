@@ -96,6 +96,8 @@ type State struct {
 	PureAirplanePolicy bool          `json:"pure_airplane_policy"`
 	HomeMCC            string        `json:"home_mcc,omitempty"`
 	HomeMNC            string        `json:"home_mnc,omitempty"`
+	CarrierProfile     string        `json:"carrier_profile,omitempty"`
+	CarrierProfileFrom string        `json:"carrier_profile_from,omitempty"`
 	EPDG               string        `json:"epdg,omitempty"`
 	ProxyMode          ProxyMode     `json:"proxy_mode,omitempty"`
 	ProxyID            string        `json:"proxy_id,omitempty"`
@@ -137,6 +139,9 @@ type SIMIdentity struct {
 	HomeMCC         string
 	HomeMNC         string
 	HomeCountryCode string
+	SPN             string
+	GID1            string
+	GID2            string
 	EPDG            string
 	// SMSC is the TS-Service-Centre address used to build SMS-over-IMS
 	// RP-DATA. It is optional during identity discovery, but IMS submission
@@ -304,6 +309,22 @@ type SIMIdentityReader interface {
 	ReadIdentity(context.Context, string) (SIMIdentity, error)
 }
 
+// SIMMetadata contains optional, non-secret carrier selectors stored by the
+// UICC. They improve MVNO matching but are never required for AKA or exposed in
+// the public runtime state.
+type SIMMetadata struct {
+	SPN  string
+	GID1 string
+	GID2 string
+}
+
+// SIMMetadataReader is an optional companion implemented by device mappers
+// that already cache EF_SPN and EF_GID1/2. Identity readers degrade to PLMN,
+// IMSI and ICCID matching when it is unavailable.
+type SIMMetadataReader interface {
+	ReadSIMMetadata(context.Context, string) (SIMMetadata, error)
+}
+
 // SMSCenterReader optionally supplies the SIM-configured service-centre
 // address needed for mobile-originated SMS over IMS.
 type SMSCenterReader interface {
@@ -384,6 +405,7 @@ type Call struct {
 	Direction  string     `json:"direction"`
 	State      string     `json:"state"`
 	StartedAt  time.Time  `json:"started_at"`
+	AnsweredAt *time.Time `json:"answered_at,omitempty"`
 	SIPCode    int        `json:"sip_code,omitempty"`
 	Reason     string     `json:"reason,omitempty"`
 	MediaReady bool       `json:"media_ready,omitempty"`

@@ -3,6 +3,7 @@ package device
 import (
 	_ "embed"
 	"encoding/json"
+	"sort"
 	"strings"
 )
 
@@ -49,6 +50,25 @@ func CountryForMCC(mcc string) (string, bool) {
 	}
 	country := strings.ToUpper(strings.TrimSpace(globalCarrierDatabase.Countries[mcc]))
 	return country, len(country) == 2
+}
+
+// MCCsByCountry returns the complete MCC grouping from the embedded carrier
+// database, keyed by ISO alpha-2 country/territory code. The returned map and
+// slices are new values and may be safely modified by callers.
+func MCCsByCountry() map[string][]string {
+	result := make(map[string][]string)
+	for mcc, rawCountry := range globalCarrierDatabase.Countries {
+		country := strings.ToUpper(strings.TrimSpace(rawCountry))
+		mcc = strings.TrimSpace(mcc)
+		if len(country) != 2 || len(mcc) != 3 {
+			continue
+		}
+		result[country] = append(result[country], mcc)
+	}
+	for country := range result {
+		sort.Strings(result[country])
+	}
+	return result
 }
 
 var globalCarrierDatabase = func() carrierDatabase {
@@ -104,7 +124,7 @@ func CarrierForIMSI(imsi string) (plmn, name, countryCode string, ok bool) {
 // several customer-facing carriers authenticate through the same home PLMN.
 func CarrierForSIM(identity CarrierIdentity) (plmn, name, countryCode string, ok bool) {
 	imsi := strings.TrimSpace(identity.IMSI)
-	if !decimalDigits(imsi, 5, 20) {
+	if !decimalDigits(imsi, 5, 20) || IsPlaceholderIMSI(imsi) {
 		return "", "", "", false
 	}
 	plmns := carrierPLMNCandidates(imsi, identity.MNCLength)
