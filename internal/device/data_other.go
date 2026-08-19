@@ -23,6 +23,8 @@ func setQMINetwork(
 	return NetworkResult{}, fmt.Errorf("%w: QMI control is supported only on Linux", ErrDataBackendUnavailable)
 }
 
+func qmiWWANRawIP(string) bool { return false }
+
 func activateExportProxyInterface(context.Context, modem.Candidate, modem.Client) (string, error) {
 	return "", nil
 }

@@ -85,7 +85,12 @@ func (manager *Manager) SetNetwork(
 	}
 	candidate := manager.candidateFor(state)
 	backend := strings.ToLower(strings.TrimSpace(request.Backend))
-	if backend == "" {
+	// qmi_wwan (usbnet=0) only forwards packets after a WDS session. A stored
+	// "at" backend activates the modem PDP and copies CGCONTRDP onto wwan0,
+	// but RX stays 0 until qmi-network starts.
+	if qmiWWANRawIP(candidate.NetworkInterface) && candidate.QMIControl != "" {
+		backend = "qmi"
+	} else if backend == "" {
 		if candidate.QMIControl != "" && candidate.NetworkInterface != "" {
 			backend = "qmi"
 		} else {

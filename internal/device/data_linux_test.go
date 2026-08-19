@@ -8,6 +8,15 @@ import (
 	"testing"
 )
 
+func TestQmiCallInUse(t *testing.T) {
+	if !qmiCallInUse("interface-in-use-config-match") {
+		t.Fatal("interface-in-use was ignored")
+	}
+	if qmiCallInUse("already started") {
+		t.Fatal("already started was treated as in-use")
+	}
+}
+
 func TestReadOnlySysfsHint(t *testing.T) {
 	if hint := readOnlySysfsHint(syscall.EROFS); hint == "" {
 		t.Fatal("EROFS produced no sysfs hint")

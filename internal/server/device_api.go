@@ -1351,6 +1351,9 @@ func (s *Server) handleCellularData(
 		previous := config.NetworkEnabled
 		config.NetworkEnabled = request.Enabled
 		config.APN = apn
+		if result.Backend != "" {
+			config.DeviceBackend = result.Backend
+		}
 		if err := s.store.UpsertDevice(r.Context(), config); err != nil {
 			rollbackContext, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			networkRequest.Enabled = previous

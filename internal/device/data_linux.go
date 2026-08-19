@@ -74,6 +74,9 @@ func setQMINetwork(
 		if err := ensureQMIRawIP(ctx, ipCommand, candidate.NetworkInterface); err != nil {
 			return NetworkResult{}, err
 		}
+		// AT+CGACT can hold the same bearer. QMI then fails with
+		// interface-in-use-config-match and qmi_wwan never receives.
+		releaseATPDP(ctx, atClient)
 	}
 	action := "stop"
 	if enabled {
@@ -82,6 +85,12 @@ func setQMINetwork(
 	command := exec.CommandContext(ctx, qmiNetwork, "--profile="+profilePath, candidate.QMIControl, action)
 	output, err := command.CombinedOutput()
 	detail := strings.TrimSpace(string(output))
+	if err != nil && enabled && qmiCallInUse(detail) {
+		releaseATPDP(ctx, atClient)
+		command = exec.CommandContext(ctx, qmiNetwork, "--profile="+profilePath, candidate.QMIControl, action)
+		output, err = command.CombinedOutput()
+		detail = strings.TrimSpace(string(output))
+	}
 	if err != nil {
 		lowerDetail := strings.ToLower(detail)
 		idempotentStop := !enabled && (strings.Contains(lowerDetail, "already stopped") ||
@@ -570,28 +579,46 @@ func isNoRouteError(err error) bool {
 	return strings.Contains(message, "no route to host") || strings.Contains(message, "network is unreachable")
 }
 
+func qmiWWANRawIP(networkInterface string) bool {
+	if !safeSysfsInterfaceName(networkInterface) {
+		return false
+	}
+	_, err := os.Stat("/sys/class/net/" + networkInterface + "/qmi/raw_ip")
+	return err == nil
+}
+
+func releaseATPDP(ctx context.Context, atClient modem.Client) {
+	if atClient == nil || ctx == nil {
+		return
+	}
+	_, _ = atClient.Execute(ctx, "AT+CGACT=0,1")
+}
+
+func qmiCallInUse(detail string) bool {
+	lower := strings.ToLower(detail)
+	return strings.Contains(lower, "interface-in-use") ||
+		strings.Contains(lower, "interface in use") ||
+		strings.Contains(lower, "callfailed") ||
+		strings.Contains(lower, "out of call")
+}
+
 func ensureQMIRawIP(ctx context.Context, ipCommand, networkInterface string) error {
 	if !safeSysfsInterfaceName(networkInterface) {
 		return nil
 	}
 	path := "/sys/class/net/" + networkInterface + "/qmi/raw_ip"
-	current, err := os.ReadFile(path)
-	if err != nil {
+	if _, err := os.Stat(path); err != nil {
 		return nil
 	}
-	if strings.EqualFold(strings.TrimSpace(string(current)), "Y") {
-		prepareRawIPLink(ctx, ipCommand, networkInterface)
-		return nil
-	}
-	// The kernel ignores writes while the netdev is up, so RX stays at 0
-	// (ethernet frames never match the modem's raw IP packets).
+	// Always take the netdev down before writing. A stale Y left while the
+	// interface was up is ignored by qmi_wwan: TX increments, RX stays 0.
 	if result, downErr := exec.CommandContext(ctx, ipCommand, "link", "set", "dev", networkInterface, "down").CombinedOutput(); downErr != nil {
 		return fmt.Errorf("set %s down to enable qmi raw_ip: %w: %s", networkInterface, downErr, strings.TrimSpace(string(result)))
 	}
 	if err := os.WriteFile(path, []byte("Y\n"), 0o644); err != nil {
 		return fmt.Errorf("write %s qmi/raw_ip: %w%s", networkInterface, err, readOnlySysfsHint(err))
 	}
-	current, err = os.ReadFile(path)
+	current, err := os.ReadFile(path)
 	if err != nil || !strings.EqualFold(strings.TrimSpace(string(current)), "Y") {
 		value := strings.TrimSpace(string(current))
 		if err != nil {
