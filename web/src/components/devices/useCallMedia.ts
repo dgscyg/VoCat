@@ -41,11 +41,75 @@ function pcm16ToFloat(buffer: ArrayBuffer): Float32Array {
   return output;
 }
 
+type PreparedAudio = {
+  stream: MediaStream | null;
+  context: AudioContext | null;
+};
+
+function canUseMicrophone(): boolean {
+  return window.isSecureContext || location.hostname === "localhost" || location.hostname === "127.0.0.1";
+}
+
+async function openMicrophone(): Promise<MediaStream | null> {
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+      video: false,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function newAudioContext(): AudioContext | null {
+  const AudioCtx = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  return AudioCtx ? new AudioCtx() : null;
+}
+
+export async function primeCallAudio() {
+  if (!canUseMicrophone()) return;
+  const context = newAudioContext();
+  if (context?.state === "suspended") {
+    try {
+      await context.resume();
+    } catch {
+      /* ignore */
+    }
+  }
+  void context?.close();
+  const stream = await openMicrophone();
+  stream?.getTracks().forEach((track) => track.stop());
+}
+
 export function useCallMedia(deviceId: string, callId: string, enabled: boolean, muted: boolean) {
   const [status, setStatus] = useState<MediaStatus>("idle");
   const [error, setError] = useState("");
   const mutedRef = useRef(muted);
   mutedRef.current = muted;
+  const preparedRef = useRef<PreparedAudio>({ stream: null, context: null });
+
+  // Must run inside a click handler so Chrome/Edge treat later playback as user-activated.
+  async function prepare() {
+    if (!canUseMicrophone()) {
+      setStatus("blocked");
+      setError("secure_context");
+      return;
+    }
+    if (!preparedRef.current.stream) {
+      preparedRef.current.stream = await openMicrophone();
+    }
+    if (!preparedRef.current.context) {
+      preparedRef.current.context = newAudioContext();
+    }
+    const context = preparedRef.current.context;
+    if (context?.state === "suspended") {
+      try {
+        await context.resume();
+      } catch {
+        /* playback may still work after a later gesture */
+      }
+    }
+  }
 
   useEffect(() => {
     if (!enabled || !deviceId || !callId) {
@@ -53,7 +117,7 @@ export function useCallMedia(deviceId: string, callId: string, enabled: boolean,
       setError("");
       return;
     }
-    if (!window.isSecureContext && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {
+    if (!canUseMicrophone()) {
       setStatus("blocked");
       setError("secure_context");
       return;
@@ -61,10 +125,10 @@ export function useCallMedia(deviceId: string, callId: string, enabled: boolean,
 
     let closed = false;
     let socket: WebSocket | null = null;
-    let context: AudioContext | null = null;
+    let context: AudioContext | null = preparedRef.current.context;
     let processor: ScriptProcessorNode | null = null;
     let source: MediaStreamAudioSourceNode | null = null;
-    let stream: MediaStream | null = null;
+    let stream: MediaStream | null = preparedRef.current.stream;
     const playback: number[] = [];
     const capture: number[] = [];
     setStatus("connecting");
@@ -74,32 +138,27 @@ export function useCallMedia(deviceId: string, callId: string, enabled: boolean,
     const url = `${protocol}//${location.host}/api/devices/${encodeURIComponent(deviceId)}/calls/media?call_id=${encodeURIComponent(callId)}`;
 
     const start = async () => {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
-          video: false,
-        });
-      } catch {
-        if (!closed) setError("microphone");
+      if (!stream) {
+        stream = await openMicrophone();
+        preparedRef.current.stream = stream;
       }
-      if (closed) {
-        stream?.getTracks().forEach((track) => track.stop());
-        return;
-      }
+      if (!stream && !closed) setError("microphone");
+      if (closed) return;
 
-      const AudioCtx = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-      if (!AudioCtx) {
+      if (!context) {
+        context = newAudioContext();
+        preparedRef.current.context = context;
+      }
+      if (!context) {
         setStatus("error");
         setError("audio_context");
-        stream?.getTracks().forEach((track) => track.stop());
         return;
       }
-      context = new AudioCtx();
       if (context.state === "suspended") {
         try {
           await context.resume();
         } catch {
-          /* continue; playback may still work after a later gesture */
+          /* continue */
         }
       }
       const nativeRate = context.sampleRate || 48000;
@@ -161,10 +220,18 @@ export function useCallMedia(deviceId: string, callId: string, enabled: boolean,
       } catch {
         /* already torn down */
       }
-      void context?.close();
-      stream?.getTracks().forEach((track) => track.stop());
+      // Keep the primed mic/context across the same user gesture so a follow-up
+      // active call can attach without another permission prompt.
     };
   }, [deviceId, callId, enabled]);
 
-  return { status, error };
+  useEffect(() => {
+    return () => {
+      preparedRef.current.stream?.getTracks().forEach((track) => track.stop());
+      void preparedRef.current.context?.close();
+      preparedRef.current = { stream: null, context: null };
+    };
+  }, [deviceId]);
+
+  return { status, error, prepare };
 }

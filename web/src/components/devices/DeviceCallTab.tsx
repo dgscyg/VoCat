@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   CallEndRegular,
   CallRegular,
@@ -44,6 +44,12 @@ function mediaHint(status: MediaStatus, error: string, t: (value: string) => str
   return "";
 }
 
+function formatDuration(seconds: number): string {
+  const safe = Math.max(0, Math.floor(seconds));
+  const minutes = Math.floor(safe / 60);
+  return `${minutes}:${String(safe % 60).padStart(2, "0")}`;
+}
+
 export function IncomingCallBanner({
   call,
   busy,
@@ -81,6 +87,58 @@ export function IncomingCallBanner({
   );
 }
 
+function IncomingCallOverlay({
+  call,
+  lineLabel,
+  busy,
+  onAnswer,
+  onDecline,
+}: {
+  call: DeviceCall;
+  lineLabel?: string;
+  busy?: string;
+  onAnswer: () => void;
+  onDecline: () => void;
+}) {
+  const { t } = useI18n();
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur-sm">
+      <div className="ui-card w-full max-w-sm px-8 py-10 text-center shadow-2xl">
+        <div className="text-xs font-bold uppercase tracking-[0.2em] text-gray-500">{t("来电")}</div>
+        <div className="mx-auto mt-6 flex h-24 w-24 items-center justify-center rounded-full border-2 border-emerald-400/40 bg-emerald-500/10 text-4xl text-emerald-500">
+          ☎
+        </div>
+        <div className="mt-5 font-mono text-2xl font-extrabold text-gray-900 dark:text-white">{call.number || t("未知号码")}</div>
+        {lineLabel ? <div className="mt-1 text-sm text-gray-500">{lineLabel}</div> : null}
+        <div className="mt-8 flex justify-center gap-10">
+          <div className="flex flex-col items-center gap-2">
+            <Button
+              variant="danger"
+              className="!h-16 !w-16 !rounded-full !p-0 text-2xl"
+              loading={busy === "hangup"}
+              onClick={onDecline}
+            >
+              ✕
+            </Button>
+            <span className="text-xs text-gray-500">{t("拒绝")}</span>
+          </div>
+          <div className="flex flex-col items-center gap-2">
+            <Button
+              variant="primary"
+              className="!h-16 !w-16 !rounded-full !border-0 !p-0 text-2xl"
+              loading={busy === "answer"}
+              onClick={onAnswer}
+            >
+              ✆
+            </Button>
+            <span className="text-xs text-gray-500">{t("接听")}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function DeviceCallTab({
   device,
   online,
@@ -93,51 +151,70 @@ export function DeviceCallTab({
   const { t } = useI18n();
   const [number, setNumber] = useState("");
   const [muted, setMuted] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
   const live = session.live;
   const audioEnabled = session.audioAvailable && live?.state === "active";
   const media = useCallMedia(device.id, live?.id || "", !!audioEnabled, muted);
   const history = useMemo(
-    () => session.calls.filter((call) => !isLiveCall(call)).slice(-4).reverse(),
+    () => session.calls.filter((call) => !isLiveCall(call)).slice(-8).reverse(),
     [session.calls],
   );
+
+  useEffect(() => {
+    if (live?.state !== "active") {
+      setElapsed(0);
+      return;
+    }
+    const started = live.startedAt ? Date.parse(live.startedAt) : Date.now();
+    const tick = () => setElapsed(Math.max(0, Math.floor((Date.now() - started) / 1000)));
+    tick();
+    const timer = window.setInterval(tick, 500);
+    return () => window.clearInterval(timer);
+  }, [live?.id, live?.state, live?.startedAt]);
 
   function appendDigit(digit: string) {
     setNumber((current) => sanitizeDialNumber(current + digit));
   }
 
+  async function withAudioGesture(action: () => Promise<void>) {
+    if (session.audioAvailable) await media.prepare();
+    await action();
+  }
+
   async function handleDial() {
     const value = sanitizeDialNumber(number);
     if (value.length < 2) return;
-    await session.dial(value);
+    await withAudioGesture(() => session.dial(value));
   }
 
   return (
     <div className="space-y-4">
+      {session.incoming ? (
+        <IncomingCallOverlay
+          call={session.incoming}
+          lineLabel={device.name || device.id}
+          busy={session.busy}
+          onAnswer={() => void withAudioGesture(() => session.answer(session.incoming!.id))}
+          onDecline={() => void session.hangup(session.incoming!.id)}
+        />
+      ) : null}
+
       <div className="flex items-center gap-3">
         <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-sky-50 text-sky-600 dark:bg-sky-500/10 dark:text-sky-300">
           <CallRegular className="text-[22px]" />
         </div>
         <div className="min-w-0 flex-1">
-          <div className="text-lg font-bold text-gray-900 dark:text-white">{t("语音通话")}</div>
+          <div className="text-lg font-bold text-gray-900 dark:text-white">{t("软电话")}</div>
           <div className="mt-0.5 text-sm text-gray-500 dark:text-gray-400">
             {session.audioAvailable
-              ? t("VoWiFi IMS 已就绪，接通后可在浏览器里通话")
+              ? t("VoWiFi IMS 已就绪，可在浏览器里拨打和接听，无需外部客户端")
               : t("当前走基站电路域，只能拨打、接听和挂断，浏览器没有声音")}
           </div>
         </div>
         <Tag type={session.audioAvailable ? "success" : "warning"}>
-          {session.audioAvailable ? t("VoWiFi 音频") : t("电路域 · 无音频")}
+          {session.audioAvailable ? t("浏览器音频") : t("电路域 · 无音频")}
         </Tag>
       </div>
-
-      {session.incoming ? (
-        <IncomingCallBanner
-          call={session.incoming}
-          busy={session.busy}
-          onAnswer={() => void session.answer(session.incoming!.id)}
-          onHangup={() => void session.hangup(session.incoming!.id)}
-        />
-      ) : null}
 
       {live && live !== session.incoming ? (
         <div className="ui-panel-muted rounded-xl border border-gray-100 p-4 dark:border-white/10">
@@ -145,7 +222,9 @@ export function DeviceCallTab({
             <div>
               <div className="text-xs font-bold uppercase tracking-wider text-gray-500">{live.direction === "incoming" ? t("来电") : t("去电")}</div>
               <div className="mt-1 font-mono text-2xl font-semibold text-gray-900 dark:text-white">{live.number || t("未知号码")}</div>
-              <div className="mt-1 text-sm text-gray-500">{stateLabel(live.state, t)}</div>
+              <div className="mt-1 text-sm text-gray-500">
+                {live.state === "active" ? formatDuration(elapsed) : stateLabel(live.state, t)}
+              </div>
               {live.reason ? <div className="mt-1 text-xs text-red-500">{live.reason}</div> : null}
             </div>
             <div className="flex flex-wrap gap-2">

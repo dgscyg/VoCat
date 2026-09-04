@@ -31,6 +31,20 @@ func TestValidDialNumber(t *testing.T) {
 	}
 }
 
+func TestCallListPayloadMarksVoWiFiAudio(t *testing.T) {
+	vowifi := callListPayload("ec20", "vowifi", []any{}, nil)
+	if vowifi["audio_available"] != true {
+		t.Fatalf("VoWiFi audio_available = %#v, want true", vowifi["audio_available"])
+	}
+	cellular := callListPayload("ec20", "cellular", []any{}, map[string]any{"raw": "OK"})
+	if cellular["audio_available"] != false {
+		t.Fatalf("cellular audio_available = %#v, want false", cellular["audio_available"])
+	}
+	if cellular["raw"] != "OK" {
+		t.Fatalf("extra fields were dropped: %#v", cellular)
+	}
+}
+
 func TestCallTransportRequiresIMSReady(t *testing.T) {
 	controller := &fakeVoWiFiController{state: vowifi.State{Enabled: true}}
 	server := &Server{vowifi: controller}

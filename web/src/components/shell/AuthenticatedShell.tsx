@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import {
   BoardRegular,
+  CallRegular,
   DocumentTextRegular,
   GlobeRegular,
   MailRegular,
@@ -27,6 +28,7 @@ import { listPlugins, type InstalledPlugin } from "../../extensions";
 const NAV = [
   { to: "/", label: "仪表盘", icon: BoardRegular, end: true },
   { to: "/devices", label: "设备管理", icon: RouterRegular },
+  { to: "/softphone", label: "软电话", icon: CallRegular },
   { to: "/proxy", label: "代理管理", icon: GlobeRegular },
   { to: "/sms", label: "短信检测", icon: MailRegular },
   { to: "/automatic-tasks", label: "自动任务", icon: SendClockRegular },

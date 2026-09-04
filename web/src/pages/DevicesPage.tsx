@@ -13,6 +13,9 @@ import { DeviceEsimTab } from "../components/devices/DeviceEsimTab";
 import { DeviceAtTab } from "../components/devices/DeviceAtTab";
 import { DeviceUssdTab } from "../components/devices/DeviceUssdTab";
 import { DeviceConfigTab } from "../components/devices/DeviceConfigTab";
+import { DeviceCallTab, IncomingCallBanner } from "../components/devices/DeviceCallTab";
+import { useDeviceCalls } from "../components/devices/useDeviceCalls";
+import { primeCallAudio } from "../components/devices/useCallMedia";
 import { CardPolicyPanel } from "../components/devices/CardPolicyPanel";
 import { DeviceAddDialog } from "../components/devices/DeviceAddDialog";
 import { CarrierWebsheetDialog, type CarrierWebsheet } from "../components/devices/CarrierWebsheetDialog";
@@ -20,7 +23,7 @@ import { copyText, isDeviceOnline, isQmiControl, isRecoveringPhase, readEventStr
 import type { AddDeviceForm, DeviceDetail, LoadError } from "../components/devices/types";
 import { tf, useI18n } from "../lib/i18n";
 
-const VALID_TABS = new Set(["overview", "esim", "at", "ussd", "config", "card"]);
+const VALID_TABS = new Set(["overview", "esim", "calls", "at", "ussd", "config", "card"]);
 const CELLULAR_DATA_POLL_MS = 1000;
 const CELLULAR_DATA_DISABLE_UI_TIMEOUT_MS = 35000;
 const CELLULAR_DATA_ENABLE_UI_TIMEOUT_MS = 80000;
@@ -370,6 +373,10 @@ export default function DevicesPage() {
     const id = selectedIdRef.current;
     if (id) navigate(`/sms?device=${id}`);
   }, [navigate]);
+  const handleOpenCall = useCallback(() => {
+    const id = selectedIdRef.current;
+    if (id) navigate(`/softphone?device=${id}`);
+  }, [navigate]);
   const handleSaveConfig = useCallback(async () => {
     const id = selectedIdRef.current.trim();
     if (!id || !editConfig) return;
@@ -654,18 +661,25 @@ export default function DevicesPage() {
   const detailOnline = isDeviceOnline(detail);
 	const isReader = detail?.deviceType === "usb_sim_reader";
 	const isNative410 = detail?.deviceType === "wifi_410";
+	const callSession = useDeviceCalls(detail?.id || "", !!detail && !isNative410);
 	useEffect(() => {
 		if (isReader && ["at", "ussd"].includes(activeTab)) setActiveTab("overview");
-	}, [isReader, activeTab]);
+		if (isNative410 && activeTab === "calls") setActiveTab("overview");
+	}, [isReader, isNative410, activeTab]);
   const addAtLimit = deviceLimit > 0 && list.length >= deviceLimit;
   const tabItems = [
     { key: "overview", label: t("概览") },
     { key: "esim", label: t("eSIM") },
+    { key: "calls", label: t("软电话") },
     { key: "at", label: t("AT 终端") },
     { key: "ussd", label: t("USSD") },
     { key: "config", label: t("配置") },
     { key: "card", label: t("卡策略") },
-  ].filter((tab) => !isReader || !["at", "ussd"].includes(tab.key));
+  ].filter((tab) => {
+    if (isNative410 && tab.key === "calls") return false;
+    if (isReader && ["at", "ussd"].includes(tab.key)) return false;
+    return true;
+  });
 
   const overviewNode = detail ? (
     <div className="space-y-4">
@@ -758,13 +772,29 @@ export default function DevicesPage() {
                 onReconnectVowifi={handleReconnectVoWiFi}
                 onRebootModem={handleRebootModem}
                 onOpenSms={handleOpenSms}
+                onOpenCall={isNative410 ? undefined : handleOpenCall}
 				wifiCallingOnly={isReader}
 				modemControlOnly={isNative410}
               />
+              {callSession.incoming && activeTab !== "calls" ? (
+                <IncomingCallBanner
+                  call={callSession.incoming}
+                  busy={callSession.busy}
+                  onAnswer={() => {
+                    setActiveTab("calls");
+                    void primeCallAudio().then(() => callSession.answer(callSession.incoming!.id));
+                  }}
+                  onHangup={() => void callSession.hangup(callSession.incoming!.id)}
+                  onOpenTab={() => setActiveTab("calls")}
+                />
+              ) : null}
               <div className="device-detail-tabs ui-card p-6">
                 <Tabs tabs={tabItems} value={activeTab} onChange={handleTabChange} />
                 <div className="mt-5">
                   {activeTab === "overview" ? overviewNode : null}
+                  {activeTab === "calls" && detail ? (
+                    <DeviceCallTab device={detail} online={detailOnline} session={callSession} />
+                  ) : null}
                   {activeTab === "esim" ? (
                     <DeviceEsimTab
                       deviceId={detail.id}

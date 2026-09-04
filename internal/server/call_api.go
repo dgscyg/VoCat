@@ -31,9 +31,7 @@ func (s *Server) handleCalls(w http.ResponseWriter, r *http.Request, config stor
 			writeError(w, http.StatusServiceUnavailable, "vowifi_call_failed", err.Error())
 			return true
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{
-			"device_id": config.ID, "transport": transport, "calls": calls,
-		}})
+		writeJSON(w, http.StatusOK, map[string]any{"data": callListPayload(config.ID, transport, calls, nil)})
 		return true
 	}
 	response, err := s.devices.ExecuteAT(r.Context(), physicalID, "AT+CLCC")
@@ -42,14 +40,22 @@ func (s *Server) handleCalls(w http.ResponseWriter, r *http.Request, config stor
 		return true
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"data": map[string]any{
-			"device_id": config.ID,
-			"transport": transport,
-			"calls":     parseCLCC(response),
-			"raw":       response.Text(),
-		},
+		"data": callListPayload(config.ID, transport, parseCLCC(response), map[string]any{"raw": response.Text()}),
 	})
 	return true
+}
+
+func callListPayload(deviceID, transport string, calls any, extra map[string]any) map[string]any {
+	payload := map[string]any{
+		"device_id":       deviceID,
+		"transport":       transport,
+		"audio_available": transport == "vowifi",
+		"calls":           calls,
+	}
+	for key, value := range extra {
+		payload[key] = value
+	}
+	return payload
 }
 
 func (s *Server) handleCallAction(w http.ResponseWriter, r *http.Request, config store.Device, physicalID, action string) bool {
