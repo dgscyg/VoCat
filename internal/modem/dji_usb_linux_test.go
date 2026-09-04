@@ -91,6 +91,33 @@ func TestEnsureDJIUSBCompositionReclaimsQMIFromOption(t *testing.T) {
 	}
 }
 
+func TestEnsureDJIUSBCompositionSkipsCDCECM(t *testing.T) {
+	sysRoot, devRoot := setupDJIUSBTree(t, false)
+	qmiIface := filepath.Join(sysRoot, "bus", "usb", "devices", "1-2:1.4")
+	_ = os.Remove(filepath.Join(qmiIface, "driver"))
+	mustWrite(t, filepath.Join(qmiIface, "bInterfaceClass"), "02\n")
+
+	var binds []string
+	sysfsControlWriter = func(path, value string) error {
+		if filepath.Base(path) == "bind" && strings.Contains(path, "qmi_wwan") {
+			binds = append(binds, value)
+		}
+		return writeSysfsFile(path, value)
+	}
+	t.Cleanup(func() { sysfsControlWriter = writeSysfsFile })
+
+	statuses, err := EnsureDJIUSBComposition(context.Background(), sysRoot, devRoot)
+	if err != nil {
+		t.Fatalf("EnsureDJIUSBComposition() error = %v", err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %#v", statuses)
+	}
+	if len(binds) != 0 {
+		t.Fatalf("qmi_wwan bind = %v, want none for CDC ECM if4", binds)
+	}
+}
+
 func TestWriteSysfsDoesNotCreateMissingPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing")
 	if err := writeSysfs(path, "value"); err == nil {
@@ -154,6 +181,7 @@ func setupDJIUSBTree(t *testing.T, qmiBound bool) (string, string) {
 	}
 	qmiIface := filepath.Join(usbRoot, "1-2:1.4")
 	mustMkdirAll(t, qmiIface)
+	mustWrite(t, filepath.Join(qmiIface, "bInterfaceClass"), "ff\n")
 	if qmiBound {
 		mustMkdirAll(t, filepath.Join(qmiIface, "usbmisc", "cdc-wdm1"))
 		mustMkdirAll(t, filepath.Join(qmiIface, "net", "wwan1"))

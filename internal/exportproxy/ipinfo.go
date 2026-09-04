@@ -43,17 +43,19 @@ func LookupPublicIP(ctx context.Context, networkInterface string) (PublicIPInfo,
 			return dialTarget(ctx, address, &dialer, networkInterface)
 		},
 		DisableKeepAlives:     true,
-		ResponseHeaderTimeout: 12 * time.Second,
+		ResponseHeaderTimeout: 4 * time.Second,
+		TLSHandshakeTimeout:   4 * time.Second,
 	}
 	defer transport.CloseIdleConnections()
-	// Each probe gets its own budget. A blocked 1.1.1.1 (common on CN carriers)
-	// used to consume the whole 15s parent deadline, so ipinfo.io never ran and
-	// the API reported "context deadline exceeded" twice.
+	// Each probe gets its own budget. HTTPS to 1.1.1.1 often handshakes then
+	// stalls on CN carriers; try cleartext first. A blocked first probe used
+	// to consume the whole parent deadline so ipinfo.io never ran.
 	var last error
 	for _, probe := range []struct {
 		rawURL, accept string
 		decode         func(io.Reader) (PublicIPInfo, error)
 	}{
+		{cloudflareTraceHTTPURL, "text/plain", decodeCloudflareTrace},
 		{cloudflareTraceURL, "text/plain", decodeCloudflareTrace},
 		{ipInfoURL, "application/json", decodePublicIPInfo},
 	} {
@@ -75,7 +77,10 @@ func LookupPublicIP(ctx context.Context, networkInterface string) (PublicIPInfo,
 	return PublicIPInfo{}, fmt.Errorf("query public IP through %s: %w", networkInterface, last)
 }
 
-const cloudflareTraceURL = "https://1.1.1.1/cdn-cgi/trace"
+const (
+	cloudflareTraceURL     = "https://1.1.1.1/cdn-cgi/trace"
+	cloudflareTraceHTTPURL = "http://1.1.1.1/cdn-cgi/trace"
+)
 
 func queryPublicIPEndpoint(
 	ctx context.Context,

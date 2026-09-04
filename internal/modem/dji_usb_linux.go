@@ -229,6 +229,11 @@ func bindDJIQMIFunction(
 	if driver == "qmi_wwan" && control != "" {
 		return false, control, network, nil
 	}
+	if !qmiWWANClass(interfacePath) {
+		// CDC/ECM/MBIM functions are not QMI. Periodic discovery used to bind
+		// qmi_wwan anyway, which fails with EBUSY (-16) every 30s and glitches AT.
+		return false, "", network, nil
+	}
 	if driver != "" && driver != "option" && driver != "qmi_wwan" {
 		return false, "", "", fmt.Errorf("refusing to replace unexpected driver %q on %s", driver, interfaceName)
 	}
@@ -239,11 +244,10 @@ func bindDJIQMIFunction(
 		}
 	}
 
-	devicePath := filepath.Join(usbRoot, usbName)
-	if usbDevice, usbErr := usbDeviceNode(devicePath, devRoot); usbErr == nil {
-		_ = assertUSBDTR(usbDevice, djiQMIInterface)
-	}
-
+	// Do not assert DTR here. vocat doctor does that once. Discovery runs every
+	// 30s; usbfs control transfers on an unclaimed if4 log "did not claim
+	// interface 4" and stall the same USB device's AT port (CMGS timeouts,
+	// +CMS ERROR: 350).
 	qmiDriverRoot := filepath.Join(driversRoot, "qmi_wwan")
 	if err := bindDJIQMIInterface(qmiDriverRoot, interfacePath, interfaceName); err != nil {
 		return false, "", "", err
@@ -253,6 +257,23 @@ func bindDJIQMIFunction(
 		return false, "", "", fmt.Errorf("qmi_wwan bound but no cdc-wdm node appeared for %s: %w", interfaceName, err)
 	}
 	return true, nodes[0], firstEntryName(filepath.Join(interfacePath, "net"), ""), nil
+}
+
+func qmiWWANClass(interfacePath string) bool {
+	raw, err := readTrimmedFile(filepath.Join(interfacePath, "bInterfaceClass"))
+	if err != nil || raw == "" {
+		return true
+	}
+	value, err := strconv.ParseUint(strings.TrimPrefix(strings.ToLower(raw), "0x"), 16, 8)
+	if err != nil {
+		return true
+	}
+	switch value {
+	case 0x02, 0x0a, 0x0e:
+		return false
+	default:
+		return true
+	}
 }
 
 func bindDJIQMIInterface(driverRoot, interfacePath, interfaceName string) (returnErr error) {
