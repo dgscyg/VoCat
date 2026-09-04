@@ -8,7 +8,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf16"
+	"unicode/utf8"
+
+	"github.com/warthog618/sms/encoding/gsm7"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
 )
 
 var gsm7DefaultAlphabet = [128]rune{
@@ -548,6 +554,14 @@ func decodeGSM7(septets []byte) (string, error) {
 	return result.String(), nil
 }
 
+// DecodeGSM7Septets decodes a GSM 7-bit default-alphabet string whose septets
+// are stored one code per byte (the form USSI bodies use when DCS=0x0F). It
+// returns the decoded text and ok=false if a code is out of range.
+func DecodeGSM7Septets(data string) (string, bool) {
+	decoded, err := decodeGSM7([]byte(data))
+	return decoded, err == nil
+}
+
 type pduCursor struct {
 	data  []byte
 	index int
@@ -762,13 +776,34 @@ func readTPAddress(cursor *pduCursor) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	byteCount := (int(length) + 1) / 2
+	var byteCount int
+	var septetCount int
+	if toa&0x70 == 0x50 {
+		// 3GPP TS 23.040 §9.1.2.5: For alphanumeric addresses, the length field
+		// is a count of useful semi-octets, not a character count. In particular,
+		// a three-character sender such as "OKX" has length 6. Treating every
+		// short length as a septet count consumes PID/DCS bytes as part of the
+		// address and shifts the entire TPDU, producing plausible-looking GSM-7
+		// garbage instead of the message body.
+		byteCount = (int(length) + 1) / 2
+		septetCount = int(length) * 4 / 7
+
+		// A few legacy/non-standard sources do put the character count in this
+		// field. Retain compatibility only when the standard-sized value cannot
+		// be a valid zero-padded GSM-7 address; do not guess based on its length.
+		if byteCount == 0 || cursor.index+byteCount > len(cursor.data) ||
+			!hasZeroGSM7Padding(cursor.data[cursor.index:cursor.index+byteCount], septetCount) {
+			byteCount = (int(length)*7 + 7) / 8
+			septetCount = int(length)
+		}
+	} else {
+		byteCount = (int(length) + 1) / 2
+	}
 	value, err := cursor.bytes(byteCount)
 	if err != nil {
 		return "", err
 	}
 	if toa&0x70 == 0x50 {
-		septetCount := int(length) * 4 / 7
 		septets, unpackErr := unpackSeptets(value, septetCount, 0)
 		if unpackErr != nil {
 			return "", unpackErr
@@ -776,6 +811,18 @@ func readTPAddress(cursor *pduCursor) (string, error) {
 		return decodeGSM7(septets)
 	}
 	return decodeNumericAddress(value, int(length), toa), nil
+}
+
+func hasZeroGSM7Padding(data []byte, septetCount int) bool {
+	if septetCount <= 0 || septetCount*7 > len(data)*8 {
+		return false
+	}
+	for bit := septetCount * 7; bit < len(data)*8; bit++ {
+		if data[bit/8]&(byte(1)<<uint(bit%8)) != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func decodeNumericAddress(value []byte, digits int, toa byte) string {
@@ -805,9 +852,9 @@ func decodeUserData(
 	udl int,
 	message *SMSMessage,
 ) error {
-	alphabet := dcs & 0x0c
+	alphabet := decodeSMSAlphabet(dcs)
 	expectedBytes := udl
-	if alphabet == 0 {
+	if alphabet == smsAlphabetGSM7 {
 		expectedBytes = (udl*7 + 7) / 8
 	}
 	if expectedBytes > len(data) {
@@ -828,8 +875,12 @@ func decodeUserData(
 		message.Concat = parseConcatHeader(data[1:headerBytes])
 	}
 
+	var header []byte
+	if headerBytes > 0 {
+		header = data[1:headerBytes]
+	}
 	switch alphabet {
-	case 0:
+	case smsAlphabetGSM7:
 		message.Encoding = SMSEncodingGSM7PDU
 		headerSeptets := 0
 		if headerBytes > 0 {
@@ -840,31 +891,226 @@ func decodeUserData(
 		if err != nil {
 			return err
 		}
-		text, err := decodeGSM7(septets)
+		text, err := decodeGSM7WithHeader(septets, header)
 		message.Text = text
 		return err
-	case 8:
+	case smsAlphabetUCS2:
 		message.Encoding = SMSEncodingUCS2PDU
 		payload := data[headerBytes:]
-		if len(payload)%2 != 0 {
-			return errors.New("UCS2 SMS has an odd byte count")
+		text, ok := decodeUTF16Bytes(payload)
+		if ok {
+			message.Text = text
+			return nil
 		}
-		units := make([]uint16, 0, len(payload)/2)
-		for index := 0; index < len(payload); index += 2 {
-			units = append(units, uint16(payload[index])<<8|uint16(payload[index+1]))
+		// Some gateways label UTF-8 or a local 8-bit character set as UCS-2.
+		// Only accept a fallback when it is unambiguously readable text.
+		if text, encoding, detected := decodeTextBytes(payload, header); detected {
+			message.Text = text
+			message.Encoding = encoding
+			return nil
 		}
-		message.Text = string(utf16.Decode(units))
-		return nil
+		return errors.New("UCS2 SMS has invalid UTF-16 data")
 	default:
-		// 8-bit (binary) user data has no portable text representation, so the
-		// raw payload bytes are rendered as uppercase hexadecimal after the user
-		// data header is stripped. This keeps the bubble non-empty and gives a
-		// faithful rendering of the delivered content rather than a blank "".
-		message.Encoding = SMSEncoding8BitPDU
 		payload := data[headerBytes:]
+		if text, encoding, detected := decodeTextBytes(payload, header); detected {
+			message.Text = text
+			message.Encoding = encoding
+			return nil
+		}
+		// Port-addressed or non-text 8-bit data remains hexadecimal, preserving
+		// binary SMS (WAP push, provisioning, SIM data) without lossy guessing.
+		message.Encoding = SMSEncoding8BitPDU
 		message.Text = strings.ToUpper(hex.EncodeToString(payload))
 		return nil
 	}
+}
+
+type smsAlphabet byte
+
+const (
+	smsAlphabetGSM7 smsAlphabet = iota
+	smsAlphabet8Bit
+	smsAlphabetUCS2
+	smsAlphabetUnknown
+)
+
+// decodeSMSAlphabet applies the complete 3GPP TS 23.038 DCS grouping rules.
+// A plain dcs&0x0c check is incorrect for message-waiting groups Cx/Dx/Ex and
+// reserved coding groups, and can silently select the wrong decoder.
+func decodeSMSAlphabet(dcs byte) smsAlphabet {
+	switch {
+	case dcs&0x80 == 0:
+		if dcs&0x20 != 0 { // GSM compression is not safely decodable here.
+			return smsAlphabetUnknown
+		}
+		switch (dcs >> 2) & 0x03 {
+		case 0:
+			return smsAlphabetGSM7
+		case 1:
+			return smsAlphabet8Bit
+		case 2:
+			return smsAlphabetUCS2
+		default:
+			return smsAlphabetUnknown
+		}
+	case dcs&0xe0 == 0xc0: // Cx and Dx message-waiting groups use GSM-7.
+		return smsAlphabetGSM7
+	case dcs&0xf0 == 0xe0: // Ex message-waiting group uses UCS-2.
+		return smsAlphabetUCS2
+	case dcs&0xf0 == 0xf0:
+		if dcs&0x04 != 0 {
+			return smsAlphabet8Bit
+		}
+		return smsAlphabetGSM7
+	default:
+		return smsAlphabetUnknown
+	}
+}
+
+func decodeGSM7WithHeader(septets, header []byte) (string, error) {
+	locking, hasLocking := userDataHeaderLanguage(header, 0x25)
+	shift, hasShift := userDataHeaderLanguage(header, 0x24)
+	if !hasLocking && !hasShift {
+		return decodeGSM7(septets)
+	}
+	options := make([]gsm7.DecoderOption, 0, 2)
+	if hasLocking {
+		options = append(options, gsm7.WithCharset(locking))
+	}
+	if hasShift {
+		options = append(options, gsm7.WithExtCharset(shift))
+	}
+	decoded, err := gsm7.Decode(septets, options...)
+	return string(decoded), err
+}
+
+func userDataHeaderLanguage(header []byte, identifier byte) (int, bool) {
+	for index := 0; index+1 < len(header); {
+		id := header[index]
+		length := int(header[index+1])
+		index += 2
+		if index+length > len(header) {
+			return 0, false
+		}
+		if id == identifier && length == 1 {
+			return int(header[index]), true
+		}
+		index += length
+	}
+	return 0, false
+}
+
+func decodeUTF16Bytes(payload []byte) (string, bool) {
+	if len(payload) == 0 {
+		return "", true
+	}
+	if len(payload)%2 != 0 {
+		return "", false
+	}
+	littleEndian := len(payload) >= 2 && payload[0] == 0xff && payload[1] == 0xfe
+	if (payload[0] == 0xfe && payload[1] == 0xff) || littleEndian {
+		payload = payload[2:]
+	}
+	units := make([]uint16, 0, len(payload)/2)
+	for index := 0; index < len(payload); index += 2 {
+		unit := uint16(payload[index])<<8 | uint16(payload[index+1])
+		if littleEndian {
+			unit = uint16(payload[index+1])<<8 | uint16(payload[index])
+		}
+		units = append(units, unit)
+	}
+	text := string(utf16.Decode(units))
+	return text, !strings.ContainsRune(text, unicode.ReplacementChar) && readableText(text)
+}
+
+func decodeTextBytes(payload, header []byte) (string, SMSEncoding, bool) {
+	if hasApplicationPortAddressing(header) || len(payload) == 0 {
+		return "", SMSEncoding8BitPDU, false
+	}
+	if len(payload) >= 2 && ((payload[0] == 0xfe && payload[1] == 0xff) ||
+		(payload[0] == 0xff && payload[1] == 0xfe)) {
+		if text, ok := decodeUTF16Bytes(payload); ok {
+			return text, SMSEncodingUCS2PDU, true
+		}
+	}
+	if utf8.Valid(payload) {
+		text := string(payload)
+		if readableText(text) {
+			return text, SMSEncodingUTF8PDU, true
+		}
+	}
+	if containsNonASCII(payload) {
+		decoded, _, err := transform.Bytes(simplifiedchinese.GB18030.NewDecoder(), payload)
+		text := string(decoded)
+		if err == nil && strings.ContainsFunc(text, func(character rune) bool {
+			return unicode.Is(unicode.Han, character)
+		}) && readableText(text) {
+			return text, SMSEncodingGB18030, true
+		}
+	}
+	if text, ok := decodeLatin1Text(payload); ok {
+		return text, SMSEncodingLatin1, true
+	}
+	return "", SMSEncoding8BitPDU, false
+}
+
+func readableText(text string) bool {
+	if text == "" {
+		return true
+	}
+	printable, total := 0, 0
+	for _, character := range text {
+		total++
+		if unicode.IsPrint(character) || character == '\n' || character == '\r' || character == '\t' {
+			printable++
+		}
+	}
+	return printable*100 >= total*90
+}
+
+func containsNonASCII(data []byte) bool {
+	for _, value := range data {
+		if value >= utf8.RuneSelf {
+			return true
+		}
+	}
+	return false
+}
+
+func decodeLatin1Text(payload []byte) (string, bool) {
+	characters := make([]rune, 0, len(payload))
+	ascii := 0
+	for _, value := range payload {
+		switch {
+		case value == '\n' || value == '\r' || value == '\t' || value >= 0x20 && value <= 0x7e:
+			ascii++
+		case value >= 0xa0:
+		default:
+			return "", false
+		}
+		characters = append(characters, rune(value))
+	}
+	if ascii == 0 || ascii*2 < len(payload) {
+		return "", false
+	}
+	text := string(characters)
+	return text, readableText(text)
+}
+
+func hasApplicationPortAddressing(header []byte) bool {
+	for index := 0; index+1 < len(header); {
+		identifier := header[index]
+		length := int(header[index+1])
+		index += 2
+		if index+length > len(header) {
+			return true
+		}
+		if (identifier == 0x04 && length == 2) || (identifier == 0x05 && length == 4) {
+			return true
+		}
+		index += length
+	}
+	return false
 }
 
 func parseConcatHeader(header []byte) *SMSConcatInfo {

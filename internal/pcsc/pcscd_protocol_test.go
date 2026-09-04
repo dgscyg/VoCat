@@ -10,6 +10,28 @@ import (
 	"testing"
 )
 
+var testMFFCPResponse = []byte{
+	0x62, 0x2F, 0x82, 0x02, 0x78, 0x21, 0x83, 0x02, 0x3F, 0x00,
+	0xA5, 0x0C, 0x80, 0x01, 0x71, 0x83, 0x04, 0x00, 0x01, 0x21,
+	0x06, 0x88, 0x01, 0xFF, 0x8A, 0x01, 0x05, 0x8B, 0x03, 0x2F,
+	0x06, 0x02, 0xC6, 0x09, 0x90, 0x01, 0x40, 0x83, 0x01, 0x01,
+	0x83, 0x01, 0x81, 0x81, 0x04, 0x00, 0x02, 0x24, 0xD3,
+	0x90, 0x00,
+}
+
+func TestSplitAPDUResponseKeepsFCPPrefixOutOfStatus(t *testing.T) {
+	data, status, err := splitAPDUResponse(testMFFCPResponse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != 0x9000 {
+		t.Fatalf("status = %04X, want 9000", status)
+	}
+	if len(data) != len(testMFFCPResponse)-2 || data[0] != 0x62 || data[1] != 0x2F {
+		t.Fatalf("FCP data = % X", data)
+	}
+}
+
 func TestPCSCDClientLifecycleAndTransmit(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	serverDone := make(chan error, 1)
@@ -43,7 +65,7 @@ func TestPCSCDClientLifecycleAndTransmit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("transmit: %v", err)
 	}
-	if !bytes.Equal(response, []byte{0x62, 0x02, 0x90, 0x00}) {
+	if !bytes.Equal(response, testMFFCPResponse) {
 		t.Fatalf("response = %x", response)
 	}
 	disposition := uint32(pcscLeaveCard)
@@ -110,7 +132,7 @@ func servePCSCDTestSession(conn net.Conn) error {
 			if _, err := io.ReadFull(conn, commandBody); err != nil {
 				return err
 			}
-			response := []byte{0x62, 0x02, 0x90, 0x00}
+			response := testMFFCPResponse
 			binary.LittleEndian.PutUint32(body[24:28], uint32(len(response)))
 			if err := writeAll(conn, body); err != nil {
 				return err

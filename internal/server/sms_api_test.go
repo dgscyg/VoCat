@@ -3,16 +3,56 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"vocat/internal/developer"
 	"vocat/internal/device"
+	"vocat/internal/loghub"
 	"vocat/internal/store"
 )
+
+type smsDeletionController struct {
+	fakeDeviceController
+	mu             sync.Mutex
+	storedMessages []device.SMSMessage
+	deleted        []string
+}
+
+func (controller *smsDeletionController) ListSMS(context.Context, string) ([]device.SMSMessage, error) {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	return append([]device.SMSMessage(nil), controller.storedMessages...), nil
+}
+
+func (controller *smsDeletionController) DeleteSMSFromStorage(
+	_ context.Context,
+	_ string,
+	storageName string,
+	index int,
+) error {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	key := storageName + ":" + strconv.Itoa(index)
+	controller.deleted = append(controller.deleted, key)
+	remaining := controller.storedMessages[:0]
+	for _, message := range controller.storedMessages {
+		if message.Storage == storageName && message.Index == index {
+			continue
+		}
+		remaining = append(remaining, message)
+	}
+	controller.storedMessages = remaining
+	return nil
+}
 
 func TestSMSThreadAllDevicesUsesIMSIFilter(t *testing.T) {
 	ctx := context.Background()
@@ -63,6 +103,58 @@ func TestNative410DoesNotUseModemSMSStorage(t *testing.T) {
 	}
 	if !supportsModemSMSStorage(store.Device{DeviceType: store.DeviceTypePCIeEC20EC25}) {
 		t.Fatal("EC20 modem SMS storage polling was disabled")
+	}
+}
+
+func TestSyncModemSMSDoesNotRelabelStoredMessageAfterProfileSwitch(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	const (
+		deviceID = "ec20-1"
+		imei     = "867394042309830"
+	)
+	if err := database.UpsertDevice(ctx, store.Device{
+		ID: deviceID, Name: "EC20", DeviceType: store.DeviceTypePCIeEC20EC25,
+		ModemIMEI: imei, SMSEnabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	receivedAt := time.Unix(1_700_000_000, 0).UTC()
+	storedMessage := device.SMSMessage{
+		Index: 7, Storage: "ME", StorageStatus: device.SMSStatusReceivedUnread,
+		Direction: device.SMSDirectionReceived, From: "JETPAC", Text: "hello",
+		ServiceCenterTimestamp: &receivedAt, RawPDU: "001122334455",
+	}
+	server := &Server{store: database, logger: regionTestLogger()}
+	server.devices = fakeDeviceController{
+		entry: device.Device{ID: deviceID, Discovered: true, Snapshot: &device.Snapshot{
+			DeviceID: deviceID, IMEI: imei, ICCID: "iccid-a", IMSI: "imsi-a",
+			Phone: device.PhoneNumber{Number: "+441111"},
+		}},
+		smsMessages: []device.SMSMessage{storedMessage},
+	}
+	server.syncModemSMS(ctx, deviceID)
+
+	server.devices = fakeDeviceController{
+		entry: device.Device{ID: deviceID, Discovered: true, Snapshot: &device.Snapshot{
+			DeviceID: deviceID, IMEI: imei, ICCID: "iccid-b", IMSI: "imsi-b",
+			Phone: device.PhoneNumber{Number: "+442222"},
+		}},
+		smsMessages: []device.SMSMessage{storedMessage},
+	}
+	server.syncModemSMS(ctx, deviceID)
+
+	messages, err := database.ListSMSMessages(ctx, store.SMSFilter{DeviceID: deviceID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 || messages[0].ICCID != "iccid-a" ||
+		messages[0].IMSI != "imsi-a" || messages[0].LocalPhone != "+441111" {
+		t.Fatalf("message identity after profile B rescan = %#v", messages)
 	}
 }
 
@@ -123,6 +215,224 @@ func TestSupportsModemSMSStorageRejectsUSBReader(t *testing.T) {
 	}
 	if !supportsModemSMSStorage(store.Device{DeviceType: store.DeviceTypePCIeEC20EC25}) {
 		t.Fatal("cellular modem should retain modem SMS storage synchronization")
+	}
+}
+
+func TestSyncModemSMSLogsMultipartMessageOnlyOnceAcrossStoragesAndPolls(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	const (
+		deviceID = "ec20-1"
+		imei     = "867394042309830"
+	)
+	if err := database.UpsertDevice(ctx, store.Device{
+		ID: deviceID, Name: "EC20", DeviceType: store.DeviceTypePCIeEC20EC25,
+		ModemIMEI: imei, SMSEnabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	receivedAt := time.Unix(1_700_000_000, 0).UTC()
+	messages := make([]device.SMSMessage, 0, 6)
+	for _, storageName := range []string{"SM", "ME"} {
+		for sequence, body := range []string{"part one ", "part two ", "part three"} {
+			messages = append(messages, device.SMSMessage{
+				Index:                  sequence + 1,
+				Storage:                storageName,
+				StorageStatus:          device.SMSStatusReceivedUnread,
+				Direction:              device.SMSDirectionReceived,
+				From:                   "+447700900123",
+				Text:                   body,
+				Encoding:               device.SMSEncodingGSM7PDU,
+				ServiceCenterTimestamp: &receivedAt,
+				Concat: &device.SMSConcatInfo{
+					Reference: 23,
+					Total:     3,
+					Sequence:  sequence + 1,
+				},
+				RawPDU: storageName + body,
+			})
+		}
+	}
+	hub := loghub.New(slog.NewTextHandler(io.Discard, nil), 100)
+	server := &Server{
+		store:  database,
+		logger: slog.New(hub),
+		devices: fakeDeviceController{
+			entry: device.Device{
+				ID: deviceID, Discovered: true,
+				Snapshot: &device.Snapshot{DeviceID: deviceID, IMEI: imei, IMSI: "23433"},
+			},
+			smsMessages: messages,
+		},
+	}
+
+	server.syncModemSMS(ctx, deviceID)
+	server.syncModemSMS(ctx, deviceID)
+
+	receivedLogs := hub.History(100, slog.LevelInfo, "cellular SMS received")
+	if len(receivedLogs) != 1 {
+		t.Fatalf("sms.received logs = %d, want 1: %#v", len(receivedLogs), receivedLogs)
+	}
+	parts := receivedLogs[0].Fields["parts"]
+	if receivedLogs[0].Fields["event"] != "sms.received" || (parts != int64(3) && parts != 3) {
+		t.Fatalf("received log fields = %#v", receivedLogs[0].Fields)
+	}
+	stored, err := database.ListSMSMessages(ctx, store.SMSFilter{DeviceID: deviceID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 || stored[0].Body != "part one part two part three" {
+		t.Fatalf("stored messages = %#v", stored)
+	}
+}
+
+func TestSyncModemSMSSeparatesReusedConcatReferencesWithoutCursorChurn(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	const (
+		deviceID = "ec20-1"
+		imei     = "867394042309830"
+		peer     = "+447700900123"
+	)
+	if err := database.UpsertDevice(ctx, store.Device{
+		ID: deviceID, Name: "EC20", DeviceType: store.DeviceTypePCIeEC20EC25,
+		ModemIMEI: imei, SMSEnabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	receivedAt := time.Unix(1_700_000_000, 0).UTC()
+	part := func(index, sequence int, body string) device.SMSMessage {
+		return device.SMSMessage{
+			Index: index, Storage: "SM", StorageStatus: device.SMSStatusReceivedUnread,
+			Direction: device.SMSDirectionReceived, From: peer, Text: body,
+			Encoding: device.SMSEncodingGSM7PDU, ServiceCenterTimestamp: &receivedAt,
+			Concat: &device.SMSConcatInfo{Reference: 7, Total: 2, Sequence: sequence},
+			RawPDU: body,
+		}
+	}
+	messages := []device.SMSMessage{
+		// Storage slot 21 and 43 contain unrelated messages that the modem did
+		// not return in this filtered view. Multipart segments still belong to
+		// the first segment's actual slot, rather than an inferred consecutive
+		// slot number.
+		part(20, 1, "old-a "), part(25, 2, "old-b"),
+		part(42, 1, "new-a "), part(47, 2, "new-b"),
+	}
+	server := &Server{
+		store: database, logger: regionTestLogger(),
+		devices: fakeDeviceController{
+			entry: device.Device{ID: deviceID, Discovered: true,
+				Snapshot: &device.Snapshot{DeviceID: deviceID, IMEI: imei, IMSI: "23433"}},
+			smsMessages: messages,
+		},
+	}
+
+	server.syncModemSMS(ctx, deviceID)
+	first, err := database.ListSMSMessages(ctx, store.SMSFilter{DeviceID: deviceID})
+	if err != nil || len(first) != 2 {
+		t.Fatalf("first sync messages = %#v, %v", first, err)
+	}
+	latest, err := database.LatestSMSMessageID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.syncModemSMS(ctx, deviceID)
+	second, err := database.ListSMSMessages(ctx, store.SMSFilter{DeviceID: deviceID})
+	if err != nil || len(second) != 2 {
+		t.Fatalf("second sync messages = %#v, %v", second, err)
+	}
+	fresh, err := database.ListInboundSMSAfterID(ctx, latest, 10)
+	if err != nil || len(fresh) != 0 {
+		t.Fatalf("notification rows after repeated scan = %#v, %v", fresh, err)
+	}
+}
+
+func TestDeleteSMSRemovesModemCopyBeforeDatabaseRow(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	const (
+		deviceID = "ec20-1"
+		imei     = "867394042309830"
+	)
+	if err := database.UpsertDevice(ctx, store.Device{
+		ID: deviceID, Name: "EC20", DeviceType: store.DeviceTypePCIeEC20EC25,
+		ModemIMEI: imei, SMSEnabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	receivedAt := time.Unix(1_700_000_000, 0).UTC()
+	modemMessages := make([]device.SMSMessage, 0, 6)
+	for _, storageName := range []string{"SM", "ME"} {
+		for sequence, body := range []string{"cloud offer ", "claim link ", "reply R"} {
+			modemMessages = append(modemMessages, device.SMSMessage{
+				Index: sequence + 1, Storage: storageName,
+				StorageStatus: device.SMSStatusReceivedUnread,
+				Direction:     device.SMSDirectionReceived,
+				From:          "+447700900123", Text: body,
+				Encoding:               device.SMSEncodingGSM7PDU,
+				ServiceCenterTimestamp: &receivedAt,
+				Concat: &device.SMSConcatInfo{
+					Reference: 23, Total: 3, Sequence: sequence + 1,
+				},
+				RawPDU: storageName + body,
+			})
+		}
+	}
+	controller := &smsDeletionController{
+		fakeDeviceController: fakeDeviceController{entry: device.Device{
+			ID: deviceID, Discovered: true,
+			Snapshot: &device.Snapshot{DeviceID: deviceID, IMEI: imei, IMSI: "23433"},
+		}},
+		storedMessages: modemMessages,
+	}
+	hub := loghub.New(slog.NewTextHandler(io.Discard, nil), 100)
+	server := &Server{store: database, logger: slog.New(hub), devices: controller}
+	server.syncModemSMS(ctx, deviceID)
+	stored, err := database.ListSMSMessages(ctx, store.SMSFilter{DeviceID: deviceID})
+	if err != nil || len(stored) != 1 {
+		t.Fatalf("initial stored messages = %#v, %v", stored, err)
+	}
+	deletedID := stored[0].ID
+
+	request := httptest.NewRequest(http.MethodDelete, "/api/sms/messages/"+strconv.FormatInt(deletedID, 10), nil)
+	response := httptest.NewRecorder()
+	server.handleSMSMessage(response, request, strconv.FormatInt(deletedID, 10))
+	if response.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, body = %s", response.Code, response.Body.String())
+	}
+	controller.mu.Lock()
+	deleted := append([]string(nil), controller.deleted...)
+	remainingOnModem := len(controller.storedMessages)
+	controller.mu.Unlock()
+	sort.Strings(deleted)
+	wantDeleted := []string{"ME:1", "ME:2", "ME:3", "SM:1", "SM:2", "SM:3"}
+	if strings.Join(deleted, ",") != strings.Join(wantDeleted, ",") || remainingOnModem != 0 {
+		t.Fatalf("modem deletion = %v, remaining = %d", deleted, remainingOnModem)
+	}
+
+	server.syncModemSMS(ctx, deviceID)
+	stored, err = database.ListSMSMessages(ctx, store.SMSFilter{DeviceID: deviceID})
+	if err != nil || len(stored) != 0 {
+		t.Fatalf("messages after delete and resync = %#v, %v", stored, err)
+	}
+	fresh, err := database.ListInboundSMSAfterID(ctx, deletedID, 10)
+	if err != nil || len(fresh) != 0 {
+		t.Fatalf("notification rows after delete and resync = %#v, %v", fresh, err)
+	}
+	if logs := hub.History(100, slog.LevelInfo, "cellular SMS received"); len(logs) != 1 {
+		t.Fatalf("sms.received logs after delete and resync = %d, want 1", len(logs))
 	}
 }
 

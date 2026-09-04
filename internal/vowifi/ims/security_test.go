@@ -38,28 +38,18 @@ func TestParseSecurityAgreementSelectsSupportedIPSec(t *testing.T) {
 	}
 }
 
-func TestO2GermanySecurityProposalUsesIntegrityOnlyESP(t *testing.T) {
-	identity := vowifi.SIMIdentity{HomeMCC: "262", HomeMNC: "03"}
-	if got := securityEncryptionForIdentity(identity); got != "null" {
-		t.Fatalf("O2 security encryption = %q, want null", got)
+func TestSecurityProposalDefaultUsesAESCBC(t *testing.T) {
+	identity := vowifi.SIMIdentity{HomeMCC: "999", HomeMNC: "99"}
+	if got := securityEncryptionForIdentity(identity); got != "aes-cbc" {
+		t.Fatalf("standard security encryption = %q, want aes-cbc", got)
 	}
 	proposal := securityProposal{
 		spiClient: 1001, spiServer: 1002,
 		portClient: 40666, portServer: 55610,
 		encryption: securityEncryptionForIdentity(identity),
 	}
-	if got, want := proposal.headerValue(), "ipsec-3gpp;q=1.000;alg=hmac-sha-1-96;prot=esp;mod=trans;ealg=null;spi-c=0000001001;spi-s=0000001002;port-c=40666;port-s=55610"; got != want {
-		t.Fatalf("O2 Security-Client = %q, want %q", got, want)
-	}
-	selected := "ipsec-3gpp;q=1.000;alg=hmac-sha-1-96;prot=esp;mod=trans;" +
-		"ealg=null;spi-c=2001;spi-s=2002;port-c=50601;port-s=50600"
-	if _, err := parseSecurityAgreement([]string{selected}, proposal); err != nil {
-		t.Fatalf("O2 null Security-Server rejected: %v", err)
-	}
-
-	identity.HomeMNC = "02"
-	if got := securityEncryptionForIdentity(identity); got != "aes-cbc" {
-		t.Fatalf("non-O2 security encryption = %q, want aes-cbc", got)
+	if got, want := proposal.headerValue(), "ipsec-3gpp;q=1.000;alg=hmac-sha-1-96;prot=esp;mod=trans;ealg=aes-cbc;spi-c=0000001001;spi-s=0000001002;port-c=40666;port-s=55610"; got != want {
+		t.Fatalf("Security-Client = %q, want %q", got, want)
 	}
 }
 

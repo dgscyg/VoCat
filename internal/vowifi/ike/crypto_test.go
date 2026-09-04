@@ -113,3 +113,80 @@ func TestIKEKeyDerivationSeparatesDirections(t *testing.T) {
 		t.Fatal("initiator and responder keys were not separated")
 	}
 }
+
+func TestRFC7383FragmentationAndReassembly(t *testing.T) {
+	suite := legacyTestSuite()
+	encryptionKey := bytes.Repeat([]byte{0x11}, 16)
+	integrityKey := bytes.Repeat([]byte{0x22}, 20)
+	header := ikeHeader{
+		InitiatorSPI: [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+		ResponderSPI: [8]byte{8, 7, 6, 5, 4, 3, 2, 1},
+		Exchange:     exchangeIKEAuth,
+		Flags:        flagInitiator,
+		MessageID:    9,
+	}
+
+	largeCertData := bytes.Repeat([]byte{0xAB, 0xCD, 0xEF, 0x01}, 400) // 1600 bytes
+	inner := []payload{
+		{Type: payloadIDi, Body: []byte{3, 0, 0, 0, 'u', 's', 'e', 'r'}},
+		{Type: payloadCert, Body: largeCertData},
+		{Type: payloadAuth, Body: bytes.Repeat([]byte{0x55}, 64)},
+	}
+
+	// Fragment into chunks with max fragment size 600 bytes
+	packets, err := encryptPayloadsFragmented(
+		header,
+		inner,
+		suite,
+		encryptionKey,
+		integrityKey,
+		600,
+		bytes.NewReader(bytes.Repeat([]byte{0x77}, 1024)),
+	)
+	if err != nil {
+		t.Fatalf("encryptPayloadsFragmented() error = %v", err)
+	}
+
+	if len(packets) < 3 {
+		t.Fatalf("expected at least 3 fragments for large payload, got %d", len(packets))
+	}
+
+	for i, pkt := range packets {
+		hdr, body, parseErr := parseIKEPacket(pkt)
+		if parseErr != nil {
+			t.Fatalf("fragment %d parse error: %v", i+1, parseErr)
+		}
+		if hdr.NextPayload != payloadEncryptedFragment {
+			t.Fatalf("fragment %d NextPayload = %d, want %d (payloadEncryptedFragment)", i+1, hdr.NextPayload, payloadEncryptedFragment)
+		}
+		if len(body) < 8 {
+			t.Fatalf("fragment %d body too short", i+1)
+		}
+	}
+
+	// Decrypt and reassemble
+	decodedHeader, decoded, err := decryptPayloadsAny(nil, packets, suite, encryptionKey, integrityKey)
+	if err != nil {
+		t.Fatalf("decryptPayloadsAny() error = %v", err)
+	}
+
+	if decodedHeader.MessageID != header.MessageID || len(decoded) != len(inner) {
+		t.Fatalf("reassembled payload mismatch: header=%#v, count=%d, want=%d", decodedHeader, len(decoded), len(inner))
+	}
+
+	for index := range inner {
+		if decoded[index].Type != inner[index].Type || !bytes.Equal(decoded[index].Body, inner[index].Body) {
+			t.Fatalf("decoded payload %d = %#v, want %#v", index, decoded[index], inner[index])
+		}
+	}
+
+	// Test tamper detection on second fragment
+	tamperedPackets := make([][]byte, len(packets))
+	for i := range packets {
+		tamperedPackets[i] = append([]byte(nil), packets[i]...)
+	}
+	tamperedPackets[1][len(tamperedPackets[1])-1] ^= 0x55
+	if _, _, err := decryptPayloadsAny(nil, tamperedPackets, suite, encryptionKey, integrityKey); !errors.Is(err, errIntegrityMismatch) {
+		t.Fatalf("tampered fragment decrypt error = %v, want errIntegrityMismatch", err)
+	}
+}

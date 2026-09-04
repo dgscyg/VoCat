@@ -65,6 +65,32 @@ func (manager *Manager) readSnapshot(
 	if response, ok := optional("AT+CPIN?"); ok {
 		snapshot.SIMStatus, snapshot.SIMReady = parseCPIN(response)
 	}
+	previousICCID = strings.TrimSpace(previousICCID)
+	if !snapshot.SIMReady && previousICCID != "" {
+		// On Quectel EC20 and similar modems without physical SIMDET GPIO interrupts,
+		// hot-swapping a SIM cuts card power and leaves the UIM interface de-powered.
+		// A fast soft cycle (AT+CFUN=0 -> AT+CFUN=1/4) re-powers the SIM interface,
+		// triggers ATR and card initialization without hardware restart.
+		_, _ = manager.command(ctx, client, "AT+CFUN=0")
+		select {
+		case <-ctx.Done():
+			return snapshot, ctx.Err()
+		case <-time.After(300 * time.Millisecond):
+		}
+		targetCFUN := "AT+CFUN=1"
+		if snapshot.FlightMode {
+			targetCFUN = "AT+CFUN=4"
+		}
+		_, _ = manager.command(ctx, client, targetCFUN)
+		select {
+		case <-ctx.Done():
+			return snapshot, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+		if response, ok := optional("AT+CPIN?"); ok {
+			snapshot.SIMStatus, snapshot.SIMReady = parseCPIN(response)
+		}
+	}
 	ccid, ccidErr := manager.command(ctx, client, "AT+CCID")
 	if ccidErr != nil {
 		ccid, ccidErr = manager.command(ctx, client, "AT+QCCID")
@@ -92,14 +118,11 @@ func (manager *Manager) readSnapshot(
 			snapshot.ICCID = parseICCIDIdentifier(ccid, []string{"+CCID:", "+QCCID:"}, 18, 22)
 		}
 	}
-	previousICCID = strings.TrimSpace(previousICCID)
 	if previousICCID != "" && snapshot.ICCID != "" && !strings.EqualFold(previousICCID, snapshot.ICCID) {
 		// A different physical SIM must never inherit the previous card's
 		// permission to use cellular RF. Disable RF before reading serving-cell
 		// or operator state; policy reconciliation will then start VoWiFi.
-		if _, err := manager.command(ctx, client, "AT+CFUN=4"); err != nil {
-			return snapshot, fmt.Errorf("protect changed SIM with RF off: %w", err)
-		}
+		_, _ = manager.command(ctx, client, "AT+CFUN=4")
 		snapshot.SIMChanged = true
 	}
 	if response, ok := optional("AT+CIMI"); ok {

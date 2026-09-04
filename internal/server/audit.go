@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -21,6 +22,20 @@ func (s *Server) recordAudit(
 	outcome string,
 	remoteAddr string,
 ) {
+	level := slog.LevelInfo
+	if !strings.EqualFold(strings.TrimSpace(outcome), "success") {
+		level = slog.LevelWarn
+	}
+	if s.logger != nil {
+		s.logger.Log(ctx, level, "user operation",
+			"category", auditLogCategory(action),
+			"event", action,
+			"actor", actor,
+			"entity_type", entityType,
+			"entity_id", entityID,
+			"outcome", outcome,
+		)
+	}
 	if s.store == nil {
 		return
 	}
@@ -34,7 +49,24 @@ func (s *Server) recordAudit(
 		CreatedAt:  time.Now().UTC(),
 	})
 	if err != nil {
-		s.logger.Warn("write audit event failed", "action", action, "error", err)
+		s.logger.Warn("write audit event failed", "category", "system", "action", action, "raw_error", err)
+	}
+}
+
+func auditLogCategory(action string) string {
+	action = strings.ToLower(strings.TrimSpace(action))
+	switch {
+	case strings.Contains(action, ".sms") || strings.HasPrefix(action, "sms."):
+		return "sms"
+	case strings.Contains(action, ".call") || strings.HasPrefix(action, "call."):
+		return "call"
+	case strings.Contains(action, "vowifi") || strings.Contains(action, "ims"):
+		return "vowifi"
+	case strings.Contains(action, "device") || strings.Contains(action, "esim") ||
+		strings.Contains(action, ".at.") || strings.Contains(action, ".ussd"):
+		return "hardware"
+	default:
+		return "operation"
 	}
 }
 

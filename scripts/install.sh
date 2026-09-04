@@ -3,9 +3,9 @@
 # vocat install / update script for systemd and OpenWrt/procd deployments.
 #
 # Usage:
-#   bash install.sh [version]             # run directly when already root
-#   sudo bash install.sh [version]        # run through sudo as a normal user
-#   bash install.sh --check-env           # check VoWiFi host prerequisites
+#   bash install.sh [--check-env] [--skip-vowifi-check] [version]       # run directly when already root
+#   sudo bash install.sh [--check-env] [--skip-vowifi-check] [version]  # run through sudo as a normal user
+#   bash install.sh --check-env                                           # check VoWiFi host prerequisites
 #
 # Behavior:
 #   - Prompts for script language (中文 / English) as soon as it runs.
@@ -197,15 +197,26 @@ install_linux_ip_tool() {
 
 install_qmi_support() {
     msg "正在检查 QMI 命令行工具..." "Checking QMI command-line utilities..."
-    if command -v qmicli >/dev/null 2>&1 && command -v qmi-network >/dev/null 2>&1; then
+    qmi_proxy_available() {
+        command -v qmi-proxy >/dev/null 2>&1 || \
+            [ -x /usr/libexec/qmi-proxy ] || \
+            [ -x /usr/lib/qmi-proxy ] || \
+            [ -x /usr/lib/libqmi-glib/qmi-proxy ]
+    }
+    if command -v qmicli >/dev/null 2>&1 && qmi_proxy_available; then
         return 0
     fi
 
     if is_openwrt && command -v opkg >/dev/null 2>&1; then
         opkg update >/dev/null 2>&1 || true
-        if opkg_has_package libqmi; then
-            opkg install libqmi >/dev/null 2>&1 || true
+        local pkgs=""
+        opkg_has_package qmi-utils && pkgs="$pkgs qmi-utils"
+        opkg_has_package libqmi && pkgs="$pkgs libqmi"
+        if [ -z "$pkgs" ]; then
+            pkgs="qmi-utils libqmi"
         fi
+        # shellcheck disable=SC2086
+        opkg install $pkgs >/dev/null 2>&1 || true
     elif command -v apt-get >/dev/null 2>&1; then
         apt-get update -qq || true
         DEBIAN_FRONTEND=noninteractive apt-get install -y libqmi-utils || true
@@ -219,13 +230,13 @@ install_qmi_support() {
         apk add --no-cache qmi-utils || true
     fi
 
-    if command -v qmicli >/dev/null 2>&1 && command -v qmi-network >/dev/null 2>&1; then
+    if command -v qmicli >/dev/null 2>&1 && qmi_proxy_available; then
         msg "QMI 命令行工具已就绪。" "QMI command-line utilities are ready."
         return 0
     fi
     die \
-        "无法安装或找到 qmicli/qmi-network。请安装系统提供的 libqmi/qmi-utils 软件包后重试。" \
-        "Could not install or find qmicli/qmi-network. Install your distribution's libqmi/qmi-utils package and retry."
+        "无法安装或找到 qmicli/qmi-proxy。请安装系统提供的 libqmi/qmi-utils 软件包后重试。" \
+        "Could not install or find qmicli/qmi-proxy. Install your distribution's libqmi/qmi-utils package and retry."
 }
 
 install_pcsc_support() {
@@ -236,6 +247,7 @@ install_pcsc_support() {
         local packages=""
         opkg_has_package pcscd && packages="$packages pcscd"
         opkg_has_package ccid && packages="$packages ccid"
+        opkg_has_package libccid && packages="$packages libccid"
         if [ -n "$packages" ]; then
             # shellcheck disable=SC2086
             opkg install $packages >/dev/null 2>&1 && installed=1 || true
@@ -299,8 +311,8 @@ check_vowifi_environment() {
             "The OpenWrt/Kwrt kernel $(uname -r) lacks NETLINK_XFRM and its feed has no matching kmod-ipsec. Use a firmware built with matching kmod-ipsec, kmod-ipsec4/6, crypto-authenc, CBC, AES and SHA1 modules. Never force kmods from another kernel. Use --skip-vowifi-check only for non-VoWiFi operation."
     fi
     die \
-        "当前 Linux 内核不支持 XFRM/IPsec，VoWiFi IMS 无法工作。请启用 CONFIG_XFRM、CONFIG_XFRM_USER、CONFIG_INET_ESP、CONFIG_INET6_ESP、AES-CBC 和 HMAC-SHA1。" \
-        "This Linux kernel lacks XFRM/IPsec required by VoWiFi IMS. Enable CONFIG_XFRM, CONFIG_XFRM_USER, CONFIG_INET_ESP, CONFIG_INET6_ESP, AES-CBC and HMAC-SHA1."
+        "当前 Linux 内核不支持 XFRM/IPsec，VoWiFi IMS 无法工作。请启用 CONFIG_XFRM、CONFIG_XFRM_USER、CONFIG_INET_ESP、CONFIG_INET6_ESP、AES-CBC 和 HMAC-SHA1；若仅使用非 VoWiFi 功能（蜂窝短信/数据等），可重新运行安装脚本并加 --skip-vowifi-check。" \
+        "This Linux kernel lacks XFRM/IPsec required by VoWiFi IMS. Enable CONFIG_XFRM, CONFIG_XFRM_USER, CONFIG_INET_ESP, CONFIG_INET6_ESP, AES-CBC and HMAC-SHA1; or re-run with --skip-vowifi-check if you only need non-VoWiFi features (cellular SMS/data)."
 }
 
 # --- Skip if already installed at the same version ---------------------------
@@ -366,7 +378,7 @@ download_and_verify() {
     [ "$actual" = "$expected" ] || die "SHA-256 校验失败。" "SHA-256 verification failed."
     chmod 0755 "${VOCAT_TMP}/vocat"
     "${VOCAT_TMP}/vocat" version >/dev/null 2>&1 || die \
-        "Downloaded binary cannot run on this system; keeping the installed version." \
+        "下载的二进制文件无法在此系统上运行；未更改当前安装的版本。" \
         "The downloaded binary cannot run on this host; the installed version was not changed."
 }
 
@@ -395,8 +407,18 @@ INITIAL_ADMIN_PASSWORD=""
 bootstrap_admin() {
     local candidate="${1:-$BINARY_PATH}"
     local secret result
-    secret=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
-    [ -n "$secret" ] || die "Failed to generate a random secret." "Failed to generate a random secret."
+    if command -v od >/dev/null 2>&1; then
+        secret=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    elif command -v hexdump >/dev/null 2>&1; then
+        secret=$(hexdump -n 16 -e '16/1 "%02x"' /dev/urandom)
+    elif command -v openssl >/dev/null 2>&1; then
+        secret=$(openssl rand -hex 16 2>/dev/null || true)
+    elif command -v sha256sum >/dev/null 2>&1; then
+        secret=$(head -c 32 /dev/urandom | sha256sum | awk '{print substr($1, 1, 32)}')
+    else
+        secret=$(tr -dc 'a-f0-9' < /dev/urandom | head -c 32)
+    fi
+    [ -n "$secret" ] || die "生成随机密钥失败。" "Failed to generate a random secret."
     result=$(printf '%s\n' "$secret" | "$candidate" bootstrap-admin --database /opt/vocat/data/vocat.db --username admin) || \
         die \
             "待安装版本无法读取或升级现有数据库；当前程序尚未被替换，请检查数据库与版本兼容性。" \
@@ -485,7 +507,36 @@ USE_PROCD=1
 PROCD_TERM_TIMEOUT=40
 PROGRAM=/opt/vocat/bin/vocat
 ENV_FILE=/etc/vocat/env
+MODEM_RECOVERY_SCRIPT=/usr/bin/modem_network_recover_detection.sh
+MODEM_LOCK_DIR=/var/run/modem
+MODEM_LOCK_FILE=$MODEM_LOCK_DIR/auto_dial_lock
+MODEM_LOCK_OWNER=/var/run/vocat.modem_control_lock
+acquire_modem_control() {
+    [ -x "$MODEM_RECOVERY_SCRIPT" ] || return 0
+    mkdir -p "$MODEM_LOCK_DIR" || return 1
+    if [ ! -e "$MODEM_LOCK_FILE" ]; then
+        if ! printf '%s\n' lock > "$MODEM_LOCK_FILE"; then
+            rm -f "$MODEM_LOCK_FILE"
+            return 1
+        fi
+        if ! : > "$MODEM_LOCK_OWNER"; then
+            rm -f "$MODEM_LOCK_FILE"
+            return 1
+        fi
+    fi
+}
+release_modem_control() {
+    [ -e "$MODEM_LOCK_OWNER" ] || return 0
+    rm -f "$MODEM_LOCK_FILE" "$MODEM_LOCK_OWNER"
+}
 start_service() {
+    if ! acquire_modem_control; then
+        logger -t vocat "cannot acquire GL.iNet modem recovery lock"
+        # rc.common's rc_procd ignores start_service's return value and would
+        # otherwise submit an empty service definition. Exit before its
+        # unconditional procd_close_service call and preserve the failure status.
+        exit 1
+    fi
     procd_open_instance
     procd_set_param command "$PROGRAM" serve
     procd_set_param env VOCAT_DATABASE_PATH=/opt/vocat/data/vocat.db
@@ -499,6 +550,7 @@ start_service() {
     procd_set_param stderr 1
     procd_close_instance
 }
+service_stopped() { release_modem_control; }
 service_triggers() { procd_add_reload_trigger vocat; }
 EOF
     chmod 0755 "$OPENWRT_INIT_PATH"
@@ -513,7 +565,7 @@ write_service() {
         write_openwrt_init
         return
     fi
-    die "Unsupported service manager." "Neither systemd nor OpenWrt procd was detected."
+    die "不支持的服务管理器。" "Neither systemd nor OpenWrt procd was detected."
 }
 
 enable_and_start() {
@@ -555,7 +607,7 @@ enable_and_start() {
             cp -a "${BINARY_PATH}.bak" "$BINARY_PATH"
             "$OPENWRT_INIT_PATH" restart || true
         fi
-        die "OpenWrt vocat service failed to start." "The OpenWrt vocat service failed to start."
+        die "OpenWrt vocat 服务启动失败。" "The OpenWrt vocat service failed to start."
     fi
     systemctl daemon-reload
     systemctl enable vocat

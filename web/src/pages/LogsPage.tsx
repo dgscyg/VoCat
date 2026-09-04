@@ -16,11 +16,13 @@ import { Switch } from "../components/ui/Switch";
 import { Select } from "../components/ui/Select";
 import { Input } from "../components/ui/Input";
 import { message } from "../components/ui/message";
+import { confirmDialog } from "../components/ui/MessageBox";
 import { LogRetentionCard } from "../components/logs/LogRetentionCard";
 
 const MAX_LOGS = 1000;
 
 type Level = "all" | "debug" | "info" | "warn" | "error";
+type Category = "all" | "hardware" | "network" | "vowifi" | "sms" | "call" | "operation" | "system";
 
 const LEVEL_OPTIONS: { value: Level; label: string }[] = [
   { value: "all", label: "全部" },
@@ -28,6 +30,17 @@ const LEVEL_OPTIONS: { value: Level; label: string }[] = [
   { value: "info", label: "INFO" },
   { value: "warn", label: "WARN" },
   { value: "error", label: "ERROR" },
+];
+
+const CATEGORY_OPTIONS: { value: Category; label: string }[] = [
+  { value: "all", label: "全部业务" },
+  { value: "hardware", label: "硬件与模块" },
+  { value: "network", label: "驻网" },
+  { value: "vowifi", label: "WiFi Calling" },
+  { value: "sms", label: "短信" },
+  { value: "call", label: "通话" },
+  { value: "operation", label: "用户操作" },
+  { value: "system", label: "系统错误" },
 ];
 
 function levelColor(level: string): string {
@@ -52,6 +65,42 @@ function fieldsText(fields: LogEntry["fields"]): string {
   return typeof fields === "string" ? fields : JSON.stringify(fields);
 }
 
+function logFields(entry: LogEntry): Record<string, unknown> {
+  return entry.fields && typeof entry.fields === "object" ? entry.fields : {};
+}
+
+function logCategory(entry: LogEntry): Exclude<Category, "all"> {
+  const explicit = String(logFields(entry).category ?? "").toLowerCase();
+  if (CATEGORY_OPTIONS.some((item) => item.value === explicit && item.value !== "all")) {
+    return explicit as Exclude<Category, "all">;
+  }
+  const text = `${entry.message} ${fieldsText(entry.fields)}`.toLowerCase();
+  if (/\bsms\b|短信|tpdu|rp-data|rpdu/.test(text)) return "sms";
+  if (/incoming call|\bcall\b|invite|来电|通话/.test(text)) return "call";
+  if (/vowifi|wi-?fi calling|\bims\b|\bike\b|epdg|ipsec/.test(text)) return "vowifi";
+  if (/registration|operator|network|驻网|注册网络/.test(text)) return "network";
+  if (/device|modem|hardware|sim|uicc|esim|qmi|串口|模块|设备/.test(text)) return "hardware";
+  if (/operation|audit|setting|操作/.test(text)) return "operation";
+  return "system";
+}
+
+function categoryColor(category: Exclude<Category, "all">): string {
+  switch (category) {
+    case "hardware": return "bg-cyan-500/15 text-cyan-300";
+    case "network": return "bg-emerald-500/15 text-emerald-300";
+    case "vowifi": return "bg-sky-500/15 text-sky-300";
+    case "sms": return "bg-violet-500/15 text-violet-300";
+    case "call": return "bg-pink-500/15 text-pink-300";
+    case "operation": return "bg-amber-500/15 text-amber-300";
+    default: return "bg-gray-500/20 text-gray-300";
+  }
+}
+
+function isHTTPAccessLog(entry: LogEntry): boolean {
+  return entry.message.trim().toLowerCase() === "http request" ||
+    String(logFields(entry).category ?? "").toLowerCase() === "http_access";
+}
+
 // Reference renders a fixed YYYY-MM-DD HH:mm:ss timestamp.
 function displayTime(time: string): string {
   try {
@@ -71,8 +120,11 @@ export default function LogsPage() {
   const [paused, setPaused] = useState(false);
   const [autoTail, setAutoTail] = useState(true);
   const [level, setLevel] = useState<Level>("all");
+  const [category, setCategory] = useState<Category>("all");
   const [search, setSearch] = useState("");
   const [connError, setConnError] = useState("");
+  const [clearing, setClearing] = useState(false);
+  const [retentionRefreshKey, setRetentionRefreshKey] = useState(0);
 
   const esRef = useRef<EventSource | null>(null);
   const logContainerRef = useRef<HTMLDivElement>(null);
@@ -80,6 +132,7 @@ export default function LogsPage() {
   const levelRef = useRef<Level>("all");
 
   const appendLog = useCallback((entry: LogEntry) => {
+    if (isHTTPAccessLog(entry)) return;
     setLogs((prev) => {
       const next = [...prev, entry];
       return next.length > MAX_LOGS ? next.slice(-MAX_LOGS) : next;
@@ -118,7 +171,7 @@ export default function LogsPage() {
     try {
       const res = await api<LogEntry[] | { logs?: LogEntry[] }>("/logs/history?lines=500");
       const list = Array.isArray(res) ? res : (res?.logs ?? []);
-      setLogs(list.slice(-MAX_LOGS));
+      setLogs(list.filter((entry) => !isHTTPAccessLog(entry)).slice(-MAX_LOGS));
     } catch {
       /* 历史回填失败不阻塞实时流 */
     } finally {
@@ -164,12 +217,33 @@ export default function LogsPage() {
     }
   }, [connect]);
 
-  const clearLogs = useCallback(() => setLogs([]), []);
+  const clearLogs = useCallback(async () => {
+    const confirmed = await confirmDialog(
+      t("此操作会永久删除服务端保存的全部日志，无法恢复。"),
+      t("确认清空日志？"),
+      { type: "warning", confirmText: t("清空"), cancelText: t("取消") },
+    );
+    if (!confirmed) return;
+    setClearing(true);
+    try {
+      await api<{ cleared: boolean; deleted: number }>("/logs/history", { method: "DELETE" });
+      setLogs([]);
+      setRetentionRefreshKey((value) => value + 1);
+      message.success(t("日志已清空"));
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : t("清空日志失败"));
+    } finally {
+      setClearing(false);
+    }
+  }, [t]);
 
   const filtered = useMemo(() => {
     let list = logs;
     if (level !== "all") {
       list = list.filter((e) => e.level.toLowerCase() === level.toLowerCase());
+    }
+    if (category !== "all") {
+      list = list.filter((entry) => logCategory(entry) === category);
     }
     if (search.trim()) {
       const q = search.toLowerCase();
@@ -181,14 +255,14 @@ export default function LogsPage() {
       );
     }
     return list;
-  }, [logs, level, search]);
+  }, [logs, level, category, search]);
 
   const exportLogs = useCallback(() => {
     const text = filtered
       .map((v) => {
         const time = new Date(v.time).toLocaleString();
         const fields = v.fields ? ` ${fieldsText(v.fields)}` : "";
-        return `[${time}] ${v.level.toUpperCase().padEnd(5)} ${v.caller ?? ""} ${v.message}${fields}`;
+        return `[${time}] ${v.level.toUpperCase().padEnd(5)} [${logCategory(v)}] ${v.caller ?? ""} ${v.message}${fields}`;
       })
       .join("\n");
     const blob = new Blob([text], { type: "text/plain" });
@@ -204,8 +278,8 @@ export default function LogsPage() {
   return (
     <div className="max-w-7xl mx-auto">
       <PageHeader
-        title={t("实时日志")}
-        subtitle={t("查看系统运行日志，支持过滤和搜索")}
+        title={t("设备与业务日志")}
+        subtitle={t("记录硬件、驻网、WiFi Calling、短信、通话和用户操作；敏感信息已自动打码")}
         actions={
           <div className="flex flex-wrap items-center gap-2">
             <Button
@@ -216,7 +290,7 @@ export default function LogsPage() {
             >
               {paused ? t("继续") : t("暂停")}
             </Button>
-            <Button onClick={clearLogs} className="!border-0 flex-1 justify-center sm:flex-none" icon={<DeleteRegular />}>
+            <Button loading={clearing} onClick={clearLogs} className="!border-0 flex-1 justify-center sm:flex-none" icon={<DeleteRegular />}>
               {t("清空")}
             </Button>
             <Button onClick={exportLogs} variant="primary" className="!border-0 flex-1 justify-center sm:flex-none" icon={<ArrowDownloadRegular />}>
@@ -255,6 +329,13 @@ export default function LogsPage() {
             className="w-full sm:w-40"
             options={LEVEL_OPTIONS.map((o) => ({ ...o, label: t(o.label) }))}
           />
+          <Select
+            value={category}
+            onChange={(v) => setCategory(v as Category)}
+            placeholder={t("业务分类")}
+            className="w-full sm:w-44"
+            options={CATEGORY_OPTIONS.map((o) => ({ ...o, label: t(o.label) }))}
+          />
           <Input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
@@ -279,7 +360,7 @@ export default function LogsPage() {
         </div>
       </div>
 
-      <LogRetentionCard />
+      <LogRetentionCard refreshKey={retentionRefreshKey} />
 
       <div className="ui-card overflow-hidden">
         <div
@@ -291,24 +372,30 @@ export default function LogsPage() {
               {loading ? t("等待日志...") : connected ? t("等待日志...") : t("未连接到日志流")}
             </div>
           ) : null}
-          {filtered.map((entry, i) => (
-            <div key={i} className="py-0.5 hover:bg-white/5 px-2 -mx-2 rounded whitespace-nowrap">
-              <span className="text-gray-500">[{displayTime(entry.time)}]</span>
-              <span className={cx("font-bold ml-1.5", levelColor(entry.level))}>
-                {entry.level.toUpperCase()}
-              </span>
-              <span
-                className="text-indigo-400 inline-block max-w-48 truncate align-bottom ml-1.5"
-                title={entry.caller ?? ""}
-              >
-                {entry.caller ?? ""}
-              </span>
-              <span className="text-gray-100 ml-1.5">{entry.message}</span>
-              {entry.fields ? (
-                <span className="text-amber-300/70 ml-1.5">{fieldsText(entry.fields)}</span>
-              ) : null}
-            </div>
-          ))}
+          {filtered.map((entry, i) => {
+            const entryCategory = logCategory(entry);
+            const fields = logFields(entry);
+            const hasRawError = fields.raw_error !== undefined || fields.error !== undefined || fields.raw_response !== undefined;
+            return (
+              <div key={`${entry.time}-${i}`} className="border-b border-white/5 px-2 py-2 -mx-2 last:border-0 hover:bg-white/5">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <span className="text-gray-500">[{displayTime(entry.time)}]</span>
+                  <span className={cx("font-bold", levelColor(entry.level))}>{entry.level.toUpperCase()}</span>
+                  <span className={cx("rounded px-1.5 py-0.5 text-[11px]", categoryColor(entryCategory))}>
+                    {t(CATEGORY_OPTIONS.find((item) => item.value === entryCategory)?.label ?? "系统错误")}
+                  </span>
+                  {entry.caller ? <span className="max-w-48 truncate text-indigo-400" title={entry.caller}>{entry.caller}</span> : null}
+                  <span className="break-words text-gray-100">{entry.message}</span>
+                </div>
+                {entry.fields ? (
+                  <pre className={cx(
+                    "mt-1 whitespace-pre-wrap break-all pl-2 text-xs leading-5",
+                    hasRawError ? "border-l-2 border-red-500/60 text-red-200" : "text-amber-300/70",
+                  )}>{typeof entry.fields === "string" ? entry.fields : JSON.stringify(entry.fields, null, 2)}</pre>
+                ) : null}
+              </div>
+            );
+          })}
         </div>
       </div>
     </div>

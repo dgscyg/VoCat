@@ -60,12 +60,10 @@ function showSmsSendOutcome(result: SmsSendResult) {
       message.success("短信已确认送达");
       return;
     case "accepted_unconfirmed":
-      message.info(
-        result.transport === "ims"
-          ? "IMS 已接受短信提交，但尚未收到收件人送达确认"
-          : "模块已接受短信提交，但尚未收到运营商送达确认",
-        5000,
-      );
+      // Keep the user-facing result identical across cellular AT (EC20) and
+      // VoWiFi IMS (410). The transport remains available in the API response
+      // for diagnostics, but it must not change the meaning shown to users.
+      message.info("模块已接受短信提交，但尚未收到运营商送达确认", 5000);
       return;
     case "partial":
       message.warning(`短信仅有 ${accepted}/${total} 段被接受，不能判定为发送成功`, 5000);
@@ -294,8 +292,9 @@ export default function SmsPage() {
     if (device !== "all") query.deviceId = device;
     else {
       query.modemImei = thread.modemImei;
-      query.imsi = thread.imsi;
     }
+		if (thread.iccid) query.iccid = thread.iccid;
+		else query.imsi = thread.imsi;
     try {
       const list = sortMessages(await getThread(query));
       if (id !== threadReqId.current) return false;
@@ -314,7 +313,7 @@ export default function SmsPage() {
   const selectContact = useCallback(
     async (key: string, opts: { syncRoute?: boolean; silent?: boolean; scrollToBottom?: boolean } = {}) => {
       const { syncRoute = true, silent = false, scrollToBottom = true } = opts;
-      if (!key || (keyRef.current === key && messagesRef.current.length > 0)) return;
+      if (!key) return;
       setKey(key);
       if (syncRoute) syncQuery(deviceRef.current, key);
       const thread = contactsRef.current.find((t) => t.key === key) || null;
@@ -338,8 +337,8 @@ export default function SmsPage() {
       contactsList: SmsThread[],
       opts: { syncRoute?: boolean; silent?: boolean; scrollToBottom?: boolean } = {},
     ) => {
-      const { syncRoute = false, silent = false, scrollToBottom = false } = opts;
-      const active = contactsList.find((t) => t.key === keyRef.current) || null;
+      const { silent = false, scrollToBottom = false } = opts;
+      const active = (keyRef.current && contactsList.find((t) => t.key === keyRef.current)) || null;
       if (active) {
         const ok = await loadThreadFor(active, device, silent);
         if (ok) {
@@ -350,16 +349,8 @@ export default function SmsPage() {
       }
       setMessagesState([]);
       setHasMoreState(false);
-      if (keyRef.current) {
-        setKey("");
-        if (syncRoute) syncQuery(device, "");
-      }
-      const filtered = filterThreads(contactsList, searchRef.current);
-      if (!isMobileRef.current && filtered.length > 0) {
-        await selectContact(filtered[0].key, { syncRoute, silent, scrollToBottom });
-      }
     },
-    [loadThreadFor, selectContact, syncQuery, scrollToBottomNow],
+    [loadThreadFor, scrollToBottomNow],
   );
 
   const clearSelection = useCallback(
@@ -429,8 +420,9 @@ export default function SmsPage() {
       if (device !== "all") query.deviceId = device;
       else {
         query.modemImei = thread.modemImei;
-        query.imsi = thread.imsi;
       }
+			if (thread.iccid) query.iccid = thread.iccid;
+			else query.imsi = thread.imsi;
       const older = sortMessages(await getThread(query));
       setMessagesState([...older, ...messagesRef.current]);
       setHasMoreState(older.length === THREAD_PAGE);
@@ -479,7 +471,7 @@ export default function SmsPage() {
     } finally {
       setSending(false);
     }
-  }, [composer, devices, refreshCurrent, scrollToBottomNow]);
+  }, [composer, devices, refreshCurrent, scrollToBottomNow, t]);
 
   const openNewSms = useCallback(() => {
     setNewSmsDevice(deviceRef.current !== "all" ? deviceRef.current : devices[0]?.id || "");
@@ -506,7 +498,7 @@ export default function SmsPage() {
         setSending(false);
       }
     },
-    [refreshCurrent],
+    [refreshCurrent, t],
   );
 
   const deleteMessageAction = useCallback(
@@ -530,7 +522,7 @@ export default function SmsPage() {
         setDeletingMessageId(null);
       }
     },
-    [deletingMessageId, refreshCurrent, clearSelection],
+    [deletingMessageId, refreshCurrent, clearSelection, t],
   );
 
   const deleteThreadAction = useCallback(
@@ -548,8 +540,8 @@ export default function SmsPage() {
       try {
         const q: DeleteThreadQuery =
           deviceRef.current !== "all"
-            ? { deviceId: deviceRef.current, peer: t.peer }
-            : { deviceId: "all", modemImei: t.modemImei, imsi: t.imsi, peer: t.peer };
+						? { deviceId: deviceRef.current, iccid: t.iccid || undefined, imsi: t.iccid ? undefined : t.imsi, peer: t.peer }
+						: { deviceId: "all", modemImei: t.modemImei, iccid: t.iccid || undefined, imsi: t.iccid ? undefined : t.imsi, peer: t.peer };
         await deleteThread(q);
         message.success(tl("已删除对话"));
         if (keyRef.current === t.key) clearSelection(true);
@@ -560,7 +552,7 @@ export default function SmsPage() {
         setDeletingThreadKey(null);
       }
     },
-    [deletingThreadKey, clearSelection, loadContacts],
+    [deletingThreadKey, clearSelection, loadContacts, lang],
   );
 
   const closeActionSheet = useCallback(() => {
@@ -622,16 +614,6 @@ export default function SmsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const prevIsMobile = useRef(isMobile);
-  useEffect(() => {
-    const was = prevIsMobile.current;
-    prevIsMobile.current = isMobile;
-    if (was && !isMobile && !keyRef.current) {
-      const filtered = filterThreads(contactsRef.current, searchRef.current);
-      if (filtered.length > 0) void selectContact(filtered[0].key, { syncRoute: true, scrollToBottom: false });
-    }
-  }, [isMobile, selectContact]);
-
   useEffect(() => () => clearLongPress(), [clearLongPress]);
 
   return (
@@ -670,121 +652,121 @@ export default function SmsPage() {
           onRetry={refreshAll}
         />
       ) : null}
-<div className="relative flex-1 overflow-hidden ui-card">
-  {contactsLoading && contacts.length === 0 ? (
-    <div className="absolute inset-0 z-20 flex items-center justify-center bg-white/50 backdrop-blur-sm dark:bg-black/20">
-      <Spinner className="h-7 w-7 text-[#0ea5e9]" />
-    </div>
-  ) : null}
-  <div className="sms-main-layout">
-{isDesktop ? (
-  <div className="flex flex-col border-r border-gray-100 dark:border-white/10">
-    <div className="border-b border-gray-100 p-4 dark:border-white/10">
-      <div className="text-xs font-bold uppercase tracking-wider text-gray-500">{t("设备")}</div>
-    </div>
-    <div className="space-y-1 overflow-auto p-3">
-      {deviceFilters.map((d) => (
-        <button
-          key={d.id}
-          type="button"
-          onClick={() => void selectDevice(d.id)}
-          className={cx(
-            "flex w-full items-center justify-between gap-3 rounded-xl border px-3 py-2 text-left transition-all",
-            selectedDevice === d.id
-              ? "border-indigo-200 bg-indigo-50/70 dark:border-indigo-500/30 dark:bg-indigo-500/10"
-              : "border-transparent hover:bg-gray-50/60 dark:hover:bg-white/5",
-          )}
-        >
-          <div className="min-w-0">
-            <div className="truncate text-sm font-bold text-gray-800 dark:text-gray-100">{d.label}</div>
-            <div className="truncate text-xs text-gray-400">{d.id === "all" ? t("汇总全部设备检测记录") : d.id}</div>
+      <div className="relative flex-1 overflow-hidden ui-card">
+        {contactsLoading && contacts.length === 0 ? (
+          <div className="absolute inset-0 z-20 flex items-center justify-center bg-white/50 backdrop-blur-sm dark:bg-black/20">
+            <Spinner className="h-7 w-7 text-[#0ea5e9]" />
           </div>
-          {d.id !== "all" ? (
-            <span className={cx("h-2 w-2 rounded-full", d.healthy ? "bg-green-500" : "bg-red-500")} />
+        ) : null}
+        <div className="sms-main-layout">
+          {isDesktop ? (
+            <div className="flex flex-col border-r border-gray-100 dark:border-white/10">
+              <div className="border-b border-gray-100 p-4 dark:border-white/10">
+                <div className="text-xs font-bold uppercase tracking-wider text-gray-500">{t("设备")}</div>
+              </div>
+              <div className="space-y-1 overflow-auto p-3">
+                {deviceFilters.map((d) => (
+                  <button
+                    key={d.id}
+                    type="button"
+                    onClick={() => void selectDevice(d.id)}
+                    className={cx(
+                      "flex w-full items-center justify-between gap-3 rounded-xl border px-3 py-2 text-left transition-all",
+                      selectedDevice === d.id
+                        ? "border-indigo-200 bg-indigo-50/70 dark:border-indigo-500/30 dark:bg-indigo-500/10"
+                        : "border-transparent hover:bg-gray-50/60 dark:hover:bg-white/5",
+                    )}
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-bold text-gray-800 dark:text-gray-100">{d.label}</div>
+                      <div className="truncate text-xs text-gray-400">{d.id === "all" ? t("汇总全部设备检测记录") : d.id}</div>
+                    </div>
+                    {d.id !== "all" ? (
+                      <span className={cx("h-2 w-2 rounded-full", d.healthy ? "bg-green-500" : "bg-red-500")} />
+                    ) : null}
+                  </button>
+                ))}
+              </div>
+            </div>
           ) : null}
-        </button>
-      ))}
-    </div>
-  </div>
-) : null}
-{showContactColumn ? (
-  <ContactList
-    isMobile={isMobile}
-    isDesktop={isDesktop}
-    selectedDevice={selectedDevice}
-    deviceOptions={deviceSelectOptions}
-    onSelectDevice={(id) => void selectDevice(id)}
-    searchQuery={searchQuery}
-    onSearchChange={setSearch}
-    loading={contactsLoading}
-    contacts={filteredContacts}
-    activeKey={selectedKey}
-    isUnread={isUnread}
-    deletingKey={deletingThreadKey}
-    canHover={canHover}
-    onSelect={(key) => void selectContact(key)}
-    onDelete={(t) => void deleteThreadAction(t)}
-    onRowPointerDown={onThreadPointerDown}
-    onRowPointerMove={moveLongPress}
-    onRowPointerEnd={clearLongPress}
-  />
-) : null}
-{showDetailColumn ? (
-  <ThreadPanel
-    isMobile={isMobile}
-    isDesktop={isDesktop}
-    selectedDevice={selectedDevice}
-    activeThread={activeThread}
-    canLoadMore={!!activeThread && hasMore}
-    loadingMore={loadingMore}
-    groups={groups}
-    deletingMessageId={deletingMessageId}
-    canHover={canHover}
-    composer={composer}
-    composerInfo={composerInfo}
-    composerLength={composerLength}
-    sending={sending}
-    detailRef={detailRef}
-    composerRef={composerRef}
-    onBack={onBack}
-    onScrollToBottom={scrollToBottomNow}
-    onLoadMore={() => void loadMore()}
-    onDeleteMessage={(m) => void deleteMessageAction(m)}
-    onComposerChange={setComposer}
-    onSend={() => void sendReply()}
-    onDetailScroll={onDetailScroll}
-    onMsgPointerDown={onMsgPointerDown}
-    onMsgPointerMove={moveLongPress}
-    onMsgPointerEnd={clearLongPress}
-  />
-) : null}
-  </div>
-</div>
-{actionSheetOpen && isMobile && actionTarget ? (
-  <div className="sms-action-sheet-mask animate-[fade-slide-in_0.18s_ease]" onClick={closeActionSheet}>
-    <div className="sms-action-sheet" onClick={(e) => e.stopPropagation()}>
-      <div className="sms-action-sheet-title">{t("操作")}</div>
-      <Button
-        className="sms-danger-ghost-btn !w-full !justify-center"
-        icon={<DeleteRegular />}
-        onClick={() => void confirmSheetAction()}
-      >
-        {actionTarget.type === "thread" ? t("删除对话") : t("删除短信")}
-      </Button>
-      <Button className="!w-full !justify-center" onClick={closeActionSheet}>
-        {t("取消")}
-      </Button>
-    </div>
-  </div>
-) : null}
-<NewSmsModal
-  open={newSmsOpen}
-  devices={devices}
-  defaultDeviceId={newSmsDevice}
-  sending={sending}
-  onClose={() => setNewSmsOpen(false)}
-  onSend={sendNewSms}
-/>
+          {showContactColumn ? (
+            <ContactList
+              isMobile={isMobile}
+              isDesktop={isDesktop}
+              selectedDevice={selectedDevice}
+              deviceOptions={deviceSelectOptions}
+              onSelectDevice={(id) => void selectDevice(id)}
+              searchQuery={searchQuery}
+              onSearchChange={setSearch}
+              loading={contactsLoading}
+              contacts={filteredContacts}
+              activeKey={selectedKey}
+              isUnread={isUnread}
+              deletingKey={deletingThreadKey}
+              canHover={canHover}
+              onSelect={(key) => void selectContact(key)}
+              onDelete={(t) => void deleteThreadAction(t)}
+              onRowPointerDown={onThreadPointerDown}
+              onRowPointerMove={moveLongPress}
+              onRowPointerEnd={clearLongPress}
+            />
+          ) : null}
+          {showDetailColumn ? (
+            <ThreadPanel
+              isMobile={isMobile}
+              isDesktop={isDesktop}
+              selectedDevice={selectedDevice}
+              activeThread={activeThread}
+              canLoadMore={!!activeThread && hasMore}
+              loadingMore={loadingMore}
+              groups={groups}
+              deletingMessageId={deletingMessageId}
+              canHover={canHover}
+              composer={composer}
+              composerInfo={composerInfo}
+              composerLength={composerLength}
+              sending={sending}
+              detailRef={detailRef}
+              composerRef={composerRef}
+              onBack={onBack}
+              onScrollToBottom={scrollToBottomNow}
+              onLoadMore={() => void loadMore()}
+              onDeleteMessage={(m) => void deleteMessageAction(m)}
+              onComposerChange={setComposer}
+              onSend={() => void sendReply()}
+              onDetailScroll={onDetailScroll}
+              onMsgPointerDown={onMsgPointerDown}
+              onMsgPointerMove={moveLongPress}
+              onMsgPointerEnd={clearLongPress}
+            />
+          ) : null}
+        </div>
+      </div>
+      {actionSheetOpen && isMobile && actionTarget ? (
+        <div className="sms-action-sheet-mask animate-[fade-slide-in_0.18s_ease]" onClick={closeActionSheet}>
+          <div className="sms-action-sheet" onClick={(e) => e.stopPropagation()}>
+            <div className="sms-action-sheet-title">{t("操作")}</div>
+            <Button
+              className="sms-danger-ghost-btn !w-full !justify-center"
+              icon={<DeleteRegular />}
+              onClick={() => void confirmSheetAction()}
+            >
+              {actionTarget.type === "thread" ? t("删除对话") : t("删除短信")}
+            </Button>
+            <Button className="!w-full !justify-center" onClick={closeActionSheet}>
+              {t("取消")}
+            </Button>
+          </div>
+        </div>
+      ) : null}
+      <NewSmsModal
+        open={newSmsOpen}
+        devices={devices}
+        defaultDeviceId={newSmsDevice}
+        sending={sending}
+        onClose={() => setNewSmsOpen(false)}
+        onSend={sendNewSms}
+      />
     </div>
   );
 }

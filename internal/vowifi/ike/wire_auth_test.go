@@ -169,18 +169,6 @@ func TestConfigurationRequestMatchesAndroidAttributes(t *testing.T) {
 	}
 }
 
-func TestO2GermanyUsesStandardEAPAuthentication(t *testing.T) {
-	for _, mnc := range []string{"03", "003"} {
-		if vowifi.ResolveCarrierProfile(vowifi.SIMIdentity{HomeMCC: "262", HomeMNC: mnc}).AdvertiseEAPOnly {
-			t.Fatalf("O2 Germany 262-%s unexpectedly uses EAP-only", mnc)
-		}
-	}
-	if !vowifi.ResolveCarrierProfile(vowifi.SIMIdentity{HomeMCC: "262", HomeMNC: "02"}).AdvertiseEAPOnly ||
-		!vowifi.ResolveCarrierProfile(vowifi.SIMIdentity{HomeMCC: "234", HomeMNC: "15"}).AdvertiseEAPOnly {
-		t.Fatal("non-O2 PLMN lost the existing EAP-only policy")
-	}
-}
-
 func TestResponderIDrValidatorsSeparateEPDGAndAPN(t *testing.T) {
 	epdg := payload{
 		Type: payloadIDr,

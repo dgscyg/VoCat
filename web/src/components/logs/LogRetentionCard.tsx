@@ -11,12 +11,13 @@ import { message } from "../ui/message";
 type RetentionMode = LoggingSettings["mode"];
 
 // 运行日志保留策略：默认不限制，可按条数或天数限制，服务端据此裁剪历史日志。
-export function LogRetentionCard() {
+export function LogRetentionCard({ refreshKey = 0 }: { refreshKey?: number }) {
   const { t } = useI18n();
   const [mode, setMode] = useState<RetentionMode>("unlimited");
   const [count, setCount] = useState(10000);
   const [days, setDays] = useState(30);
   const [storedLogs, setStoredLogs] = useState(0);
+  const [maxLogs, setMaxLogs] = useState(10000);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
 
@@ -25,6 +26,7 @@ export function LogRetentionCard() {
     setCount(data.count);
     setDays(data.days);
     setStoredLogs(data.storedLogs);
+    setMaxLogs(data.maxLogs || 10000);
   }, []);
 
   useEffect(() => {
@@ -41,14 +43,14 @@ export function LogRetentionCard() {
     return () => {
       cancelled = true;
     };
-  }, [apply]);
+  }, [apply, refreshKey]);
 
   const save = useCallback(async () => {
     setSaving(true);
     try {
       const data = await updateLoggingSettings({
         mode,
-        count: Math.max(1, Math.trunc(count) || 1),
+        count: Math.min(maxLogs, Math.max(1, Math.trunc(count) || 1)),
         days: Math.max(1, Math.trunc(days) || 1),
       });
       apply(data);
@@ -58,7 +60,7 @@ export function LogRetentionCard() {
     } finally {
       setSaving(false);
     }
-  }, [mode, count, days, apply]);
+  }, [mode, count, days, maxLogs, apply]);
 
   const onNumber = (setter: (value: number) => void) => (event: React.ChangeEvent<HTMLInputElement>) => {
     const parsed = parseInt(event.target.value, 10);
@@ -78,7 +80,7 @@ export function LogRetentionCard() {
           className="w-32"
           disabled={loading}
           options={[
-            { value: "unlimited", label: t("不限制") },
+            { value: "unlimited", label: t("最多 10000 条") },
             { value: "count", label: t("按条数") },
             { value: "days", label: t("按天数") },
           ]}
@@ -88,6 +90,7 @@ export function LogRetentionCard() {
             <Input
               type="number"
               min={1}
+              max={maxLogs}
               value={count === 0 ? "" : count}
               onChange={onNumber(setCount)}
               disabled={loading}
@@ -110,8 +113,9 @@ export function LogRetentionCard() {
           </label>
         ) : null}
         <span className="text-sm text-gray-400">
-          {t("当前已存储")} {storedLogs} {t("条")}
+          {t("当前已存储")} {storedLogs} / {maxLogs} {t("条")}
         </span>
+        <span className="text-xs text-gray-400">{t("达到上限后自动删除最旧日志")}</span>
         <div className="flex-1" />
         <Button
           size="small"

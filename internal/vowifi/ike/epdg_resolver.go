@@ -28,46 +28,76 @@ func resolveEPDG(ctx context.Context, resolver *net.Resolver, host string) ([]ne
 	if resolver == nil {
 		resolver = net.DefaultResolver
 	}
-	addresses, systemErr := resolver.LookupIPAddr(ctx, host)
-	if systemErr == nil && len(addresses) > 0 {
-		return addresses, nil
-	}
-
 	normalized := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
-	subnet := vowifi.EPDGDNSClientSubnet(normalized)
-	if subnet == "" {
-		if systemErr != nil {
-			return nil, systemErr
-		}
-		return nil, errors.New("ePDG did not resolve to an IP address")
+	hostsToTry := []string{normalized}
+	if alt := alternate3GPPHostname(normalized); alt != "" && alt != normalized {
+		hostsToTry = append(hostsToTry, alt)
 	}
 
+	var systemErr error
+	for _, targetHost := range hostsToTry {
+		ips, err := resolver.LookupIP(ctx, "ip4", targetHost)
+		if err == nil {
+			addresses := make([]net.IPAddr, 0, len(ips))
+			for _, ip := range ips {
+				addresses = append(addresses, net.IPAddr{IP: ip})
+			}
+			valid := filterValidPublicEPDGAddresses(addresses)
+			if len(valid) > 0 {
+				return valid, nil
+			}
+		} else {
+			systemErr = err
+		}
+	}
+
+	subnet := vowifi.EPDGDNSClientSubnet(normalized)
 	client := &http.Client{Timeout: 8 * time.Second}
 	var fallbackErr error
-	// Vodafone's authoritative response has a 60-second TTL and recursive
-	// resolvers can briefly cache the global CNAME without its geo-restricted
-	// address records. Stay inside the runtime's two-minute setup window and
-	// wait through one complete negative-cache TTL so a single reconnect is
-	// sufficient; users should not have to click Reconnect repeatedly.
-	const fallbackAttempts = 13
-	for attempt := 0; attempt < fallbackAttempts; attempt++ {
+
+	for _, targetHost := range hostsToTry {
 		var fallback []net.IPAddr
-		fallback, fallbackErr = resolveEPDGWithECS(ctx, client, googleDNSOverHTTPS, normalized, subnet)
+		fallback, fallbackErr = resolveEPDGWithECS(ctx, client, googleDNSOverHTTPS, targetHost, subnet)
 		if fallbackErr == nil && len(fallback) > 0 {
 			return fallback, nil
 		}
-		if attempt+1 < fallbackAttempts {
-			select {
-			case <-time.After(5 * time.Second):
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
 	}
 	if systemErr == nil {
-		systemErr = errors.New("system DNS returned no IP addresses")
+		systemErr = errors.New("system DNS returned no usable public IP addresses")
 	}
 	return nil, fmt.Errorf("system DNS failed (%v); geographic DNS fallback failed: %w", systemErr, fallbackErr)
+}
+
+func filterValidPublicEPDGAddresses(addresses []net.IPAddr) []net.IPAddr {
+	result := make([]net.IPAddr, 0, len(addresses))
+	for _, addr := range addresses {
+		if addr.IP == nil || addr.IP.IsLoopback() || addr.IP.IsUnspecified() {
+			continue
+		}
+		result = append(result, addr)
+	}
+	return result
+}
+
+func alternate3GPPHostname(host string) string {
+	const prefix = "epdg.epc.mnc"
+	if !strings.HasPrefix(host, prefix) {
+		return ""
+	}
+	rest := host[len(prefix):]
+	dot := strings.Index(rest, ".")
+	if dot <= 0 {
+		return ""
+	}
+	mnc := rest[:dot]
+	suffix := rest[dot:]
+	if len(mnc) == 3 && strings.HasPrefix(mnc, "0") {
+		return prefix + mnc[1:] + suffix
+	}
+	if len(mnc) == 2 {
+		return prefix + "0" + mnc + suffix
+	}
+	return ""
 }
 
 func resolveEPDGWithECS(
@@ -85,7 +115,9 @@ func resolveEPDGWithECS(
 	query := parsed.Query()
 	query.Set("name", strings.TrimSpace(host))
 	query.Set("type", "A")
-	query.Set("edns_client_subnet", strings.TrimSpace(subnet))
+	if strings.TrimSpace(subnet) != "" {
+		query.Set("edns_client_subnet", strings.TrimSpace(subnet))
+	}
 	parsed.RawQuery = query.Encode()
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
@@ -116,7 +148,7 @@ func resolveEPDGWithECS(
 			continue
 		}
 		ip := net.ParseIP(strings.TrimSuffix(strings.TrimSpace(answer.Data), "."))
-		if ip == nil {
+		if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
 			continue
 		}
 		duplicate := false

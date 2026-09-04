@@ -28,24 +28,49 @@ const (
 // protocol layers consume this common result so their carrier handling cannot
 // drift into separate MCC/MNC switch statements.
 type CarrierProfile struct {
-	ID                 string
-	MatchSource        string
-	RouteMCC           string
-	RouteMNC           string
-	EPDG               string
-	IKEProposal        string
-	AdvertiseEAPOnly   bool
-	IMSTransport       string
-	IMSIdentityProfile string
-	IMSRegisterProfile string
-	IMSIPSecEncryption string
-	SMSCenter          string
-	PANICountry        string
-	PANINode           string
-	IMSDialURIScheme   string
-	IMSUserEqPhone     bool
-	IMSVoiceCodecs     []string
+	ID                                 string
+	MatchSource                        string
+	RouteMCC                           string
+	RouteMNC                           string
+	EPDG                               string
+	IKEProposal                        string
+	AdvertiseEAPOnly                   bool
+	AllowSMSWithoutContactConfirmation bool
+	IMSRegisterOptions                 IMSRegisterOptions
+	IMSTransport                       string
+	IMSIdentityProfile                 string
+	IMSRegisterProfile                 string
+	IMSIPSecEncryption                 string
+	SMSCenter                          string
+	PANIEnabled                        *bool
+	PANICountry                        string
+	PANINode                           string
+	IMSUserAgent                       string
+	IMSDialURIScheme                   string
+	IMSUserEqPhone                     bool
+	IMSVoiceCodecs                     []string
 }
+
+// IMSRegisterOptions carries carrier-specific SIP REGISTER header values.
+// Pointer fields distinguish "use default" (nil) from "explicitly omit" ("").
+type IMSRegisterOptions struct {
+	ContactFormat       string
+	ExpirySeconds       int
+	ContactExtraTags    []string
+	SupportedHeader     *string
+	AllowHeader         *string
+	PPreferredIdentity  bool
+	PVisitedNetworkID   string
+	PAccessNetworkInfo  *string
+	CellularNetworkInfo string
+	AcceptContactTags   []string
+}
+
+const (
+	IMSContactFormatStandard = "standard"
+	IMSContactFormatATT      = "att"
+	IMSContactFormatGSMA     = "gsma"
+)
 
 type carrierProfileDocument struct {
 	Version  int                  `json:"version"`
@@ -88,16 +113,33 @@ type carrierProfileIKE struct {
 }
 
 type carrierProfileIMS struct {
-	Transport       string   `json:"transport,omitempty"`
-	IdentityProfile string   `json:"identity_profile,omitempty"`
-	RegisterProfile string   `json:"register_profile,omitempty"`
-	IPSecEncryption string   `json:"ipsec_encryption,omitempty"`
-	SMSCenter       string   `json:"sms_center,omitempty"`
-	PANICountry     string   `json:"pani_country,omitempty"`
-	PANINode        string   `json:"pani_node,omitempty"`
-	DialURIScheme   string   `json:"dial_uri_scheme,omitempty"`
-	UserEqPhone     *bool    `json:"user_eq_phone,omitempty"`
-	VoiceCodecs     []string `json:"voice_codecs,omitempty"`
+	Transport                          string                        `json:"transport,omitempty"`
+	IdentityProfile                    string                        `json:"identity_profile,omitempty"`
+	RegisterProfile                    string                        `json:"register_profile,omitempty"`
+	IPSecEncryption                    string                        `json:"ipsec_encryption,omitempty"`
+	SMSCenter                          string                        `json:"sms_center,omitempty"`
+	PANIEnabled                        *bool                         `json:"pani_enabled,omitempty"`
+	PANICountry                        string                        `json:"pani_country,omitempty"`
+	PANINode                           string                        `json:"pani_node,omitempty"`
+	UserAgent                          string                        `json:"user_agent,omitempty"`
+	DialURIScheme                      string                        `json:"dial_uri_scheme,omitempty"`
+	UserEqPhone                        *bool                         `json:"user_eq_phone,omitempty"`
+	VoiceCodecs                        []string                      `json:"voice_codecs,omitempty"`
+	RegisterOptions                    carrierProfileRegisterOptions `json:"register_options,omitzero"`
+	AllowSMSWithoutContactConfirmation *bool                         `json:"allow_sms_without_contact_confirmation,omitempty"`
+}
+
+type carrierProfileRegisterOptions struct {
+	ContactFormat       string   `json:"contact_format,omitempty"`
+	ExpirySeconds       int      `json:"expiry_seconds,omitempty"`
+	ContactExtraTags    []string `json:"contact_extra_tags,omitempty"`
+	SupportedHeader     *string  `json:"supported_header,omitempty"`
+	AllowHeader         *string  `json:"allow_header,omitempty"`
+	PPreferredIdentity  bool     `json:"p_preferred_identity,omitempty"`
+	PVisitedNetworkID   string   `json:"p_visited_network_id,omitempty"`
+	PAccessNetworkInfo  *string  `json:"p_access_network_info,omitempty"`
+	CellularNetworkInfo string   `json:"cellular_network_info,omitempty"`
+	AcceptContactTags   []string `json:"accept_contact_tags,omitempty"`
 }
 
 //go:embed carrier_profiles.json
@@ -224,7 +266,11 @@ func carrierProfilesSnapshot() []carrierProfileRule {
 }
 
 func validCarrierProfileRule(rule carrierProfileRule) bool {
-	matches := make([]carrierProfileMatch, 0, 1+len(rule.MatchAny))
+	capacity := len(rule.MatchAny)
+	if !emptyCarrierProfileMatch(rule.Match) {
+		capacity++
+	}
+	matches := make([]carrierProfileMatch, 0, capacity)
 	if !emptyCarrierProfileMatch(rule.Match) {
 		matches = append(matches, rule.Match)
 	}
@@ -279,6 +325,7 @@ func validCarrierProfileRule(rule carrierProfileRule) bool {
 		return false
 	}
 	if country := strings.ToUpper(strings.TrimSpace(rule.IMS.PANICountry)); country != "" &&
+		country != "AUTO" &&
 		(len(country) != 2 || country[0] < 'A' || country[0] > 'Z' || country[1] < 'A' || country[1] > 'Z') {
 		return false
 	}
@@ -289,6 +336,34 @@ func validCarrierProfileRule(rule carrierProfileRule) bool {
 		switch strings.ToUpper(strings.TrimSpace(codec)) {
 		case "PCMA", "PCMU", "AMR", "AMR-WB":
 		default:
+			return false
+		}
+	}
+	if rule.IMS.RegisterOptions.ExpirySeconds != 0 &&
+		(rule.IMS.RegisterOptions.ExpirySeconds < 60 || rule.IMS.RegisterOptions.ExpirySeconds > 86400) {
+		return false
+	}
+	if format := strings.ToLower(strings.TrimSpace(rule.IMS.RegisterOptions.ContactFormat)); format != "" &&
+		format != IMSContactFormatStandard && format != IMSContactFormatATT && format != IMSContactFormatGSMA {
+		return false
+	}
+	for _, value := range rule.IMS.RegisterOptions.ContactExtraTags {
+		if strings.ContainsAny(value, "\r\n") {
+			return false
+		}
+	}
+	for _, value := range []*string{rule.IMS.RegisterOptions.SupportedHeader, rule.IMS.RegisterOptions.AllowHeader, rule.IMS.RegisterOptions.PAccessNetworkInfo} {
+		if value != nil && strings.ContainsAny(*value, "\r\n") {
+			return false
+		}
+	}
+	for _, value := range []string{rule.IMS.UserAgent, rule.IMS.RegisterOptions.PVisitedNetworkID, rule.IMS.RegisterOptions.CellularNetworkInfo} {
+		if strings.ContainsAny(value, "\r\n") {
+			return false
+		}
+	}
+	for _, value := range rule.IMS.RegisterOptions.AcceptContactTags {
+		if strings.ContainsAny(value, "\r\n") {
 			return false
 		}
 	}
@@ -325,8 +400,8 @@ func decimalString(value string) bool {
 // ResolveCarrierProfile returns the most specific built-in match. Exact SIM
 // attributes add specificity, so a constrained MVNO rule wins over its host
 // PLMN without weakening the default match for unrelated subscriptions.
-func ResolveCarrierProfile(identity SIMIdentity) CarrierProfile {
-	resolved := CarrierProfile{
+func defaultCarrierProfile() CarrierProfile {
+	return CarrierProfile{
 		ID:                 CarrierProfileStandard,
 		MatchSource:        "standard",
 		IKEProposal:        IKEProposalModern,
@@ -337,6 +412,13 @@ func ResolveCarrierProfile(identity SIMIdentity) CarrierProfile {
 		IMSDialURIScheme:   "tel",
 		IMSVoiceCodecs:     []string{"PCMA", "PCMU"},
 	}
+}
+
+// ResolveCarrierProfile returns the most specific built-in match. Exact SIM
+// attributes add specificity, so a constrained MVNO rule wins over its host
+// PLMN without weakening the default match for unrelated subscriptions.
+func ResolveCarrierProfile(identity SIMIdentity) CarrierProfile {
+	resolved := defaultCarrierProfile()
 	bestScore := -1
 	for _, rule := range carrierProfilesSnapshot() {
 		score, source, matched := matchCarrierProfileRule(rule, identity)
@@ -344,7 +426,7 @@ func ResolveCarrierProfile(identity SIMIdentity) CarrierProfile {
 			continue
 		}
 		bestScore = score
-		resolved = applyCarrierProfileRule(resolved, rule, source)
+		resolved = applyCarrierProfileRule(defaultCarrierProfile(), rule, source, identity)
 	}
 	return resolved
 }
@@ -356,7 +438,11 @@ func ResolveCarrierProfile(identity SIMIdentity) CarrierProfile {
 func matchCarrierProfileRule(rule carrierProfileRule, identity SIMIdentity) (int, string, bool) {
 	bestScore := -1
 	bestSource := ""
-	matches := make([]carrierProfileMatch, 0, 1+len(rule.MatchAny))
+	capacity := len(rule.MatchAny)
+	if !emptyCarrierProfileMatch(rule.Match) {
+		capacity++
+	}
+	matches := make([]carrierProfileMatch, 0, capacity)
 	if !emptyCarrierProfileMatch(rule.Match) {
 		matches = append(matches, rule.Match)
 	}
@@ -374,16 +460,20 @@ func matchCarrierProfileRule(rule carrierProfileRule, identity SIMIdentity) (int
 func matchCarrierProfile(match carrierProfileMatch, identity SIMIdentity) (int, string, bool) {
 	score := 0
 	sources := make([]string, 0, 6)
+	hasHomePLMNMatch := false
 	if len(match.HomePLMNs) > 0 {
 		wanted := canonicalPLMN(identity.HomeMCC, identity.HomeMNC)
-		if wanted == "" || !matchesAny(match.HomePLMNs, func(value string) bool {
+		if wanted != "" && matchesAny(match.HomePLMNs, func(value string) bool {
 			return canonicalPLMNValue(value) == wanted
 		}) {
+			score += 100
+			sources = append(sources, "hplmn")
+			hasHomePLMNMatch = true
+		} else if identity.HomeMCC != "" && identity.HomeMNC != "" {
 			return 0, "", false
 		}
-		score += 100
-		sources = append(sources, "hplmn")
 	}
+	hasSelectorMatch := false
 	for _, selector := range []struct {
 		name     string
 		weight   int
@@ -393,34 +483,45 @@ func matchCarrierProfile(match carrierProfileMatch, identity SIMIdentity) (int, 
 	}{
 		{name: "imsi", weight: 80, values: match.IMSIPrefixes, actual: identity.IMSI},
 		{name: "iccid", weight: 70, values: match.ICCIDPrefixes, actual: identity.ICCID},
-		{name: "gid1", weight: 50, values: match.GID1Prefixes, actual: identity.GID1, foldCase: true},
-		{name: "gid2", weight: 40, values: match.GID2Prefixes, actual: identity.GID2, foldCase: true},
+		// GID values identify an MVNO/service profile within a host network and
+		// therefore outrank the host issuer's broad ICCID prefix. Otherwise a
+		// home-PLMN+ICCID AT&T rule hides RedPocket/Cricket/etc. even when the SIM
+		// exposes the carrier bundle's exact GID selector.
+		{name: "gid1", weight: 90, values: match.GID1Prefixes, actual: identity.GID1, foldCase: true},
+		{name: "gid2", weight: 85, values: match.GID2Prefixes, actual: identity.GID2, foldCase: true},
 	} {
 		if len(selector.values) == 0 {
 			continue
 		}
 		actual := strings.TrimSpace(selector.actual)
-		if actual == "" || !matchesAny(selector.values, func(prefix string) bool {
+		if actual != "" && matchesAny(selector.values, func(prefix string) bool {
 			prefix = strings.TrimSpace(prefix)
 			if selector.foldCase {
 				return strings.HasPrefix(strings.ToLower(actual), strings.ToLower(prefix))
 			}
 			return strings.HasPrefix(actual, prefix)
 		}) {
+			score += selector.weight
+			sources = append(sources, selector.name)
+			hasSelectorMatch = true
+		} else if !hasHomePLMNMatch || selector.name == "gid1" || selector.name == "gid2" {
 			return 0, "", false
 		}
-		score += selector.weight
-		sources = append(sources, selector.name)
 	}
 	if len(match.SPNs) > 0 {
 		spn := strings.TrimSpace(identity.SPN)
-		if spn == "" || !matchesAny(match.SPNs, func(value string) bool {
+		if spn != "" && matchesAny(match.SPNs, func(value string) bool {
 			return strings.EqualFold(strings.TrimSpace(value), spn)
 		}) {
+			score += 20
+			sources = append(sources, "spn")
+			hasSelectorMatch = true
+		} else {
 			return 0, "", false
 		}
-		score += 20
-		sources = append(sources, "spn")
+	}
+	if !hasHomePLMNMatch && !hasSelectorMatch {
+		return 0, "", false
 	}
 	return score, strings.Join(sources, "+"), score > 0
 }
@@ -434,11 +535,43 @@ func matchesAny(values []string, match func(string) bool) bool {
 	return false
 }
 
-func applyCarrierProfileRule(base CarrierProfile, rule carrierProfileRule, source string) CarrierProfile {
+func applyCarrierProfileRule(base CarrierProfile, rule carrierProfileRule, source string, identity SIMIdentity) CarrierProfile {
 	base.ID = rule.ID
 	base.MatchSource = source
 	base.RouteMCC = strings.TrimSpace(rule.Route.MCC)
 	base.RouteMNC = strings.TrimSpace(rule.Route.MNC)
+	if base.RouteMCC == "" {
+		currentPLMN := canonicalPLMN(identity.HomeMCC, identity.HomeMNC)
+		if currentPLMN != "" {
+			for _, m := range append([]carrierProfileMatch{rule.Match}, rule.MatchAny...) {
+				for _, plmn := range m.HomePLMNs {
+					if canonicalPLMNValue(plmn) == currentPLMN {
+						base.RouteMCC = strings.TrimSpace(identity.HomeMCC)
+						base.RouteMNC = strings.TrimSpace(identity.HomeMNC)
+						break
+					}
+				}
+				if base.RouteMCC != "" {
+					break
+				}
+			}
+		}
+		if base.RouteMCC == "" {
+			for _, m := range append([]carrierProfileMatch{rule.Match}, rule.MatchAny...) {
+				for _, plmn := range m.HomePLMNs {
+					plmn = canonicalPLMNValue(plmn)
+					if len(plmn) >= 5 {
+						base.RouteMCC = plmn[:3]
+						base.RouteMNC = plmn[3:]
+						break
+					}
+				}
+				if base.RouteMCC != "" {
+					break
+				}
+			}
+		}
+	}
 	base.EPDG = strings.ToLower(strings.TrimSpace(rule.EPDG.Hostname))
 	if value := strings.TrimSpace(rule.IKE.Proposal); value != "" {
 		base.IKEProposal = value
@@ -459,8 +592,15 @@ func applyCarrierProfileRule(base CarrierProfile, rule carrierProfileRule, sourc
 		base.IMSIPSecEncryption = value
 	}
 	base.SMSCenter = strings.TrimSpace(rule.IMS.SMSCenter)
+	if rule.IMS.PANIEnabled != nil {
+		enabled := *rule.IMS.PANIEnabled
+		base.PANIEnabled = &enabled
+	}
 	base.PANICountry = strings.ToUpper(strings.TrimSpace(rule.IMS.PANICountry))
 	base.PANINode = strings.TrimSpace(rule.IMS.PANINode)
+	if value := strings.TrimSpace(rule.IMS.UserAgent); value != "" {
+		base.IMSUserAgent = value
+	}
 	if value := strings.ToLower(strings.TrimSpace(rule.IMS.DialURIScheme)); value != "" {
 		base.IMSDialURIScheme = value
 	}
@@ -469,6 +609,47 @@ func applyCarrierProfileRule(base CarrierProfile, rule carrierProfileRule, sourc
 	}
 	if len(rule.IMS.VoiceCodecs) > 0 {
 		base.IMSVoiceCodecs = normalizeVoiceCodecs(rule.IMS.VoiceCodecs)
+	}
+	if rule.IMS.AllowSMSWithoutContactConfirmation != nil {
+		base.AllowSMSWithoutContactConfirmation = *rule.IMS.AllowSMSWithoutContactConfirmation
+	}
+	base.IMSRegisterOptions = applyRegisterOptions(base.IMSRegisterOptions, rule.IMS.RegisterOptions)
+	return base
+}
+
+func applyRegisterOptions(base IMSRegisterOptions, rule carrierProfileRegisterOptions) IMSRegisterOptions {
+	if value := strings.ToLower(strings.TrimSpace(rule.ContactFormat)); value != "" {
+		base.ContactFormat = value
+	}
+	if rule.ExpirySeconds != 0 {
+		base.ExpirySeconds = rule.ExpirySeconds
+	}
+	if len(rule.ContactExtraTags) > 0 {
+		base.ContactExtraTags = append([]string(nil), rule.ContactExtraTags...)
+	}
+	if rule.SupportedHeader != nil {
+		value := strings.TrimSpace(*rule.SupportedHeader)
+		base.SupportedHeader = &value
+	}
+	if rule.AllowHeader != nil {
+		value := strings.TrimSpace(*rule.AllowHeader)
+		base.AllowHeader = &value
+	}
+	if rule.PPreferredIdentity {
+		base.PPreferredIdentity = true
+	}
+	if value := strings.TrimSpace(rule.PVisitedNetworkID); value != "" {
+		base.PVisitedNetworkID = value
+	}
+	if rule.PAccessNetworkInfo != nil {
+		value := strings.TrimSpace(*rule.PAccessNetworkInfo)
+		base.PAccessNetworkInfo = &value
+	}
+	if value := strings.TrimSpace(rule.CellularNetworkInfo); value != "" {
+		base.CellularNetworkInfo = value
+	}
+	if len(rule.AcceptContactTags) > 0 {
+		base.AcceptContactTags = append([]string(nil), rule.AcceptContactTags...)
 	}
 	return base
 }
@@ -536,17 +717,154 @@ func IsATT310280(identity SIMIdentity) bool {
 }
 
 func applyAssignedCarrierRoute(identity SIMIdentity) SIMIdentity {
-	if strings.TrimSpace(identity.EPDG) != "" {
+	profile := ResolveCarrierProfile(identity)
+	if profile.ID != CarrierProfileStandard && profile.RouteMCC != "" {
+		identity.HomeMCC = profile.RouteMCC
+		identity.HomeMNC = profile.RouteMNC
+		if profile.EPDG != "" {
+			identity.EPDG = profile.EPDG
+		} else {
+			identity.EPDG = standardEPDGHostname(profile.RouteMCC, profile.RouteMNC)
+		}
 		return identity
 	}
-	profile := ResolveCarrierProfile(identity)
-	switch {
-	case profile.EPDG != "":
-		identity.EPDG = profile.EPDG
-	case profile.RouteMCC != "":
-		identity.EPDG = standardEPDGHostname(profile.RouteMCC, profile.RouteMNC)
+
+	if strings.TrimSpace(identity.ICCID) != "" {
+		if mcc, mnc, ok := HomePLMNFromICCID(identity.ICCID); ok {
+			imsiCountry := CountryCodeForMCC(identity.HomeMCC)
+			iccidCountry := CountryCodeForMCC(mcc)
+			if identity.HomeMCC == "" || (imsiCountry != "" && iccidCountry != "" && imsiCountry != iccidCountry) {
+				identity.HomeMCC = mcc
+				identity.HomeMNC = mnc
+			}
+		}
+	}
+	if strings.TrimSpace(identity.EPDG) == "" && identity.HomeMCC != "" && identity.HomeMNC != "" {
+		identity.EPDG = standardEPDGHostname(identity.HomeMCC, identity.HomeMNC)
 	}
 	return identity
+}
+
+// CountryCodeForMCC returns the ISO 3166-1 alpha-2 country code associated
+// with an MCC known to the carrier compatibility database.
+func CountryCodeForMCC(mcc string) string {
+	switch strings.TrimSpace(mcc) {
+	case "515":
+		return "PH"
+	case "262":
+		return "DE"
+	case "204":
+		return "NL"
+	case "234", "235":
+		return "GB"
+	case "460":
+		return "CN"
+	case "454":
+		return "HK"
+	case "466", "467":
+		return "TW"
+	case "525":
+		return "SG"
+	case "440", "441":
+		return "JP"
+	case "450":
+		return "KR"
+	case "310", "311", "312", "313", "314", "315", "316":
+		return "US"
+	case "302":
+		return "CA"
+	case "505":
+		return "AU"
+	case "208":
+		return "FR"
+	case "214":
+		return "ES"
+	case "222":
+		return "IT"
+	case "228":
+		return "CH"
+	case "232":
+		return "AT"
+	case "206":
+		return "BE"
+	case "260":
+		return "PL"
+	case "520":
+		return "TH"
+	case "510":
+		return "ID"
+	case "502":
+		return "MY"
+	}
+	return ""
+}
+
+// HomePLMNFromICCID infers the home MCC/MNC from well-known global ICCID prefixes.
+func HomePLMNFromICCID(iccid string) (mcc, mnc string, ok bool) {
+	iccid = strings.TrimSpace(iccid)
+	if len(iccid) < 6 || !strings.HasPrefix(iccid, "89") {
+		return "", "", false
+	}
+	prefixes := []struct {
+		prefix string
+		mcc    string
+		mnc    string
+	}{
+		// Philippines
+		{"896366", "515", "66"}, // DITO
+		{"896302", "515", "02"}, // Globe
+		{"896303", "515", "03"}, // Smart
+		// Germany
+		{"894920", "262", "02"}, // Vodafone DE
+		{"894901", "262", "01"}, // Telekom DE
+		{"894902", "262", "03"}, // O2 DE
+		{"894903", "262", "03"},
+		{"894907", "262", "07"},
+		// United Kingdom
+		{"894410", "234", "15"}, // Vodafone UK
+		{"894415", "234", "15"},
+		{"894411", "234", "30"}, // EE
+		{"894430", "234", "30"},
+		{"894420", "234", "20"}, // Three UK
+		{"894421", "234", "10"}, // O2 UK
+		// Netherlands
+		{"8937204", "204", "04"}, // Vodafone NL
+		{"893104", "204", "04"},
+		{"893108", "204", "08"}, // KPN
+		{"893116", "204", "16"}, // Odido
+		// Hong Kong
+		{"8985201", "454", "00"}, // CSL
+		{"8985203", "454", "03"}, // 3 HK
+		{"898523", "454", "03"},
+		{"8985204", "454", "12"}, // CMHK
+		{"8985206", "454", "06"}, // SmarTone
+		// China
+		{"898600", "460", "00"}, // China Mobile
+		{"898602", "460", "00"},
+		{"898604", "460", "00"},
+		{"898607", "460", "00"},
+		{"898601", "460", "01"}, // China Unicom
+		{"898606", "460", "01"},
+		{"898609", "460", "01"},
+		{"898603", "460", "03"}, // China Telecom
+		{"898605", "460", "03"},
+		{"898611", "460", "03"},
+		// Taiwan
+		{"8988601", "466", "92"}, // Chunghwa
+		{"8988602", "466", "97"}, // Taiwan Mobile
+		{"8988603", "466", "01"}, // FarEasTone
+		// Singapore
+		{"896501", "525", "01"}, // Singtel
+		{"896502", "525", "05"}, // StarHub
+		{"896503", "525", "03"}, // M1
+		{"896504", "525", "10"}, // SIMBA
+	}
+	for _, entry := range prefixes {
+		if strings.HasPrefix(iccid, entry.prefix) {
+			return entry.mcc, entry.mnc, true
+		}
+	}
+	return "", "", false
 }
 
 // EPDGDNSClientSubnet returns a deliberately scoped EDNS client subnet for an
@@ -560,6 +878,103 @@ func EPDGDNSClientSubnet(host string) string {
 				return strings.TrimSpace(rule.EPDG.DNSClientSubnet)
 			}
 		}
+	}
+	if idx := strings.Index(host, ".mcc"); idx >= 0 && len(host) >= idx+7 {
+		mcc := host[idx+4 : idx+7]
+		if decimalString(mcc) {
+			if subnet := MCCDefaultClientSubnet(mcc); subnet != "" {
+				return subnet
+			}
+		}
+	}
+	return ""
+}
+
+// MCCDefaultClientSubnet returns the standard GeoDNS EDNS client subnet for a country MCC.
+func MCCDefaultClientSubnet(mcc string) string {
+	switch strings.TrimSpace(mcc) {
+	case "262": // Germany
+		return "139.7.0.0/16"
+	case "204": // Netherlands
+		return "109.39.0.0/16"
+	case "234", "235": // UK
+		return "212.183.0.0/16"
+	case "515": // Philippines
+		return "112.198.0.0/16"
+	case "454": // Hong Kong
+		return "203.0.0.0/16"
+	case "466", "467": // Taiwan
+		return "210.0.0.0/16"
+	case "525": // Singapore
+		return "202.166.0.0/16"
+	case "440", "441": // Japan
+		return "126.0.0.0/16"
+	case "450": // South Korea
+		return "211.0.0.0/16"
+	case "310", "311", "312", "313", "314", "315", "316": // USA
+		return "198.228.0.0/16"
+	case "302": // Canada
+		return "142.0.0.0/16"
+	case "505": // Australia
+		return "1.120.0.0/16"
+	case "520": // Thailand
+		return "171.96.0.0/16"
+	case "510": // Indonesia
+		return "182.0.0.0/16"
+	case "502": // Malaysia
+		return "115.132.0.0/16"
+	case "208": // France
+		return "194.51.0.0/16"
+	case "214": // Spain
+		return "212.166.0.0/16"
+	case "222": // Italy
+		return "83.224.0.0/16"
+	case "228": // Switzerland
+		return "178.192.0.0/16"
+	case "232": // Austria
+		return "194.138.0.0/16"
+	case "206": // Belgium
+		return "193.190.0.0/16"
+	case "260": // Poland
+		return "83.0.0.0/16"
+	case "268": // Portugal
+		return "194.65.0.0/16"
+	case "272": // Ireland
+		return "193.1.0.0/16"
+	case "238": // Denmark
+		return "193.162.0.0/16"
+	case "240": // Sweden
+		return "194.236.0.0/16"
+	case "242": // Norway
+		return "193.69.0.0/16"
+	case "244": // Finland
+		return "193.64.0.0/16"
+	case "202": // Greece
+		return "194.219.0.0/16"
+	case "216": // Hungary
+		return "195.199.0.0/16"
+	case "230": // Czech Republic
+		return "195.113.0.0/16"
+	case "286": // Turkey
+		return "195.175.0.0/16"
+	case "425": // Israel
+		return "192.114.0.0/16"
+	case "404", "405": // India
+		return "103.0.0.0/16"
+	case "655": // South Africa
+		return "196.0.0.0/16"
+	case "724": // Brazil
+		return "177.0.0.0/16"
+	case "334": // Mexico
+		return "187.188.0.0/16"
+	case "452": // Vietnam
+		return "118.69.0.0/16"
+	case "455": // Macao
+		return "202.175.0.0/16"
+	case "530": // New Zealand
+		return "202.27.0.0/16"
+	case "460": // China
+		return "223.5.5.0/24"
 	}
 	return ""
 }

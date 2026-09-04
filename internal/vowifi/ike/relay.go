@@ -39,7 +39,7 @@ func newSessionRelay(
 	keepalive time.Duration,
 ) *sessionRelay {
 	if keepalive <= 0 {
-		keepalive = 20 * time.Second
+		keepalive = 15 * time.Second
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	relay := &sessionRelay{

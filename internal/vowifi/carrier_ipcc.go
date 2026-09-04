@@ -246,6 +246,82 @@ func InstallCarrierIPCCResult(result IPCCImportResult, dir string) (string, erro
 	return target, nil
 }
 
+// ImportCarrierBundlePlists converts a set of parsed plists for one Apple
+// carrier bundle into a validated carrierProfileRule.
+func ImportCarrierBundlePlists(bundleName string, plistData map[string][]byte) (*carrierProfileRule, []IPCCImportWarning, error) {
+	if len(plistData) == 0 {
+		return nil, nil, errors.New("no plist data provided")
+	}
+	var primaryData []byte
+	if data, ok := plistData["carrier.plist"]; ok {
+		primaryData = data
+	} else {
+		for k, v := range plistData {
+			if strings.EqualFold(path.Base(k), "carrier.plist") {
+				primaryData = v
+				break
+			}
+		}
+	}
+	if len(primaryData) == 0 {
+		return nil, nil, fmt.Errorf("bundle %q has no carrier.plist", bundleName)
+	}
+	var primaryRoot map[string]any
+	decoder := plist.NewDecoder(bytes.NewReader(primaryData))
+	if err := decoder.Decode(&primaryRoot); err != nil {
+		return nil, nil, fmt.Errorf("decode carrier.plist: %w", err)
+	}
+	if primaryRoot == nil {
+		return nil, nil, errors.New("carrier.plist root is not a dictionary")
+	}
+	plists := []ipccPlist{{name: "carrier.plist", root: primaryRoot}}
+
+	var overrideNames []string
+	for k := range plistData {
+		base := path.Base(k)
+		if strings.HasPrefix(strings.ToLower(base), "overrides") && strings.EqualFold(path.Ext(base), ".plist") {
+			overrideNames = append(overrideNames, k)
+		}
+	}
+	sort.Strings(overrideNames)
+	for _, k := range overrideNames {
+		var overrideRoot map[string]any
+		dec := plist.NewDecoder(bytes.NewReader(plistData[k]))
+		if err := dec.Decode(&overrideRoot); err == nil && overrideRoot != nil {
+			plists = append(plists, ipccPlist{name: k, root: overrideRoot})
+		}
+	}
+
+	warnings := &ipccWarningSet{}
+	carrierName := firstNonempty(
+		plistString(primaryRoot["CarrierName"]),
+		statusBarCarrierName(primaryRoot),
+		strings.TrimSuffix(bundleName, path.Ext(bundleName)),
+	)
+	matches, plmns, err := importCarrierSelectors(primaryRoot, plists, warnings)
+	if err != nil {
+		return nil, warnings.items, fmt.Errorf("import selectors: %w", err)
+	}
+	profileID := generatedIPCCProfileID(carrierName, plmns)
+	if !validInstalledProfileID(profileID) {
+		return nil, warnings.items, fmt.Errorf("invalid profile ID %q", profileID)
+	}
+	rule := carrierProfileRule{ID: profileID}
+	if len(matches) == 1 {
+		rule.Match = matches[0]
+	} else {
+		rule.MatchAny = matches
+	}
+	importCarrierEPDG(&rule, plists, warnings)
+	importCarrierIKE(&rule, plists, warnings)
+	importCarrierIMS(&rule, plists, warnings)
+	inspectIgnoredCarrierFields(plists, warnings)
+	if !validCarrierProfileRule(rule) {
+		return nil, warnings.items, errors.New("converted profile is not valid")
+	}
+	return &rule, warnings.items, nil
+}
+
 func carrierBundleRoots(files []*zip.File) []string {
 	seen := make(map[string]struct{})
 	for _, file := range files {
@@ -425,11 +501,17 @@ func parseAppleSupportedSIM(raw string, warnings *ipccWarningSet) (carrierProfil
 		}
 		switch strings.ToUpper(strings.TrimSpace(name)) {
 		case "GID1":
-			match.GID1Prefixes = append(match.GID1Prefixes, trimAppleHexMask(value))
+			if trimmed := trimAppleHexMask(value); trimmed != "" {
+				match.GID1Prefixes = append(match.GID1Prefixes, trimmed)
+			}
 		case "GID2":
-			match.GID2Prefixes = append(match.GID2Prefixes, trimAppleHexMask(value))
+			if trimmed := trimAppleHexMask(value); trimmed != "" {
+				match.GID2Prefixes = append(match.GID2Prefixes, trimmed)
+			}
 		case "ICCID":
-			match.ICCIDPrefixes = append(match.ICCIDPrefixes, strings.TrimRight(value, "Ff"))
+			if trimmed := strings.TrimRight(value, "Ff"); trimmed != "" {
+				match.ICCIDPrefixes = append(match.ICCIDPrefixes, trimmed)
+			}
 		case "SPN":
 			match.SPNs = append(match.SPNs, value)
 		default:
@@ -437,16 +519,13 @@ func parseAppleSupportedSIM(raw string, warnings *ipccWarningSet) (carrierProfil
 			return carrierProfileMatch{}, false, false
 		}
 	}
-	return match, len(parts) > 1, true
+	constrained := len(match.GID1Prefixes) > 0 || len(match.GID2Prefixes) > 0 || len(match.ICCIDPrefixes) > 0 || len(match.SPNs) > 0
+	return match, constrained, true
 }
 
 func trimAppleHexMask(value string) string {
 	value = strings.ToUpper(strings.TrimSpace(value))
-	trimmed := strings.TrimRight(value, "F")
-	if trimmed == "" {
-		return value
-	}
-	return trimmed
+	return strings.TrimRight(value, "F")
 }
 
 func collectMatchingICCIDPrefixes(plists []ipccPlist) []string {
@@ -555,6 +634,11 @@ func importCarrierIMS(rule *carrierProfileRule, plists []ipccPlist, warnings *ip
 				} else {
 					warnings.add("disabled_ims_ipsec_ignored", "UseIPSec=false was not imported because VoWiFi IMS security cannot be weakened automatically", document.name+":"+strings.Join(signaling.path, ".")+".UseIPSec")
 				}
+			}
+			if strings.EqualFold(plistString(signaling.value["CountryOfOriginationFormat"]), "PANI") {
+				enabled := true
+				rule.IMS.PANIEnabled = &enabled
+				rule.IMS.PANICountry = "AUTO"
 			}
 		}
 	}

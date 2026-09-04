@@ -115,8 +115,10 @@ func (session *Session) DialCall(ctx context.Context, number string) (vowifi.Cal
 		"P-Preferred-Identity: <"+preferredIdentity+">",
 		"P-Preferred-Service: "+mmtelServiceURN,
 		`Accept-Contact: *;+g.3gpp.icsi-ref="`+mmtelFeatureTag+`"`,
-		"P-Access-Network-Info: "+session.pAccessNetworkInfo(),
-		"User-Agent: "+session.callUserAgent(),
+	)
+	lines = session.appendPAccessNetworkInfoHeader(lines)
+	lines = append(lines,
+		"User-Agent: "+session.imsUserAgent(),
 		"Allow: INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE, PRACK, UPDATE, INFO",
 		"Supported: 100rel, timer, replaces",
 		"Session-Expires: 1800;refresher=uac",
@@ -146,6 +148,8 @@ func (session *Session) DialCall(ctx context.Context, number string) (vowifi.Cal
 	session.callMu.Unlock()
 	if session.provider != nil && session.provider.config.Logger != nil {
 		session.provider.config.Logger.Info("IMS call started",
+			"category", "call",
+			"device_id", session.request.DeviceID,
 			"direction", "outgoing",
 			"identity_source", identitySource,
 			"target_scheme", strings.ToLower(strings.TrimSuffix(strings.SplitN(target, ":", 2)[0], ":")),
@@ -228,6 +232,8 @@ func (session *Session) watchOutgoingCall(call *imsCall, key sipTransactionKey) 
 			} else {
 				if ackErr := session.sendRejectedInviteACK(call, response); ackErr != nil && session.provider != nil && session.provider.config.Logger != nil {
 					session.provider.config.Logger.Warn("IMS rejected INVITE ACK failed",
+						"category", "call",
+						"device_id", session.request.DeviceID,
 						"carrier_profile", vowifi.ResolveCarrierProfile(session.request.Identity).ID,
 						"sip_status", response.StatusCode,
 						"error", safeSIPDiagnostic(ackErr.Error()),
@@ -368,6 +374,33 @@ func (session *Session) handleCallRequest(request *sipRequest, respond func([]by
 		session.callMu.Lock()
 		session.calls[callID] = call
 		session.callMu.Unlock()
+		if session.provider != nil && session.provider.config.Logger != nil {
+			session.provider.config.Logger.Info("IMS incoming call received",
+				"category", "call",
+				"device_id", session.request.DeviceID,
+				"caller", call.public.Number,
+				"call_id", call.public.ID,
+			)
+		}
+		if session.provider != nil && session.provider.config.OnIncomingCall != nil {
+			calledNumber := identityNumber(request.value("To"))
+			if calledNumber == "" {
+				calledNumber = session.identity.public
+			}
+			receivedCall := ReceivedCall{
+				DeviceID:  session.request.DeviceID,
+				IMSI:      session.request.Identity.IMSI,
+				CallID:    callID,
+				Caller:    number,
+				Called:    calledNumber,
+				Timestamp: time.Now().UTC(),
+			}
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				_ = session.provider.config.OnIncomingCall(ctx, receivedCall)
+			}()
+		}
 		response, err := buildSIPResponseWithBody(request, 180, session.fromTag, nil)
 		if err == nil {
 			_ = respond(response)
@@ -468,8 +501,10 @@ func (session *Session) sendRejectedInviteACK(call *imsCall, response *sipRespon
 		"To: "+to,
 		"Call-ID: "+call.callID,
 		fmt.Sprintf("CSeq: %d ACK", call.cseq),
-		"P-Access-Network-Info: "+session.pAccessNetworkInfo(),
-		"User-Agent: "+session.callUserAgent(),
+	)
+	lines = session.appendPAccessNetworkInfoHeader(lines)
+	lines = append(lines,
+		"User-Agent: "+session.imsUserAgent(),
 		"Content-Length: 0", "", "",
 	)
 	session.writeMu.Lock()
@@ -546,8 +581,10 @@ func (session *Session) sendPRACK(call *imsCall, response *sipResponse) {
 	lines = append(lines,
 		"From: "+from, "To: "+to, "Call-ID: "+call.callID,
 		fmt.Sprintf("CSeq: %d PRACK", cseq), "RAck: "+rseq+" "+inviteCSeq,
-		"P-Access-Network-Info: "+session.pAccessNetworkInfo(),
-		"User-Agent: "+session.callUserAgent(),
+	)
+	lines = session.appendPAccessNetworkInfoHeader(lines)
+	lines = append(lines,
+		"User-Agent: "+session.imsUserAgent(),
 		"Content-Length: 0", "", "",
 	)
 	ctx, cancel := context.WithTimeout(session.refreshContext, 10*time.Second)
@@ -678,10 +715,10 @@ func (session *Session) buildDialogRequest(call *imsCall, method string, cseq ui
 		"Call-ID: "+call.callID,
 		fmt.Sprintf("CSeq: %d %s", cseq, method),
 		"Supported: 100rel, timer",
-		"User-Agent: "+session.callUserAgent(),
+		"User-Agent: "+session.imsUserAgent(),
 	)
 	if method != "CANCEL" {
-		lines = append(lines, "P-Access-Network-Info: "+session.pAccessNetworkInfo())
+		lines = session.appendPAccessNetworkInfoHeader(lines)
 	}
 	if method == "UPDATE" {
 		lines = append(lines, session.dialogContactHeader())
@@ -740,6 +777,13 @@ func (session *Session) dialogContactHeader() string {
 	if session == nil || session.conn == nil || strings.TrimSpace(session.identity.user) == "" {
 		return ""
 	}
+	if session.imsRegisterOptions().ContactFormat == vowifi.IMSContactFormatGSMA {
+		contact := "Contact: <sip:" + session.contactAddress() + `>;+g.3gpp.icsi-ref="` + mmtelFeatureTag + `"`
+		if strings.TrimSpace(session.instanceID) != "" {
+			contact += `;+sip.instance="<` + session.instanceID + `>"`
+		}
+		return contact
+	}
 	contact := "Contact: <sip:" + session.identity.user + "@" + session.contactAddress() + ";transport=" + session.transport + ">"
 	if strings.TrimSpace(session.instanceID) != "" {
 		contact += `;+sip.instance="<` + session.instanceID + `>"`
@@ -780,25 +824,20 @@ func (session *Session) callOriginatingIdentitiesLocked(profile vowifi.CarrierPr
 }
 
 func (session *Session) pAccessNetworkInfo() string {
-	profile := vowifi.ResolveCarrierProfile(session.request.Identity)
-	node := strings.TrimSpace(profile.PANINode)
-	if node == "" {
-		node = "000000000000"
+	if session == nil {
+		return ""
 	}
-	value := "IEEE-802.11;i-wlan-node-id=" + node
-	if country := strings.ToUpper(strings.TrimSpace(profile.PANICountry)); country != "" {
-		value += ";country=" + country
+	if session.paniResolved {
+		return session.pani
 	}
-	return value + ";network-provided"
+	return resolveSessionPAccessNetworkInfo(session.request.Identity, session.imsLogger())
 }
 
-func (session *Session) callUserAgent() string {
-	if session != nil && session.provider != nil {
-		if value := strings.TrimSpace(session.provider.config.UserAgent); value != "" {
-			return value
-		}
+func (session *Session) appendPAccessNetworkInfoHeader(lines []string) []string {
+	if pani := session.pAccessNetworkInfo(); pani != "" {
+		return append(lines, "P-Access-Network-Info: "+pani)
 	}
-	return "vocat/1"
+	return lines
 }
 
 func callResponseDiagnostic(response *sipResponse) string {
@@ -824,6 +863,8 @@ func (session *Session) logCallResponse(response *sipResponse, diagnostic string
 		return
 	}
 	session.provider.config.Logger.Info("IMS call response",
+		"category", "call",
+		"device_id", session.request.DeviceID,
 		"carrier_profile", vowifi.ResolveCarrierProfile(session.request.Identity).ID,
 		"sip_status", response.StatusCode,
 		"diagnostic", diagnostic,

@@ -19,7 +19,7 @@ export interface DeviceOverviewTabProps {
   trafficMinuteTx: string;
   e911Starting: boolean;
   onSetupE911: () => void;
-  onRefresh: () => void;
+  onRefresh: () => void | Promise<void>;
 }
 
 export function DeviceOverviewTab(props: DeviceOverviewTabProps) {

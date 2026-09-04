@@ -16,6 +16,7 @@ import (
 	"vocat/internal/device"
 	"vocat/internal/i18n"
 	"vocat/internal/modem"
+	"vocat/internal/pcsc"
 	"vocat/internal/store"
 	"vocat/internal/vowifi"
 	vowifiruntime "vocat/internal/vowifi/runtime"
@@ -46,6 +47,7 @@ type DeviceController interface {
 	ListSMS(context.Context, string) ([]device.SMSMessage, error)
 	ReadSMS(context.Context, string, int) (device.SMSMessage, error)
 	DeleteSMS(context.Context, string, int) error
+	DeleteSMSFromStorage(context.Context, string, string, int) error
 	ESIMInventory(context.Context, string) ([]device.EsimInventoryEntry, error)
 	ESIMListProfiles(context.Context, string) (device.EsimInfo, error)
 	ESIMSwitchProfile(context.Context, string, string, string) error
@@ -54,6 +56,23 @@ type DeviceController interface {
 	ESIMDownloadProfile(context.Context, string, device.EsimDownloadParams, func(device.EsimProgress)) (*device.EsimDownloadResult, error)
 	ESIMDeleteProfile(context.Context, string, string, string) (*device.EsimDeleteResult, error)
 	ESIMChipInfo(context.Context, string) (*device.EsimChipInfo, error)
+}
+
+type cellularIMSController interface {
+	CellularIMS(context.Context, string) (device.CellularIMSStatus, error)
+	SetCellularIMS(context.Context, string, device.CellularIMSMode) (device.CellularIMSStatus, error)
+}
+
+type cellularNetworkStatusController interface {
+	NetworkStatus(context.Context, string) (device.NetworkStatus, error)
+}
+
+type cellularNetworkEventController interface {
+	SubscribeNetworkStatusEvents(context.Context) (<-chan string, error)
+}
+
+type cellularDeviceLifecycleController interface {
+	SubscribeDeviceLifecycleEvents(context.Context) (<-chan device.DeviceLifecycleEvent, error)
 }
 
 type deviceConfigPayload struct {
@@ -264,13 +283,31 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) bool {
 				return true
 			}
 		}
-		if _, err := s.devices.SetFlight(r.Context(), selected.ID, true); err != nil {
-			s.writeDeviceError(w, err)
-			return true
+		if selector, ok := s.devices.(interface{ SetESIMTransport(string, string) error }); ok {
+			if err := selector.SetESIMTransport(selected.ID, config.ESIMTransport); err != nil {
+				s.writeDeviceError(w, err)
+				return true
+			}
 		}
 		if err := s.store.UpsertDevice(r.Context(), config); err != nil {
 			s.writeStoreError(w, err)
 			return true
+		}
+		// Persist the physical binding before the first RF command. A newly
+		// enumerated USB modem may still be settling, or ModemManager may not yet
+		// have released its AT port. Rejecting the whole add operation in that
+		// transient window leaves no configured identity for the periodic recovery
+		// loop to retry. The stored desired state remains fail-closed (cellular data
+		// disabled, VoWiFi enabled); report the incomplete hardware transition as a
+		// warning while allowing normal reconciliation to finish it later.
+		flightWarning := ""
+		if _, err := s.devices.SetFlight(r.Context(), selected.ID, true); err != nil {
+			flightWarning = "device configuration was saved, but the modem did not enter airplane mode yet; VoCat will retry during recovery"
+			s.logger.Warn("new device saved before initial airplane-mode transition completed",
+				"device_id", config.ID,
+				"physical_device_id", selected.ID,
+				"error", device.HardwareErrorDetail(err),
+			)
 		}
 		if selected.Snapshot != nil {
 			iccid := strings.TrimSpace(selected.Snapshot.ICCID)
@@ -299,6 +336,7 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) bool {
 				"id":              config.ID,
 				"discovery_key":   selected.ID,
 				"physical_device": s.configuredDeviceSummary(config, selected),
+				"warning":         flightWarning,
 			},
 		})
 	default:
@@ -498,6 +536,12 @@ func (s *Server) handleDevicePath(
 						return true
 					}
 				}
+				if selector, ok := s.devices.(interface{ SetESIMTransport(string, string) error }); ok {
+					if err := selector.SetESIMTransport(physicalID, next.ESIMTransport); err != nil {
+						s.writeDeviceError(w, err)
+						return true
+					}
+				}
 			}
 			if err := s.store.UpsertDevice(r.Context(), next); err != nil {
 				s.writeStoreError(w, err)
@@ -575,7 +619,7 @@ func (s *Server) handleDevicePath(
 		if !s.requirePhysicalDevice(w, physicalPresent) {
 			return true
 		}
-		return s.handleUSSD(w, r, physicalID)
+		return s.handleUSSD(w, r, config, physicalID)
 	case "actions/ussd/continue":
 		return s.handleUSSDContinue(w, r)
 	case "actions/ussd/cancel":
@@ -587,11 +631,20 @@ func (s *Server) handleDevicePath(
 		if !s.requirePhysicalDevice(w, physicalPresent) {
 			return true
 		}
+		desiredData := config.NetworkEnabled && !config.VoWiFiEnabled
+		iccid := ""
+		if entry.Snapshot != nil {
+			iccid = strings.TrimSpace(entry.Snapshot.ICCID)
+		}
+		dataRuntime := s.cellularDataRuntime()
+		invalidated := dataRuntime.invalidateWithModemPhase(config.ID, desiredData, "recovering", "", "rebooting")
 		if err := s.devices.Reboot(r.Context(), physicalID); err != nil {
+			dataRuntime.invalidate(config.ID, desiredData, "failed", err.Error())
 			s.writeDeviceError(w, err)
 			return true
 		}
 		s.clearPublicIP(config.ID)
+		s.restoreCellularDataAfterModemReboot(config.ID, physicalID, iccid, invalidated.Revision, "manual modem reboot")
 		writeJSON(w, http.StatusAccepted, map[string]any{"data": map[string]any{"status": "rebooting"}})
 	case "flight-mode":
 		if !s.requirePhysicalDevice(w, physicalPresent) {
@@ -608,6 +661,11 @@ func (s *Server) handleDevicePath(
 			return true
 		}
 		return s.handleAPNProfiles(w, r, physicalID)
+	case "cellular-ims":
+		if !s.requirePhysicalDevice(w, physicalPresent) {
+			return true
+		}
+		return s.handleCellularIMS(w, r, config, physicalID)
 	case "network/public-ip":
 		if !s.requirePhysicalDevice(w, physicalPresent) {
 			return true
@@ -674,7 +732,7 @@ func native410UnsupportedOperation(tail []string) bool {
 		return false
 	}
 	operation := strings.Join(tail, "/")
-	return tail[0] == "calls" || operation == "actions/reboot"
+	return tail[0] == "calls" || operation == "actions/reboot" || operation == "cellular-ims"
 }
 
 func (s *Server) handleUSBNetMode(w http.ResponseWriter, r *http.Request, physicalID string) bool {
@@ -868,6 +926,14 @@ func (s *Server) handleVoWiFiEnabled(
 	// when leaving it: teardown starts from CFUN=4 and is required to remain
 	// there until the user explicitly disables airplane mode.
 	previous := config.VoWiFiEnabled
+	dataRuntime := s.cellularDataRuntime()
+	s.clearPublicIP(config.ID)
+	desiredData := config.NetworkEnabled && !config.VoWiFiEnabled
+	maintenancePhase := "disabled"
+	if desiredData {
+		maintenancePhase = "recovering"
+	}
+	dataRuntime.invalidateWithMaintenancePhase(config.ID, desiredData, maintenancePhase, "", "vowifi")
 	liveICCID := ""
 	entry, physicalID, present := s.physicalForConfig(config)
 	if present {
@@ -914,11 +980,13 @@ func (s *Server) handleVoWiFiEnabled(
 		_ = s.store.UpsertCardPolicy(context.Background(), policy)
 	}
 	config.VoWiFiEnabled = request.Enabled
+	config.NetworkEnabled = false
 	if err := s.store.UpsertDevice(r.Context(), config); err != nil {
 		rollbackCardPolicy()
 		s.writeStoreError(w, err)
 		return true
 	}
+	dataRuntime.invalidate(config.ID, false, "disabled", "")
 	state, err := s.vowifi.RequestEnabled(config.ID, request.Enabled)
 	if err != nil {
 		// Repeating the same desired state while its asynchronous transaction is
@@ -996,6 +1064,11 @@ func (s *Server) handleVoWiFiReconnect(
 }
 
 func (s *Server) writeVoWiFiError(w http.ResponseWriter, err error) {
+	s.logger.Warn("VoWiFi operation failed",
+		"category", "vowifi",
+		"event", "vowifi.operation_failed",
+		"raw_error", err,
+	)
 	switch {
 	case errors.Is(err, vowifiruntime.ErrNotRegistered):
 		writeError(w, http.StatusServiceUnavailable, "vowifi_device_unavailable", "the configured device has no VoWiFi runtime")
@@ -1006,7 +1079,6 @@ func (s *Server) writeVoWiFiError(w http.ResponseWriter, err error) {
 	case errors.Is(err, vowifi.ErrNotRunning):
 		writeError(w, http.StatusConflict, "vowifi_not_running", "VoWiFi is not running")
 	default:
-		s.logger.Warn("VoWiFi action rejected", "error", err)
 		writeError(w, http.StatusBadGateway, "vowifi_error", err.Error())
 	}
 }
@@ -1039,13 +1111,14 @@ func (s *Server) handleAT(w http.ResponseWriter, r *http.Request, id string) boo
 	var request struct {
 		Command   string `json:"cmd"`
 		TimeoutMs int    `json:"timeout_ms"`
+		Force     bool   `json:"force"`
 	}
 	if err := s.decodeJSON(w, r, &request); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return true
 	}
 	command := strings.TrimSpace(request.Command)
-	if err := validateATCommand(command); err != nil {
+	if err := validateATCommand(command, request.Force); err != nil {
 		writeError(w, http.StatusBadRequest, "unsafe_at_command", err.Error())
 		return true
 	}
@@ -1063,6 +1136,13 @@ func (s *Server) handleAT(w http.ResponseWriter, r *http.Request, id string) boo
 				text += "\n"
 			}
 			text += commandErr.Final
+			s.logger.Warn("AT command rejected by modem",
+				"category", "hardware",
+				"event", "hardware.at_rejected",
+				"device_id", id,
+				"modem_final", commandErr.Final,
+				"raw_response", text,
+			)
 			writeJSON(w, http.StatusOK, map[string]any{
 				"data": map[string]any{
 					"response":    text,
@@ -1094,13 +1174,16 @@ func (s *Server) handleAT(w http.ResponseWriter, r *http.Request, id string) boo
 	return true
 }
 
-func validateATCommand(command string) error {
+func validateATCommand(command string, force bool) error {
 	upper := strings.ToUpper(command)
 	if len(command) < 2 || len(command) > 512 || !strings.HasPrefix(upper, "AT") {
 		return errors.New("AT command must start with AT and contain at most 512 characters")
 	}
 	if strings.ContainsAny(command, "\r\n\x00") {
 		return errors.New("AT command must contain exactly one line")
+	}
+	if force {
+		return nil
 	}
 	canonical := strings.NewReplacer(" ", "", "\t", "").Replace(upper)
 	for _, blocked := range []string{
@@ -1132,7 +1215,34 @@ func validateATCommand(command string) error {
 	return nil
 }
 
-func (s *Server) handleUSSD(w http.ResponseWriter, r *http.Request, id string) bool {
+// imsUSSIController is the optional VoWiFi runtime capability used to route a
+// USSD request over IMS (3GPP TS 24.390) when VoWiFi is enabled and the IMS
+// session is registered. device.Manager does not implement it; the VoWiFi
+// runtime manager does.
+type imsUSSIController interface {
+	SendUSSI(context.Context, string, vowifi.USSISubmitRequest) (vowifi.USSISubmitResult, error)
+}
+
+// openUSSDSession mirrors device.Manager.openUSSDSession but lives on the HTTP
+// server so a USSI awaiting-input reply can hand back a token the existing
+// continue/cancel endpoints understand. The token is only a device handle;
+// the IMS session owns the actual dialog.
+func (s *Server) openUSSDSession(deviceID string) string {
+	return s.ussdSessions.open(deviceID)
+}
+
+// ussdSessionDevice resolves a USSD session token created by openUSSDSession
+// back to its device id, matching device.ErrUSSDSessionNotFound semantics.
+func (s *Server) ussdSessionDevice(sessionID string) (string, error) {
+	return s.ussdSessions.device(sessionID)
+}
+
+// dropUSSDSession releases a USSD session token.
+func (s *Server) dropUSSDSession(sessionID string) {
+	s.ussdSessions.drop(sessionID)
+}
+
+func (s *Server) handleUSSD(w http.ResponseWriter, r *http.Request, config store.Device, id string) bool {
 	if !requireMethod(w, r, http.MethodPost) {
 		return true
 	}
@@ -1146,19 +1256,90 @@ func (s *Server) handleUSSD(w http.ResponseWriter, r *http.Request, id string) b
 	}
 	ctx, cancel := actionRequestContext(r.Context(), request.TimeoutMs)
 	defer cancel()
+
+	cmd := strings.TrimSpace(request.Command)
+	if cmd == "*#06#" || cmd == "*#06" {
+		imei := config.ModemIMEI
+		if imei == "" {
+			if runtime, runtimeErr := s.store.DeviceRuntime(ctx, id); runtimeErr == nil {
+				imei = runtime.IMEI
+			}
+		}
+		if imei != "" {
+			writeUSSDResult(w, device.USSDResult{
+				Text:   fmt.Sprintf("IMEI: %s", imei),
+				Status: "final",
+			})
+			return true
+		}
+	}
+	if cmd == "*#0000#" || cmd == "*#0000" {
+		firmware := ""
+		if runtime, runtimeErr := s.store.DeviceRuntime(ctx, id); runtimeErr == nil {
+			firmware = runtime.Firmware
+		}
+		if firmware != "" {
+			writeUSSDResult(w, device.USSDResult{
+				Text:   fmt.Sprintf("Software Version: %s", firmware),
+				Status: "final",
+			})
+			return true
+		}
+	}
+
+	// VoWiFi-first: when VoWiFi owns the radio the cellular CUSD path has no
+	// network to talk to (CFUN=4 returns +CME ERROR: 30). Route over IMS/USSI
+	// when the IMS session is registered, and fall back to cellular CUSD only
+	// when USSI is not ready or the runtime is unavailable.
+	if config.VoWiFiEnabled && s.vowifi != nil {
+		sender, canSendIMS := s.vowifi.(imsUSSIController)
+		if canSendIMS {
+			if state, stateErr := s.vowifi.State(id); stateErr == nil && state.IMSReady {
+				result, sendErr := sender.SendUSSI(ctx, id, vowifi.USSISubmitRequest{Code: request.Command})
+				if sendErr == nil {
+					writeUSSDResult(w, ussdResultFromUSSI(result, id, s))
+					return true
+				}
+				if !errors.Is(sendErr, vowifi.ErrUSSINotReady) {
+					s.writeDeviceError(w, sendErr)
+					return true
+				}
+				// ErrUSSINotReady: fall through to cellular CUSD.
+			}
+		}
+	}
 	result, err := s.devices.USSD(ctx, id, request.Command)
 	if err != nil {
 		s.writeDeviceError(w, err)
 		return true
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"data": map[string]any{
-			"result": result.Text,
-			"raw":    result.Raw,
-			"dcs":    result.DCS,
-		},
-	})
+	writeUSSDResult(w, result)
 	return true
+}
+
+// ussdResultFromUSSI maps a USSI result onto the device.USSDResult shape that
+// writeUSSDResult expects. A USSI awaiting-input reply opens a server-side
+// session token via the device manager so the existing continue/cancel
+// endpoints keep working; the token maps back to the device and the continue
+// handler re-enters the USSI path through the same imsUSSIController.
+func ussdResultFromUSSI(result vowifi.USSISubmitResult, deviceID string, server *Server) device.USSDResult {
+	mapped := device.USSDResult{
+		Text:         result.Text,
+		Raw:          result.Raw,
+		DCS:          result.DCS,
+		Status:       result.Status,
+		Continueable: result.Continueable,
+	}
+	// USSI has no inline continue/terminate flag in the 2xx response body, so
+	// treat any non-empty successful reply as potentially multi-round. The cancel
+	// endpoint drops the local token; the network will time the dialog out if it
+	// was actually final.
+	if mapped.Status != "failed" && mapped.Status != "terminated" && mapped.Text != "" {
+		mapped.Status = "awaiting_input"
+		mapped.Continueable = true
+		mapped.SessionID = server.openUSSDSession(deviceID)
+	}
+	return mapped
 }
 
 func (s *Server) handleFlightMode(w http.ResponseWriter, r *http.Request, config store.Device, physicalID string) bool {
@@ -1175,6 +1356,16 @@ func (s *Server) handleFlightMode(w http.ResponseWriter, r *http.Request, config
 	if config.VoWiFiEnabled {
 		writeError(w, http.StatusConflict, "vowifi_owns_airplane_mode", "airplane mode is locked on while VoWiFi is enabled")
 		return true
+	}
+	dataRuntime := s.cellularDataRuntime()
+	desiredData := config.NetworkEnabled && !config.VoWiFiEnabled
+	if request.Enabled {
+		s.clearPublicIP(config.ID)
+		phase := "disabled"
+		if desiredData {
+			phase = "recovering"
+		}
+		dataRuntime.invalidateWithMaintenancePhase(config.ID, desiredData, phase, "", "flight_mode")
 	}
 	result, err := s.devices.SetFlight(r.Context(), physicalID, request.Enabled)
 	if err != nil {
@@ -1205,6 +1396,25 @@ func (s *Server) handleFlightMode(w http.ResponseWriter, r *http.Request, config
 				s.writeStoreError(w, err)
 				return true
 			}
+		}
+	}
+	if !request.Enabled {
+		if desiredData {
+			// Prefer the live ICCID/profile request when the modem snapshot is
+			// available. After leaving flight mode the snapshot may still be
+			// temporarily unavailable, so queue a config-based fallback instead
+			// of leaving the runtime parked in the maintenance phase.
+			networkRequest := s.cellularNetworkRequest(r.Context(), config, nil)
+			networkRequest.Enabled = true
+			identity := ""
+			if entry, getErr := s.devices.Get(physicalID); getErr == nil && entry.Snapshot != nil {
+				networkRequest = s.cellularNetworkRequest(r.Context(), config, entry.Snapshot)
+				networkRequest.Enabled = true
+				identity = strings.TrimSpace(entry.Snapshot.ICCID)
+			}
+			dataRuntime.requestWithIdentity(config.ID, physicalID, networkRequest, identity)
+		} else {
+			dataRuntime.invalidate(config.ID, false, "disabled", "")
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": result})
@@ -1270,6 +1480,180 @@ func (s *Server) handleAPNProfiles(w http.ResponseWriter, r *http.Request, physi
 	return true
 }
 
+func (s *Server) handleCellularIMS(
+	w http.ResponseWriter,
+	r *http.Request,
+	config store.Device,
+	physicalID string,
+) bool {
+	controller, ok := s.devices.(cellularIMSController)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "cellular_ims_unsupported", "cellular IMS control is unavailable")
+		return true
+	}
+	entry, _ := s.devices.Get(physicalID)
+	iccid := ""
+	if entry.Snapshot != nil {
+		iccid = strings.TrimSpace(entry.Snapshot.ICCID)
+	}
+	switch r.Method {
+	case http.MethodGet:
+		status, statusErr := controller.CellularIMS(r.Context(), physicalID)
+		if statusErr != nil {
+			writeError(w, http.StatusUnprocessableEntity, "cellular_ims_unsupported", statusErr.Error())
+			return true
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": cellularIMSResponse(iccid, status)})
+	case http.MethodPatch:
+		var request struct {
+			Mode    *string `json:"mode"`
+			Enabled *bool   `json:"enabled"`
+		}
+		if err := s.decodeJSON(w, r, &request); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return true
+		}
+		if request.Mode == nil && request.Enabled == nil {
+			writeError(w, http.StatusBadRequest, "invalid_cellular_ims", "mode is required")
+			return true
+		}
+		mode := device.CellularIMSModeMBNDefault
+		if request.Mode != nil {
+			mode = device.CellularIMSMode(strings.ToLower(strings.TrimSpace(*request.Mode)))
+		} else if *request.Enabled {
+			// Backward compatibility with PR #77: false meant restoring the MBN
+			// default (QCFG ims=0), never force-disabling IMS.
+			mode = device.CellularIMSModeForceEnabled
+		}
+		if mode != device.CellularIMSModeMBNDefault && mode != device.CellularIMSModeForceEnabled &&
+			mode != device.CellularIMSModeForceDisabled {
+			writeError(w, http.StatusBadRequest, "invalid_cellular_ims", "mode must be mbn_default, force_enabled, or force_disabled")
+			return true
+		}
+		status, applyErr := controller.SetCellularIMS(r.Context(), physicalID, mode)
+		if applyErr != nil {
+			writeError(w, http.StatusBadGateway, "cellular_ims_apply_failed", "IMS configuration could not be applied: "+applyErr.Error())
+			return true
+		}
+		if status.Rebooting {
+			desiredData := config.NetworkEnabled && !config.VoWiFiEnabled
+			invalidated := s.cellularDataRuntime().invalidateWithModemPhase(config.ID, desiredData, "recovering", "", "rebooting")
+			s.restoreCellularDataAfterModemReboot(config.ID, physicalID, iccid, invalidated.Revision, "cellular IMS reboot")
+		}
+		statusCode := http.StatusOK
+		if status.Rebooting {
+			statusCode = http.StatusAccepted
+		}
+		writeJSON(w, statusCode, map[string]any{"data": cellularIMSResponse(iccid, status)})
+	default:
+		w.Header().Set("Allow", "GET, PATCH")
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+	}
+	return true
+}
+
+// restoreCellularDataAfterModemReboot rebuilds the QMI/AT data session
+// destroyed by AT+CFUN=1,1. The desired data state already lives in the
+// device/card policy; this waits for the same SIM to register before replaying
+// it. generation prevents an older reboot from overriding a newer user action.
+func (s *Server) restoreCellularDataAfterModemReboot(configID, physicalID, iccid string, generation uint64, reason string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(s.cellularDataRuntime().rootContext(), 3*time.Minute)
+		defer cancel()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		var lastErr error
+		for {
+			select {
+			case <-ctx.Done():
+				detail := "modem did not become ready before cellular data recovery timed out"
+				if lastErr != nil {
+					detail += ": " + lastErr.Error()
+				}
+				s.cellularDataRuntime().invalidateIfCurrent(configID, generation, "recovering", true, "failed", detail)
+				s.logger.Warn("restore cellular data after modem reboot timed out", "device_id", configID, "reason", reason, "error", lastErr)
+				return
+			case <-ticker.C:
+			}
+			if !s.cellularDataRuntime().isCurrent(configID, generation, "recovering") {
+				return
+			}
+			config, err := s.store.Device(ctx, configID)
+			if err != nil {
+				s.cellularDataRuntime().invalidateIfCurrent(configID, generation, "recovering", true, "failed", err.Error())
+				return
+			}
+			if !config.NetworkEnabled || config.VoWiFiEnabled {
+				s.cellularDataRuntime().invalidateIfCurrent(configID, generation, "recovering", false, "disabled", "")
+				return
+			}
+			entry, err := s.devices.Get(physicalID)
+			if err != nil || entry.Snapshot == nil || !entry.Snapshot.SIMReady ||
+				(iccid != "" && !strings.EqualFold(strings.TrimSpace(entry.Snapshot.ICCID), iccid)) ||
+				!entry.Snapshot.PSAttached {
+				lastErr = err
+				continue
+			}
+			request := s.cellularNetworkRequest(ctx, config, entry.Snapshot)
+			dataRuntime := s.cellularDataRuntime()
+			runtime, accepted := dataRuntime.requestIfCurrent(config.ID, generation, "recovering", physicalID, request)
+			if !accepted {
+				return
+			}
+			restoreCtx, cancelRestore := context.WithTimeout(ctx, 90*time.Second)
+			_, err = dataRuntime.wait(restoreCtx, config.ID, runtime.Revision)
+			cancelRestore()
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			s.logger.Info("restored cellular data after modem reboot", "device_id", configID, "interface", config.Interface, "reason", reason)
+			return
+		}
+	}()
+}
+
+func (s *Server) cellularNetworkRequest(ctx context.Context, config store.Device, snapshot *device.Snapshot) device.NetworkRequest {
+	request := device.NetworkRequest{
+		Enabled: true, APN: strings.TrimSpace(config.APN), IPVersion: "IPV4V6", Backend: config.DeviceBackend,
+	}
+	if snapshot == nil {
+		return request
+	}
+	iccid := strings.TrimSpace(snapshot.ICCID)
+	policy, err := s.store.CardPolicy(ctx, iccid)
+	if err != nil {
+		return request
+	}
+	request.APN = strings.TrimSpace(policy.APN)
+	if policy.IPVersion != "" {
+		request.IPVersion = policy.IPVersion
+	}
+	profile, err := s.store.CardAPNProfileByAPN(ctx, iccid, policy.APN, policy.IPVersion)
+	if err != nil {
+		return request
+	}
+	request.Username = profile.Username
+	request.Password = profile.Password
+	request.Authentication = profile.AuthType
+	if snapshot.RegistrationStatus == 5 && profile.RoamingIPVersion != "" {
+		request.IPVersion = profile.RoamingIPVersion
+	}
+	return request
+}
+
+func cellularIMSResponse(iccid string, status device.CellularIMSStatus) map[string]any {
+	return map[string]any{
+		"iccid": iccid, "mode": status.Mode,
+		"desired_enabled": status.Mode == device.CellularIMSModeForceEnabled,
+		"supported":       status.Supported,
+		"configured":      status.Configured, "registered": status.Registered,
+		"volte_capable": status.VoLTECapable,
+		"cs_known":      status.CSKnown, "cs_registered": status.CSRegistered,
+		"changed": status.Changed, "rebooting": status.Rebooting,
+	}
+}
+
 func (s *Server) handleCellularData(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -1278,8 +1662,24 @@ func (s *Server) handleCellularData(
 ) bool {
 	switch r.Method {
 	case http.MethodGet:
+		runtime := s.cellularDataRuntime().status(config.ID, config.NetworkEnabled)
+		if observer, ok := s.devices.(cellularNetworkStatusController); ok {
+			probeContext, cancel := context.WithTimeout(r.Context(), 4*time.Second)
+			observed, observeErr := observer.NetworkStatus(probeContext, physicalID)
+			cancel()
+			if observeErr == nil && config.NetworkEnabled && !observed.Connected && strings.TrimSpace(observed.Detail) != "" {
+				observeErr = errors.New(observed.Detail)
+			}
+			runtime = s.cellularDataRuntime().observe(config.ID, config.NetworkEnabled, observed.Connected, observeErr)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{
 			"enabled":           config.NetworkEnabled,
+			"desired_enabled":   runtime.DesiredEnabled,
+			"connected":         runtime.Connected,
+			"phase":             runtime.Phase,
+			"modem_phase":       runtime.ModemPhase,
+			"maintenance_phase": runtime.MaintenancePhase,
+			"last_error":        runtime.LastError,
 			"interface":         config.Interface,
 			"apn":               config.APN,
 			"export_proxy_only": true,
@@ -1341,25 +1741,13 @@ func (s *Server) handleCellularData(
 			Username: activeAPNProfile.Username, Password: activeAPNProfile.Password,
 			Authentication: activeAPNProfile.AuthType, Backend: config.DeviceBackend,
 		}
-		controller := http.NewResponseController(w)
-		_ = controller.SetWriteDeadline(time.Time{})
-		result, err := s.devices.SetNetwork(r.Context(), physicalID, networkRequest)
-		if err != nil {
-			s.writeDeviceError(w, err)
-			return true
-		}
-		previous := config.NetworkEnabled
+		// Persist the desired state before starting hardware reconciliation. The
+		// background worker is server-owned, so a browser disconnect cannot leave
+		// hardware changed while the stored policy still says the opposite.
+		previousConfig := config
 		config.NetworkEnabled = request.Enabled
 		config.APN = apn
-		if result.Backend != "" {
-			config.DeviceBackend = result.Backend
-		}
 		if err := s.store.UpsertDevice(r.Context(), config); err != nil {
-			rollbackContext, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			networkRequest.Enabled = previous
-			networkRequest.APN = config.APN
-			_, _ = s.devices.SetNetwork(rollbackContext, physicalID, networkRequest)
-			cancel()
 			s.writeStoreError(w, err)
 			return true
 		}
@@ -1369,16 +1757,31 @@ func (s *Server) handleCellularData(
 			}
 			activePolicy.APN = apn
 			activePolicy.IPVersion = policyIPVersion
+			activePolicy.NetworkEnabled = request.Enabled
 			if strings.TrimSpace(request.APN) != "" {
 				activePolicy.Source = "manual"
 			}
 			if err := s.store.UpsertCardPolicy(r.Context(), activePolicy); err != nil {
-				s.logger.Warn("cellular APN active but card policy could not be updated", "device_id", config.ID, "iccid", activeICCID, "error", err)
+				rollbackContext, cancelRollback := context.WithTimeout(context.Background(), 2*time.Second)
+				_ = s.store.UpsertDevice(rollbackContext, previousConfig)
+				cancelRollback()
+				s.writeStoreError(w, err)
+				return true
 			}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{
-			"enabled": result.Enabled, "interface": result.Interface,
-			"backend": result.Backend, "export_proxy_only": true,
+		if !request.Enabled {
+			// Clear the cached public exit as soon as the user accepts the
+			// disable request; the hardware stop itself is asynchronous.
+			s.clearPublicIP(config.ID)
+		}
+		runtime := s.cellularDataRuntime().requestWithIdentity(config.ID, physicalID, networkRequest, activeICCID)
+		writeJSON(w, http.StatusAccepted, map[string]any{"data": map[string]any{
+			"enabled": request.Enabled, "desired_enabled": runtime.DesiredEnabled,
+			"connected": runtime.Connected, "phase": runtime.Phase,
+			"modem_phase":       runtime.ModemPhase,
+			"maintenance_phase": runtime.MaintenancePhase,
+			"revision":          runtime.Revision, "interface": config.Interface,
+			"backend": config.DeviceBackend, "export_proxy_only": true,
 		}})
 	default:
 		w.Header().Set("Allow", "GET, PATCH, PUT")
@@ -1400,6 +1803,11 @@ func (s *Server) requirePhysicalDevice(w http.ResponseWriter, present bool) bool
 }
 
 func (s *Server) writeDeviceError(w http.ResponseWriter, err error) {
+	s.logger.Warn("hardware operation failed",
+		"category", "hardware",
+		"event", "hardware.operation_failed",
+		"raw_error", device.HardwareErrorDetail(err),
+	)
 	switch {
 	case errors.Is(err, device.ErrNotFound):
 		writeError(w, http.StatusNotFound, "device_not_found", "device was not found or is no longer present")
@@ -1441,9 +1849,6 @@ func (s *Server) writeDeviceError(w http.ResponseWriter, err error) {
 	case errors.Is(err, context.Canceled):
 		writeError(w, http.StatusRequestTimeout, "request_canceled", "the modem request was canceled")
 	default:
-		// Preserve the hardware failure reason in the operator-visible log while
-		// keeping AT payloads and long APDU material out of it.
-		s.logger.Warn("device operation failed", "error", device.HardwareErrorDetail(err))
 		writeError(w, http.StatusBadGateway, "modem_error", "the device operation failed")
 	}
 }
@@ -1526,6 +1931,11 @@ func physicalMatchesConfig(entry device.Device, config store.Device) bool {
 		// the selected AT/QMI nodes instead of rejecting a modem whose physical
 		// path spelling changed but whose control plane is unchanged.
 	}
+	if candidate.HardwareKind == pcsc.HardwareKind && config.ControlDevice != "" && candidate.ReaderName != "" {
+		if config.ControlDevice == candidate.ReaderName {
+			return true
+		}
+	}
 	// Control and serial device nodes are allocation-order dependent. They are
 	// only legacy fallbacks when no physical USB path or readable IMEI exists.
 	if config.ATPort != "" &&
@@ -1557,8 +1967,13 @@ func (s *Server) configuredDeviceSummary(
 	result["sms_enabled"] = config.SMSEnabled
 	result["network_enabled"] = config.NetworkEnabled
 	result["developer_enabled"] = s.developerActive(context.Background())
-	result["network_connected"] = config.NetworkEnabled
-	result["data_connected"] = config.NetworkEnabled
+	dataRuntime := s.cellularDataRuntime().status(config.ID, config.NetworkEnabled)
+	result["network_connected"] = dataRuntime.Connected
+	result["data_connected"] = dataRuntime.Connected
+	result["network_phase"] = dataRuntime.Phase
+	result["modem_phase"] = dataRuntime.ModemPhase
+	result["maintenance_phase"] = dataRuntime.MaintenancePhase
+	result["network_error"] = dataRuntime.LastError
 	result["vowifi_enabled"] = config.VoWiFiEnabled
 	var runtimeResponse map[string]any
 	runtimeMatchesCard := true
@@ -1645,13 +2060,14 @@ func (s *Server) configuredDeviceOverview(
 	result["esim_transport"] = config.ESIMTransport
 	result["sms_enabled"] = config.SMSEnabled
 	result["network_enabled"] = config.NetworkEnabled
+	result["public_ip_info"] = s.overviewPublicIP(config, physical)
 	result["vowifi_enabled"] = config.VoWiFiEnabled
 	result["radio_live_ok"] = present && entry.Snapshot != nil && entry.Snapshot.Responsive
 
 	// Live network state: on-demand sample of the cellular interface counters,
 	// kept warm by the 2s overview SSE cadence. Only meaningful when the modem
 	// data path is enabled and an interface is configured.
-	if config.NetworkEnabled && strings.TrimSpace(config.Interface) != "" {
+	if connected, _ := result["network_connected"].(bool); (connected || config.NetworkEnabled) && strings.TrimSpace(config.Interface) != "" {
 		live := s.netTraffic.sample(config.ID, config.Interface, time.Now())
 		result["private_ip"] = live.ipv4
 		result["traffic"] = map[string]string{
@@ -1692,7 +2108,9 @@ func (s *Server) configuredDeviceStatus(
 	result := map[string]any{
 		"healthy":               summary["healthy"],
 		"public_ip":             summary["public_ip"],
-		"network_connected":     config.NetworkEnabled,
+		"network_connected":     summary["network_connected"],
+		"network_phase":         summary["network_phase"],
+		"network_error":         summary["network_error"],
 		"modem":                 summary["modem"],
 		"vowifi":                summary["vowifi_runtime"],
 		"sim_service_table":     map[string]any{},

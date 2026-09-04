@@ -263,6 +263,59 @@ func TestEC20AdapterCSIMFallbackSupportsSuccessAndSynchronizationFailure(
 	}
 }
 
+func TestEC20AdapterDiscoversFullUSIMAIDFromEFDIRWhenCUADFails(t *testing.T) {
+	t.Parallel()
+	const fullAID = "A0000000871002FFFFFFFF8903020000"
+	record := "61184F10" + fullAID + "50045553494D"
+	encodedResponse := strings.ToUpper(hex.EncodeToString(successfulUSIMResponse()))
+	var challenge AKAChallenge
+	for index := range challenge.RAND {
+		challenge.RAND[index] = byte(index)
+		challenge.AUTN[index] = byte(0xf0 + index)
+	}
+	authAPDU := buildUSIMAuthenticateAPDU(challenge)
+	authCommand := fmt.Sprintf(
+		`AT+CSIM=%d,"%s"`,
+		len(authAPDU)*2,
+		strings.ToUpper(hex.EncodeToString(authAPDU)),
+	)
+	selectApplication := `AT+CSIM=42,"00A4040410` + fullAID + `"`
+	transcript := &ec20Transcript{
+		t: t,
+		steps: append(
+			identityTranscriptStepsWithoutEFAD("310280000000001"),
+			[]ec20TranscriptStep{
+				{command: "AT+CCID", lines: []string{"+CCID: 8944101234567890123"}},
+				{command: "AT+CUAD", err: errors.New("+CME ERROR: 13"), final: "+CME ERROR: 13"},
+				{command: `AT+CSIM=16,"00A40004023F0000"`, lines: []string{`+CSIM: 4,"9000"`}},
+				{command: `AT+CSIM=16,"00A40004022F0000"`, lines: []string{`+CSIM: 4,"9000"`}},
+				{command: `AT+CSIM=10,"00B2010400"`, lines: []string{`+CSIM: 4,"6C1A"`}},
+				{command: `AT+CSIM=10,"00B201041A"`, lines: []string{fmt.Sprintf(`+CSIM: %d,"%s9000"`, len(record)+4, record)}},
+				{command: `AT+CCHO="` + fullAID + `"`, err: errors.New("unsupported"), final: "ERROR"},
+				{command: selectApplication, lines: []string{`+CSIM: 4,"9000"`}},
+				{command: "AT+CCID", lines: []string{"+CCID: 8944101234567890123"}},
+				{command: selectApplication, lines: []string{`+CSIM: 4,"9000"`}},
+				{command: authCommand, sensitive: true, lines: []string{fmt.Sprintf(`+CSIM: %d,"%s"`, len(encodedResponse), encodedResponse)}},
+			}...,
+		),
+	}
+	adapter, err := NewEC20Adapter(transcript, EC20AdapterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := adapter.ReadIdentity(context.Background(), "ec20-1")
+	if err != nil {
+		t.Fatalf("ReadIdentity: %v", err)
+	}
+	if _, err := adapter.CheckReady(context.Background(), identity); err != nil {
+		t.Fatalf("CheckReady: %v", err)
+	}
+	if _, err := adapter.Authenticate(context.Background(), identity, challenge); err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+	transcript.assertDone()
+}
+
 func TestEC20AdapterLogicalChannelAuthenticateFollowsGetResponse(
 	t *testing.T,
 ) {

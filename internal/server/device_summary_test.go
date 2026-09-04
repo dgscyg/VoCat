@@ -40,12 +40,12 @@ func TestConfiguredDeviceSummaryIgnoresVoWiFiRuntimeFromPreviousSIM(t *testing.T
 	if err := database.UpsertVoWiFiRuntime(context.Background(), store.VoWiFiRuntime{
 		DeviceID:          "ec20_1",
 		Phase:             "stopping",
-		ICCID:             "89441000400128014257",
-		IMSI:              "234159608751160",
+		ICCID:             "8944100000000000001",
+		IMSI:              "234150000000001",
 		TunnelReady:       true,
 		IMSReady:          true,
 		SMSReady:          true,
-		LocalPhone:        "+447386083638",
+		LocalPhone:        "+447700900123",
 		PhoneNumberSource: "ims_p_associated_uri",
 		UpdatedAt:         time.Now().UTC(),
 	}); err != nil {
@@ -60,7 +60,7 @@ func TestConfiguredDeviceSummaryIgnoresVoWiFiRuntimeFromPreviousSIM(t *testing.T
 	if got["vowifi_active"] != false {
 		t.Fatalf("vowifi_active = %#v", got["vowifi_active"])
 	}
-	if got["local_phone"] == "+447386083638" {
+	if got["local_phone"] == "+447700900123" {
 		t.Fatalf("old phone leaked into current SIM summary: %#v", got)
 	}
 	runtime, ok := got["vowifi_runtime"].(map[string]any)
@@ -169,7 +169,7 @@ func TestSnapshotHasSIMDoesNotTreatUnknownStatusAsInserted(t *testing.T) {
 	}
 	for _, snapshot := range []*device.Snapshot{
 		{SIMStatus: "pin_required"},
-		{ICCID: "89441000400128014257"},
+		{ICCID: "8944100000000000001"},
 		{SIMReady: true},
 	} {
 		if !snapshotHasSIM(snapshot) {

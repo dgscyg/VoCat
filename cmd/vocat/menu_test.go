@@ -89,3 +89,31 @@ func TestMenuCredentialResetPromptsDoNotRequestCurrentPassword(t *testing.T) {
 		}
 	}
 }
+
+func TestChooseMenuServiceManager(t *testing.T) {
+	tests := []struct {
+		name             string
+		openWrt, systemd bool
+		want             menuServiceManager
+		wantErr          bool
+	}{
+		{name: "OpenWrt preferred", openWrt: true, systemd: true, want: menuServiceOpenWrt},
+		{name: "OpenWrt only", openWrt: true, want: menuServiceOpenWrt},
+		{name: "systemd only", systemd: true, want: menuServiceSystemd},
+		{name: "unsupported", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := chooseMenuServiceManager(test.openWrt, test.systemd)
+			if test.wantErr {
+				if !errors.Is(err, errNoServiceManager) {
+					t.Fatalf("error = %v, want errNoServiceManager", err)
+				}
+				return
+			}
+			if err != nil || got != test.want {
+				t.Fatalf("manager = %q, %v; want %q", got, err, test.want)
+			}
+		})
+	}
+}

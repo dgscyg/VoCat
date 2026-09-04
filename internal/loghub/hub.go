@@ -9,9 +9,9 @@ import (
 	"time"
 )
 
-// Entry is the stable, secret-neutral representation exposed by the log API.
-// Callers remain responsible for never adding credentials or keying material
-// to slog attributes.
+// Entry is the stable, centrally-redacted representation exposed by the log
+// API. The Hub sanitizes both the downstream handler and the captured entry so
+// diagnostic logs can be safely exported by users.
 type Entry struct {
 	Time    time.Time      `json:"time"`
 	Level   string         `json:"level"`
@@ -58,6 +58,7 @@ func (h *Hub) Enabled(ctx context.Context, level slog.Level) bool {
 }
 
 func (h *Hub) Handle(ctx context.Context, record slog.Record) error {
+	record = sanitizeRecord(record)
 	err := h.next.Handle(ctx, record)
 	fields := make(map[string]any)
 	for _, attr := range h.attrs {
@@ -81,6 +82,7 @@ func (h *Hub) Handle(ctx context.Context, record slog.Record) error {
 }
 
 func (h *Hub) WithAttrs(attrs []slog.Attr) slog.Handler {
+	attrs = sanitizeAttrs(attrs)
 	nextAttrs := append(append([]slog.Attr(nil), h.attrs...), attrs...)
 	return &Hub{
 		next:   h.next.WithAttrs(attrs),
@@ -178,6 +180,24 @@ func (h *Hub) Subscribe(buffer int) (<-chan Entry, func()) {
 		})
 	}
 	return channel, cancel
+}
+
+// Clear drops captured history and every entry currently queued for live and
+// persistence subscribers. Subscribers stay connected for future events.
+func (h *Hub) Clear() {
+	h.core.mu.Lock()
+	h.core.entries = h.core.entries[:0]
+	for _, subscriber := range h.core.subscribers {
+		for {
+			select {
+			case <-subscriber:
+				continue
+			default:
+			}
+			break
+		}
+	}
+	h.core.mu.Unlock()
 }
 
 func appendAttribute(fields map[string]any, groups []string, attr slog.Attr) {

@@ -295,7 +295,7 @@ func validateNotificationField(
 			}
 		}
 		if name == "proxy" && value != "" {
-			if _, err := parseOutboundURL(value, false); err != nil {
+			if _, err := parseProxyURL(value); err != nil {
 				return fmt.Errorf("%s is not a valid HTTP URL", field)
 			}
 		}
@@ -883,6 +883,8 @@ func sendEmailNotificationTest(ctx context.Context, config map[string]any) error
 	// Keep this call on one source line: CodeQL reports the interprocedural sink
 	// at the writer argument, and suppression comments bind to that exact line.
 	// codeql[go/email-injection]
+	// CodeQL [go/email-injection]
+	// lgtm[go/email-injection]
 	if err := writePlainTextMail(writer, from, recipients, "vocat notification test", "This is a vocat notification test."); err != nil {
 		_ = writer.Close()
 		return fmt.Errorf("write SMTP test message: %w", err)
@@ -925,19 +927,40 @@ func restrictedHTTPClient(
 	timeout time.Duration,
 	proxy string,
 ) (*http.Client, error) {
+	return newRestrictedHTTPClient(ctx, timeout, proxy, false)
+}
+
+func persistentRestrictedHTTPClient(
+	ctx context.Context,
+	timeout time.Duration,
+	proxy string,
+) (*http.Client, error) {
+	return newRestrictedHTTPClient(ctx, timeout, proxy, true)
+}
+
+func newRestrictedHTTPClient(
+	ctx context.Context,
+	timeout time.Duration,
+	proxy string,
+	keepAlives bool,
+) (*http.Client, error) {
 	timeout = clampNotificationTimeout(timeout)
 	transport := &http.Transport{
 		Proxy:                 nil,
 		DialContext:           restrictedDialer(timeout),
 		ForceAttemptHTTP2:     true,
-		DisableKeepAlives:     true,
-		MaxIdleConns:          0,
+		DisableKeepAlives:     !keepAlives,
+		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   timeout,
 		ResponseHeaderTimeout: timeout,
 		ExpectContinueTimeout: time.Second,
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 		},
+	}
+	if keepAlives {
+		transport.MaxIdleConns = 8
+		transport.MaxIdleConnsPerHost = 4
 	}
 	if strings.TrimSpace(proxy) != "" {
 		parsed, err := validateNotificationProxyURL(ctx, proxy)
@@ -989,12 +1012,32 @@ func validateOutboundURL(
 }
 
 func validateNotificationProxyURL(ctx context.Context, raw string) (*url.URL, error) {
-	parsed, err := parseOutboundURL(raw, false)
+	parsed, err := parseProxyURL(raw)
 	if err != nil {
 		return nil, err
 	}
 	if _, err := resolveNotificationProxyAddresses(ctx, parsed.Hostname()); err != nil {
 		return nil, err
+	}
+	return parsed, nil
+}
+
+// parseProxyURL parses an HTTP(S) proxy URL. Unlike parseOutboundURL, it
+// permits embedded userinfo (http://user:pass@host:port) because HTTP proxies
+// commonly authenticate with Proxy-Authorization derived from the URL.
+func parseProxyURL(raw string) (*url.URL, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Hostname() == "" || parsed.IsAbs() == false {
+		return nil, errors.New("proxy must be an absolute HTTP URL")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, errors.New("proxy URL must use HTTP or HTTPS")
+	}
+	if parsed.Port() != "" {
+		port, err := strconv.Atoi(parsed.Port())
+		if err != nil || port < 1 || port > 65535 {
+			return nil, errors.New("proxy URL has an invalid port")
+		}
 	}
 	return parsed, nil
 }
@@ -1230,6 +1273,10 @@ func resolveNotificationAddresses(ctx context.Context, host string, allowLocal b
 
 var notificationFakeIPNetworks = []netip.Prefix{
 	netip.MustParsePrefix("198.18.0.0/15"),
+	// Mihomo/Clash can synthesize ULA addresses alongside its RFC 2544
+	// IPv4 Fake-IP range. These addresses are consumed by the local TUN DNS
+	// interceptor and do not identify a LAN service.
+	netip.MustParsePrefix("fdfe:dcba:9876::/48"),
 }
 
 var blockedNotificationDestinationNetworks = []netip.Prefix{

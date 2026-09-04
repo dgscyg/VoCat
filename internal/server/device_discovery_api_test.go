@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,6 +17,15 @@ type discoverySnapshotController struct {
 	fakeDeviceController
 	entries       []device.Device
 	discoverCalls int
+}
+
+type addRecoveryController struct {
+	fakeDeviceController
+	flightErr error
+}
+
+func (controller *addRecoveryController) SetFlight(context.Context, string, bool) (device.FlightResult, error) {
+	return device.FlightResult{}, controller.flightErr
 }
 
 func (controller *discoverySnapshotController) Discover(context.Context) ([]device.Device, error) {
@@ -68,5 +78,52 @@ func TestDiscoveredDevicesPerformsFreshScanAndOmitsAbsentEntries(t *testing.T) {
 	}
 	if strings.Contains(body, "stale-device") || strings.Contains(body, "absent-device") {
 		t.Fatalf("response contains an absent device: %s", body)
+	}
+}
+
+func TestAddDevicePersistsConfigWhenInitialAirplaneModeIsTemporarilyUnavailable(t *testing.T) {
+	database, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	entry := device.Device{
+		ID: "usb-2c7c-0125-2-2", Discovered: true,
+		Candidate: modem.Candidate{
+			ID: "usb-2c7c-0125-2-2", VendorID: "2c7c", ProductID: "0125",
+			Product: "Quectel EC20 / EC25", USBPath: "/sys/bus/usb/devices/2-2",
+			ATPort:     modem.Port{Path: "/dev/ttyUSB2", Name: "ttyUSB2", Role: modem.PortRoleAT},
+			QMIControl: "/dev/cdc-wdm0", NetworkInterface: "wwan0",
+		},
+	}
+	controller := &addRecoveryController{
+		fakeDeviceController: fakeDeviceController{entry: entry},
+		flightErr:            errors.New("AT port is temporarily busy"),
+	}
+	server := &Server{
+		store: database, logger: regionTestLogger(),
+		maxRequestBodyBytes: 4096, devices: controller,
+	}
+	body := `{"config":{"id":"ec20","name":"EC20","device_type":"pcie_ec20_ec25","usb_path":"/sys/bus/usb/devices/2-2","at_port":"/dev/ttyUSB2","control_device":"/dev/cdc-wdm0","interface":"wwan0","device_backend":"qmi","esim_transport":"qmi"}}`
+	request := httptest.NewRequest(http.MethodPost, "/api/devices", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	if !server.handleDevices(recorder, request) {
+		t.Fatal("handleDevices returned false")
+	}
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "saved") || !strings.Contains(recorder.Body.String(), "retry") {
+		t.Fatalf("response lacks recovery warning: %s", recorder.Body.String())
+	}
+	config, err := database.Device(context.Background(), "ec20")
+	if err != nil {
+		t.Fatalf("saved device missing: %v", err)
+	}
+	if config.NetworkEnabled || !config.VoWiFiEnabled || config.USBPath != entry.Candidate.USBPath {
+		t.Fatalf("saved safe config = %+v", config)
 	}
 }

@@ -128,7 +128,7 @@ func TestMigration12ConvertsOnlyKnownActiveDeviceBindingToICCID(t *testing.T) {
 		INSERT INTO device_proxy_bindings (device_id, upstream_proxy_id, created_at, updated_at) VALUES
 			('known', 'route', 100, 100), ('unknown', 'route', 100, 100);
 		INSERT INTO vowifi_runtime (device_id, iccid, updated_at)
-			VALUES ('known', '89441000400128014257', 100);
+			VALUES ('known', '8944100000000000001', 100);
 		PRAGMA user_version = 11;
 	`); err != nil {
 		t.Fatal(err)
@@ -138,7 +138,7 @@ func TestMigration12ConvertsOnlyKnownActiveDeviceBindingToICCID(t *testing.T) {
 	}
 
 	database := openTestStore(t, path)
-	binding, err := database.DeviceProxyBinding(ctx, "89441000400128014257")
+	binding, err := database.DeviceProxyBinding(ctx, "8944100000000000001")
 	if err != nil || binding.DeviceID != "known" || binding.UpstreamProxyID != "route" {
 		t.Fatalf("migrated binding = %+v, %v", binding, err)
 	}
@@ -279,8 +279,8 @@ func TestMigration19AcceptsDevelopmentDatabaseAndPreservesCardData(t *testing.T)
 	if err := database.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 19 {
-		t.Fatalf("schema version = %d, want 19", version)
+	if version != schemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, schemaVersion)
 	}
 	for _, column := range []string{
 		"ims_apn", "ims_private_identity", "ims_public_identity", "ims_sms_center",
@@ -333,8 +333,100 @@ func TestMigration19AcceptsDevelopmentColumnsAlreadyPresent(t *testing.T) {
 	if err := database.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 19 {
-		t.Fatalf("schema version = %d, want 19", version)
+	if version != schemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, schemaVersion)
+	}
+}
+
+func TestMigration21StopsLegacyPerCardIMSManagement(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "cellular-ims-policy.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for version := 1; version <= 20; version++ {
+		for _, statement := range migrationStatements(version) {
+			if _, err := raw.ExecContext(ctx, statement); err != nil {
+				t.Fatalf("create v%d schema: %v", version, err)
+			}
+		}
+	}
+	if _, err := raw.ExecContext(ctx, `
+		INSERT INTO card_policies (
+			iccid, source, cellular_ims_enabled, cellular_ims_managed, created_at, updated_at
+		) VALUES
+			('8900000000000000020', 'default', 0, 1, 100, 100),
+			('8900000000000000021', 'manual', 1, 1, 100, 100);
+		PRAGMA user_version = 20;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	database := openTestStore(t, path)
+	policies, err := database.ListCardPolicies(ctx)
+	if err != nil || len(policies) != 2 {
+		t.Fatalf("migrated policies = %+v, %v", policies, err)
+	}
+	for _, policy := range policies {
+		if policy.CellularIMSManaged {
+			t.Fatalf("legacy IMS ownership survived migration: %+v", policy)
+		}
+	}
+}
+
+func TestMigration22RemovesOnlyAutoProvisionedVirtualPCDReaders(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "virtual-pcd.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for version := 1; version <= 21; version++ {
+		for _, statement := range migrationStatements(version) {
+			if _, err := raw.ExecContext(ctx, statement); err != nil {
+				t.Fatalf("create v%d schema: %v", version, err)
+			}
+		}
+	}
+	if _, err := raw.ExecContext(ctx, `
+		INSERT INTO devices (
+			id, name, device_type, control_device, usb_path, created_at, updated_at
+		) VALUES
+			('reader-c192ba9f35641129', 'Virtual PCD', 'usb_sim_reader',
+			 'Virtual PCD 00 00', 'pcsc:Virtual PCD 00 00', 100, 100),
+			('reader-physical', 'Physical reader', 'usb_sim_reader',
+			 'Virtual PCD 00 02', '2-1', 100, 100),
+			('manual-virtual', 'Intentional test reader', 'usb_sim_reader',
+			 'Virtual PCD 00 03', 'pcsc:Virtual PCD 00 03', 100, 100),
+			('ec20', 'EC20', 'pcie_ec20_ec25', '/dev/cdc-wdm0',
+			 '/sys/bus/usb/devices/2-2', 100, 100);
+		PRAGMA user_version = 21;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	database := openTestStore(t, path)
+	devices, err := database.ListDevices(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 3 {
+		t.Fatalf("devices after migration = %#v, want three retained devices", devices)
+	}
+	if _, err := database.Device(ctx, "reader-c192ba9f35641129"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("auto-provisioned Virtual PCD still exists: %v", err)
+	}
+	for _, id := range []string{"reader-physical", "manual-virtual", "ec20"} {
+		if _, err := database.Device(ctx, id); err != nil {
+			t.Fatalf("retained device %q missing: %v", id, err)
+		}
 	}
 }
 
@@ -565,7 +657,7 @@ func TestSMSPersistenceAndDerivedThreads(t *testing.T) {
 	if len(contacts) != 2 || contacts[0].Peer != "95533" ||
 		contacts[0].UnreadCount != 1 || contacts[1].Peer != "10086" ||
 		contacts[1].MessageCount != 2 || contacts[1].UnreadCount != 1 ||
-		contacts[1].LocalPhone != "+8613800138000" {
+		contacts[1].LocalPhone != "" {
 		t.Fatalf("unexpected derived contacts: %+v", contacts)
 	}
 	marked, err := database.MarkSMSThreadRead(ctx, "ec20-1", "46000", "10086")
@@ -579,6 +671,20 @@ func TestSMSPersistenceAndDerivedThreads(t *testing.T) {
 	if len(contacts) != 1 || contacts[0].UnreadCount != 0 {
 		t.Fatalf("thread should be read: %+v", contacts)
 	}
+
+	// A subsequent periodic modem AT sync with raw unread state must not revert is_read back to 0.
+	if _, err := database.SaveSMSMessage(ctx, SMSMessage{
+		MessageID: "network-1", DeviceID: "ec20-1", IMSI: "46000",
+		Peer: "10086", Direction: "inbound", Body: "第一条（完整）",
+		Timestamp: base, Status: "received", Read: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	contacts, err = database.ListSMSContacts(ctx, SMSFilter{Peer: "10086"})
+	if err != nil || len(contacts) != 1 || contacts[0].UnreadCount != 0 {
+		t.Fatalf("thread read state must survive modem rescan: %+v", contacts)
+	}
+
 	deleted, err := database.DeleteSMSThread(ctx, "ec20-1", "46000", "10086")
 	if err != nil || deleted != 2 {
 		t.Fatalf("DeleteSMSThread() = %d, %v", deleted, err)
@@ -789,11 +895,11 @@ func TestProxyCredentialsAndCountryRules(t *testing.T) {
 		t.Fatalf("CountryRule() = %+v, %v", rule, err)
 	}
 	if err := database.UpsertDeviceProxyBinding(ctx, DeviceProxyBinding{
-		DeviceID: "ec20-1", ICCID: "89441000400128014257", ProfileName: "Vodafone", UpstreamProxyID: "up-1",
+		DeviceID: "ec20-1", ICCID: "8944100000000000001", ProfileName: "Vodafone", UpstreamProxyID: "up-1",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	binding, err := database.DeviceProxyBinding(ctx, "89441000400128014257")
+	binding, err := database.DeviceProxyBinding(ctx, "8944100000000000001")
 	if err != nil || binding.UpstreamProxyID != "up-1" || binding.DeviceID != "ec20-1" || binding.ProfileName != "Vodafone" {
 		t.Fatalf("DeviceProxyBinding() = %+v, %v", binding, err)
 	}
@@ -803,7 +909,7 @@ func TestProxyCredentialsAndCountryRules(t *testing.T) {
 	if _, err := database.CountryRule(ctx, "CN"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("country rule should cascade with upstream deletion, got %v", err)
 	}
-	if _, err := database.DeviceProxyBinding(ctx, "89441000400128014257"); !errors.Is(err, ErrNotFound) {
+	if _, err := database.DeviceProxyBinding(ctx, "8944100000000000001"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("device binding should cascade with upstream deletion, got %v", err)
 	}
 }
@@ -1002,6 +1108,15 @@ func TestEventsPoliciesAndTraffic(t *testing.T) {
 	logs, err := database.ListLogEvents(ctx, LogFilter{Level: "info"})
 	if err != nil || len(logs) != 1 || logs[0].Message != "ready" {
 		t.Fatalf("log filter result = %+v, %v", logs, err)
+	}
+	if _, err := database.AppendLogEvent(ctx, LogEvent{
+		Time: recent, Level: "info", Message: " HTTP REQUEST ",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	logs, err = database.ListLogEvents(ctx, LogFilter{Level: "info", ExcludeMessage: "http request"})
+	if err != nil || len(logs) != 1 || logs[0].Message != "ready" {
+		t.Fatalf("excluded log filter result = %+v, %v", logs, err)
 	}
 	auditDeleted, logDeleted, err := database.PruneEvents(
 		ctx,

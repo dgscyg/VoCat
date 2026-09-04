@@ -187,36 +187,64 @@ func (provider *Provider) start(ctx context.Context, request vowifi.TunnelReques
 		{Type: payloadNonce, Body: initiatorNonce},
 		makeNotify(notifyNATSource, sourceHash),
 		makeNotify(notifyNATDestination, destinationHash),
+		makeNotify(notifyFragmentationSupported, nil),
 	}
-	first, initBody, err := marshalPayloadChain(initPayloads)
-	if err != nil {
-		return nil, err
+	var (
+		initRequest          []byte
+		initResponse         []byte
+		responseHeader       ikeHeader
+		initResponsePayloads []payload
+		cookie               []byte
+	)
+	for attempt := 0; attempt < maxIKEInitCookieChallenges; attempt++ {
+		requestPayloads := append([]payload(nil), initPayloads...)
+		if len(cookie) > 0 {
+			requestPayloads = append([]payload{makeNotify(notifyCookie, cookie)}, requestPayloads...)
+		}
+		first, initBody, err := marshalPayloadChain(requestPayloads)
+		if err != nil {
+			return nil, err
+		}
+		initRequest = ikeHeader{
+			InitiatorSPI: initiatorSPI,
+			NextPayload:  first,
+			Exchange:     exchangeIKEInit,
+			Flags:        flagInitiator,
+			MessageID:    0,
+		}.marshal(initBody)
+		initResponse, err = transport.RoundTrip(ctx, initRequest)
+		if err != nil {
+			return nil, err
+		}
+		var responseBody []byte
+		responseHeader, responseBody, err = validateResponse(initResponse, initiatorSPI, [8]byte{}, exchangeIKEInit, 0)
+		if err != nil {
+			return nil, err
+		}
+		initResponsePayloads, err = parsePayloadChain(responseHeader.NextPayload, responseBody)
+		if err != nil {
+			return nil, err
+		}
+		if err := rejectFatalNotifications(initResponsePayloads); err != nil {
+			return nil, err
+		}
+		challenge, hasCookie, err := ikeInitCookie(initResponsePayloads)
+		if err != nil {
+			return nil, err
+		}
+		if hasCookie {
+			if attempt+1 == maxIKEInitCookieChallenges {
+				return nil, errors.New("ike: ePDG requested too many COOKIE challenges")
+			}
+			cookie = challenge
+			continue
+		}
+		if responseHeader.ResponderSPI == [8]byte{} {
+			return nil, errors.New("ike: responder returned a zero SPI")
+		}
+		break
 	}
-	initRequest := ikeHeader{
-		InitiatorSPI: initiatorSPI,
-		NextPayload:  first,
-		Exchange:     exchangeIKEInit,
-		Flags:        flagInitiator,
-		MessageID:    0,
-	}.marshal(initBody)
-	initResponse, err := transport.RoundTrip(ctx, initRequest)
-	if err != nil {
-		return nil, err
-	}
-	responseHeader, responseBody, err := validateResponse(initResponse, initiatorSPI, [8]byte{}, exchangeIKEInit, 0)
-	if err != nil {
-		return nil, err
-	}
-	if responseHeader.ResponderSPI == [8]byte{} {
-		return nil, errors.New("ike: responder returned a zero SPI")
-	}
-	initResponsePayloads, err := parsePayloadChain(responseHeader.NextPayload, responseBody)
-	if err != nil {
-		return nil, err
-	}
-	if err := rejectFatalNotifications(initResponsePayloads); err != nil {
-		return nil, err
-	}
+	peerSupportsFragmentation := hasNotifyType(initResponsePayloads, notifyFragmentationSupported)
 	saPayload, err := onePayload(initResponsePayloads, payloadSA)
 	if err != nil {
 		return nil, err
@@ -319,21 +347,19 @@ func (provider *Provider) start(ctx context.Context, request vowifi.TunnelReques
 		Flags:        flagInitiator,
 		MessageID:    1,
 	}
-	authRequest, err := encryptPayloads(authHeader, firstAuthPayloads, ikeSuite, keys.SKei, keys.SKai, provider.config.Random)
-	if err != nil {
-		return nil, err
-	}
-	authResponse, err := transport.RoundTrip(ctx, authRequest)
-	if err != nil {
-		return nil, err
-	}
-	authResponseHeader, authResponsePayloads, err := decryptAndValidate(
-		authResponse, initiatorSPI, responseHeader.ResponderSPI, exchangeIKEAuth, 1, ikeSuite, keys,
+	_, authResponsePayloads, err := sendAndReceiveIKEPayloads(
+		ctx,
+		transport,
+		authHeader,
+		firstAuthPayloads,
+		ikeSuite,
+		keys,
+		peerSupportsFragmentation,
+		provider.config.Random,
 	)
 	if err != nil {
 		return nil, err
 	}
-	_ = authResponseHeader
 	serverName := strings.TrimSpace(provider.config.ServerName)
 	if serverName == "" {
 		serverName = epdg
@@ -383,27 +409,27 @@ func (provider *Provider) start(ctx context.Context, request vowifi.TunnelReques
 				requestPayloads = append(requestPayloads, deviceIdentity)
 			}
 		}
-		eapRequest, err := encryptPayloads(ikeHeader{
+		eapHeader := ikeHeader{
 			InitiatorSPI: initiatorSPI,
 			ResponderSPI: responseHeader.ResponderSPI,
 			Exchange:     exchangeIKEAuth,
 			Flags:        flagInitiator,
 			MessageID:    messageID,
-		}, requestPayloads, ikeSuite, keys.SKei, keys.SKai, provider.config.Random)
-		if err != nil {
-			return nil, err
 		}
 		if requested, notifyErr := deviceIdentityRequested(currentPayloads); notifyErr != nil {
 			return nil, notifyErr
 		} else if requested {
 			deviceIdentityPending = true
 		}
-		eapResponse, err := transport.RoundTrip(ctx, eapRequest)
-		if err != nil {
-			return nil, err
-		}
-		_, currentPayloads, err = decryptAndValidate(
-			eapResponse, initiatorSPI, responseHeader.ResponderSPI, exchangeIKEAuth, messageID, ikeSuite, keys,
+		_, currentPayloads, err = sendAndReceiveIKEPayloads(
+			ctx,
+			transport,
+			eapHeader,
+			requestPayloads,
+			ikeSuite,
+			keys,
+			peerSupportsFragmentation,
+			provider.config.Random,
 		)
 		if err != nil {
 			return nil, err
@@ -428,22 +454,22 @@ func (provider *Provider) start(ctx context.Context, request vowifi.TunnelReques
 	}
 	messageID++
 	cleanupMessageID = messageID + 1
-	finalRequest, err := encryptPayloads(ikeHeader{
+	finalHeader := ikeHeader{
 		InitiatorSPI: initiatorSPI,
 		ResponderSPI: responseHeader.ResponderSPI,
 		Exchange:     exchangeIKEAuth,
 		Flags:        flagInitiator,
 		MessageID:    messageID,
-	}, []payload{initiatorAUTH}, ikeSuite, keys.SKei, keys.SKai, provider.config.Random)
-	if err != nil {
-		return nil, err
 	}
-	finalResponse, err := transport.RoundTrip(ctx, finalRequest)
-	if err != nil {
-		return nil, err
-	}
-	_, finalPayloads, err := decryptAndValidate(
-		finalResponse, initiatorSPI, responseHeader.ResponderSPI, exchangeIKEAuth, messageID, ikeSuite, keys,
+	_, finalPayloads, err := sendAndReceiveIKEPayloads(
+		ctx,
+		transport,
+		finalHeader,
+		[]payload{initiatorAUTH},
+		ikeSuite,
+		keys,
+		peerSupportsFragmentation,
+		provider.config.Random,
 	)
 	if err != nil {
 		return nil, err
@@ -616,6 +642,29 @@ func (provider *Provider) start(ctx context.Context, request vowifi.TunnelReques
 	return session, nil
 }
 
+const maxIKEInitCookieChallenges = 2
+
+func ikeInitCookie(payloads []payload) ([]byte, bool, error) {
+	var cookie []byte
+	for _, item := range payloadsOfType(payloads, payloadNotify) {
+		kind, data, err := parseNotify(item)
+		if err != nil {
+			return nil, false, err
+		}
+		if kind != notifyCookie {
+			continue
+		}
+		if len(data) == 0 {
+			return nil, false, errors.New("ike: ePDG returned an empty COOKIE")
+		}
+		if cookie != nil {
+			return nil, false, errors.New("ike: ePDG returned multiple COOKIE notifications")
+		}
+		cookie = append([]byte(nil), data...)
+	}
+	return cookie, cookie != nil, nil
+}
+
 func buildInitialEAPAuth(
 	idi payload,
 	requestedIDr payload,
@@ -714,7 +763,7 @@ func decryptAndValidate(
 	suite negotiatedSuite,
 	keys ikeKeys,
 ) (ikeHeader, []payload, error) {
-	header, payloads, err := decryptPayloads(packet, suite, keys.SKer, keys.SKar)
+	header, payloads, err := decryptPayloadsAny(packet, nil, suite, keys.SKer, keys.SKar)
 	if err != nil {
 		return ikeHeader{}, nil, err
 	}
@@ -727,6 +776,77 @@ func decryptAndValidate(
 		return ikeHeader{}, nil, fmt.Errorf("%w: encrypted response header does not match the request", errUnexpectedPacket)
 	}
 	return header, payloads, nil
+}
+
+func decryptAndValidateFragments(
+	packets [][]byte,
+	initiatorSPI [8]byte,
+	responderSPI [8]byte,
+	exchange uint8,
+	messageID uint32,
+	suite negotiatedSuite,
+	keys ikeKeys,
+) (ikeHeader, []payload, error) {
+	if len(packets) == 0 {
+		return ikeHeader{}, nil, errors.New("ike: empty exchange response")
+	}
+	if len(packets) == 1 {
+		return decryptAndValidate(packets[0], initiatorSPI, responderSPI, exchange, messageID, suite, keys)
+	}
+	header, payloads, err := decryptPayloadsAny(nil, packets, suite, keys.SKer, keys.SKar)
+	if err != nil {
+		return ikeHeader{}, nil, err
+	}
+	if header.InitiatorSPI != initiatorSPI ||
+		header.ResponderSPI != responderSPI ||
+		header.Exchange != exchange ||
+		header.MessageID != messageID ||
+		header.Flags&flagResponse == 0 ||
+		header.Flags&flagInitiator != 0 {
+		return ikeHeader{}, nil, fmt.Errorf("%w: encrypted response header does not match the request", errUnexpectedPacket)
+	}
+	return header, payloads, nil
+}
+
+func sendAndReceiveIKEPayloads(
+	ctx context.Context,
+	transport datagramTransport,
+	header ikeHeader,
+	payloads []payload,
+	suite negotiatedSuite,
+	keys ikeKeys,
+	peerSupportsFragmentation bool,
+	random io.Reader,
+) (ikeHeader, []payload, error) {
+	var outboundPackets [][]byte
+	var err error
+	if peerSupportsFragmentation {
+		outboundPackets, err = encryptPayloadsFragmented(header, payloads, suite, keys.SKei, keys.SKai, defaultIKEFragmentSize, random)
+	} else {
+		pkt, encryptErr := encryptPayloads(header, payloads, suite, keys.SKei, keys.SKai, random)
+		if encryptErr != nil {
+			return ikeHeader{}, nil, encryptErr
+		}
+		outboundPackets = [][]byte{pkt}
+	}
+	if err != nil {
+		return ikeHeader{}, nil, err
+	}
+	inboundPackets, err := transport.RoundTripExchange(ctx, outboundPackets)
+	if err != nil {
+		return ikeHeader{}, nil, err
+	}
+	return decryptAndValidateFragments(inboundPackets, header.InitiatorSPI, header.ResponderSPI, header.Exchange, header.MessageID, suite, keys)
+}
+
+func hasNotifyType(payloads []payload, notifyType uint16) bool {
+	for _, item := range payloadsOfType(payloads, payloadNotify) {
+		kind, _, err := parseNotify(item)
+		if err == nil && kind == notifyType {
+			return true
+		}
+	}
+	return false
 }
 
 var errNoProposalChosen = errors.New("ike: responder reported NO_PROPOSAL_CHOSEN")

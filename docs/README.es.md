@@ -187,6 +187,11 @@ dispositivos o de conexión en caliente.
 
 La imagen GHCR se publica para `linux/amd64` y `linux/arm64`.
 
+> [!TIP]
+> **Nota sobre el despliegue en NAS / QNAP Container Station**:
+> En sistemas NAS como QNAP QTS / QuTS hero (Container Station), las cuentas de administrador personalizadas y el aislamiento de volúmenes pueden hacer que los volúmenes con nombre de Docker (ej. `-v vocat-data:/opt/vocat/data`) se resuelvan en rutas aisladas distintas entre la inicialización `bootstrap-admin` y el contenedor del servicio principal, provocando errores de contraseña incorrecta al iniciar sesión en la interfaz web.
+> En entornos NAS, se recomienda encarecidamente sustituir los volúmenes con nombre por un montaje bind con ruta absoluta del host (ej. `-v /share/Container/vocat/data:/opt/vocat/data` en QNAP) tanto para la inicialización como para la ejecución, garantizando la persistencia coherente de la base de datos SQLite.
+
 ## Configuración
 
 Vocat lee un archivo de configuración JSON opcional desde `VOCAT_CONFIG` y luego aplica las variables de entorno `VOCAT_*`. Las variables de entorno tienen prioridad.

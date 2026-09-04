@@ -13,7 +13,7 @@ import (
 	"vocat/internal/vowifi"
 )
 
-const testProfileICCID = "89441000400128014257"
+const testProfileICCID = "8944100000000000001"
 
 func newProfileBindingTestServer(t *testing.T) (*Server, *store.Store, *fakeVoWiFiController) {
 	t.Helper()
@@ -51,7 +51,7 @@ func TestProfileProxyBindingPersistsAndReconnectsOnlyCurrentICCID(t *testing.T) 
 	response := profileBindingRequest(t, server, http.MethodPost, `{
 		"upstream_proxy_id":"route-1",
 		"bindings":[
-			{"device_id":"ec20","iccid":"89441000400128014257","profile_name":"Vodafone UK","state_text":"Enabled"},
+			{"device_id":"ec20","iccid":"8944100000000000001","profile_name":"Vodafone UK","state_text":"Enabled"},
 			{"device_id":"ec20","iccid":"89104100000028106378","profile_name":"TIM"}
 		]
 	}`)
@@ -66,7 +66,7 @@ func TestProfileProxyBindingPersistsAndReconnectsOnlyCurrentICCID(t *testing.T) 
 		t.Fatalf("reconnects = %d, want only the current ICCID to reconnect", controller.reconnects)
 	}
 
-	response = profileBindingRequest(t, server, http.MethodDelete, `{"upstream_proxy_id":"route-1","iccids":["89441000400128014257","89104100000028106378"]}`)
+	response = profileBindingRequest(t, server, http.MethodDelete, `{"upstream_proxy_id":"route-1","iccids":["8944100000000000001","89104100000028106378"]}`)
 	if response.Code != http.StatusOK {
 		t.Fatalf("DELETE status = %d, body = %s", response.Code, response.Body.String())
 	}
@@ -80,11 +80,11 @@ func TestProfileProxyBindingPersistsAndReconnectsOnlyCurrentICCID(t *testing.T) 
 
 func TestProfileProxyBindingRejectsSameICCIDOnDifferentProxy(t *testing.T) {
 	server, database, _ := newProfileBindingTestServer(t)
-	first := profileBindingRequest(t, server, http.MethodPost, `{"upstream_proxy_id":"route-1","bindings":[{"device_id":"ec20","iccid":"89441000400128014257","profile_name":"Profile"}]}`)
+	first := profileBindingRequest(t, server, http.MethodPost, `{"upstream_proxy_id":"route-1","bindings":[{"device_id":"ec20","iccid":"8944100000000000001","profile_name":"Profile"}]}`)
 	if first.Code != http.StatusOK {
 		t.Fatalf("initial bind status = %d, body = %s", first.Code, first.Body.String())
 	}
-	second := profileBindingRequest(t, server, http.MethodPost, `{"upstream_proxy_id":"route-2","bindings":[{"device_id":"ec20","iccid":"89441000400128014257","profile_name":"Profile"}]}`)
+	second := profileBindingRequest(t, server, http.MethodPost, `{"upstream_proxy_id":"route-2","bindings":[{"device_id":"ec20","iccid":"8944100000000000001","profile_name":"Profile"}]}`)
 	if second.Code != http.StatusConflict {
 		t.Fatalf("rebind status = %d, want 409, body = %s", second.Code, second.Body.String())
 	}

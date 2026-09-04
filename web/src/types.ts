@@ -93,6 +93,15 @@ export interface ModemSummary {
   phoneNumberSource?: string;
 }
 
+export interface PublicIPInfo {
+  detected?: boolean;
+  ip: string;
+  countryCode: string;
+  region?: string;
+  city?: string;
+  organization?: string;
+}
+
 export interface DeviceListItem {
   id: string;
   name: string;
@@ -117,6 +126,10 @@ export interface DeviceListItem {
   vowifiRuntime: VoWiFiRuntime;
   modem: ModemSummary;
   networkConnected: boolean;
+	  networkPhase?: "unknown" | "starting" | "connected" | "stopping" | "recovering" | "disabled" | "failed";
+	  networkError?: string;
+	  modemPhase?: "rebooting" | "";
+	  publicIpInfo?: PublicIPInfo;
   registrationStateLabel: "registered" | "searching" | "denied" | "unknown";
   flightMode?: boolean;
 }
@@ -282,6 +295,7 @@ export interface SMSContact {
   deviceId: string;
   deviceName?: string;
   modemImei?: string;
+  iccid?: string;
   imsi: string;
   localPhone?: string;
   peer: string;
@@ -301,6 +315,7 @@ export interface SMSMessage {
   messageId?: string;
   deviceId: string;
   modemImei?: string;
+  iccid?: string;
   imsi: string;
   peer: string;
   direction: "inbound" | "outbound" | "received" | "sent";
@@ -432,12 +447,13 @@ export interface SecuritySettings {
   clientAllowed: boolean;
 }
 
-// 运行日志保留策略：默认不限制，可按条数或天数限制。
+// 运行日志保留策略：全局硬上限 10000 条，可配置更严格的条数或天数限制。
 export interface LoggingSettings {
   mode: "unlimited" | "count" | "days";
   count: number;
   days: number;
   storedLogs: number;
+  maxLogs: number;
 }
 
 export interface SystemInfo {

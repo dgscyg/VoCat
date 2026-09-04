@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -44,9 +45,107 @@ func (backend *nativeBackend) dial(ctx context.Context) (*pcscdClient, error) {
 	return nil, fmt.Errorf("%w: pcscd socket is not reachable: %w", ErrUnavailable, errors.Join(failures...))
 }
 
+func ensurePCSCDService(ctx context.Context) {
+	if os.Geteuid() != 0 {
+		return
+	}
+	if _, err := os.Stat("/run/systemd/system"); err == nil {
+		_ = exec.CommandContext(ctx, "systemctl", "start", "pcscd.socket").Run()
+		_ = exec.CommandContext(ctx, "systemctl", "start", "pcscd").Run()
+	} else if _, err := os.Stat("/etc/init.d/pcscd"); err == nil {
+		_ = exec.CommandContext(ctx, "/etc/init.d/pcscd", "start").Run()
+	} else if path, err := exec.LookPath("pcscd"); err == nil {
+		_ = exec.CommandContext(ctx, path).Start()
+	}
+}
+
+func reauthorizeUSBDevice(sysRoot, usbPath string) {
+	if strings.Contains(usbPath, "..") || strings.Contains(usbPath, "/") || strings.Contains(usbPath, "\\") {
+		return
+	}
+	authPath := filepath.Join(filepath.Clean(sysRoot), "bus", "usb", "devices", usbPath, "authorized")
+	if _, err := os.Stat(authPath); err != nil {
+		return
+	}
+	_ = os.WriteFile(authPath, []byte("0\n"), 0o644)
+	time.Sleep(100 * time.Millisecond)
+	_ = os.WriteFile(authPath, []byte("1\n"), 0o644)
+}
+
+func (backend *nativeBackend) waitForPCSCReaders(ctx context.Context, client *pcscdClient, physical []Reader, states []pcscdReaderState) []pcscdReaderState {
+	// First pass: wait up to 2 seconds for active driver negotiation.
+	pollDeadline := time.Now().Add(2 * time.Second)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(pollDeadline) {
+		pollDeadline = dl
+	}
+	for len(states) < len(physical) && time.Now().Before(pollDeadline) {
+		select {
+		case <-ctx.Done():
+			return states
+		case <-time.After(250 * time.Millisecond):
+		}
+		if updated, err := client.readers(ctx); err == nil {
+			states = updated
+			if len(states) >= len(physical) {
+				return states
+			}
+		}
+	}
+	if len(states) >= len(physical) {
+		return states
+	}
+
+	// Second pass: if readers are still missing from pcscd, trigger a USB re-authorization
+	// on the physical devices in sysfs to reset any stalled CCID endpoints, then poll briefly.
+	reauthorized := false
+	for _, phys := range physical {
+		if phys.USBPath != "" {
+			reauthorizeUSBDevice(backend.sysRoot, phys.USBPath)
+			reauthorized = true
+		}
+	}
+	if !reauthorized {
+		return states
+	}
+
+	retryDeadline := time.Now().Add(2 * time.Second)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(retryDeadline) {
+		retryDeadline = dl
+	}
+	for len(states) < len(physical) && time.Now().Before(retryDeadline) {
+		select {
+		case <-ctx.Done():
+			return states
+		case <-time.After(300 * time.Millisecond):
+		}
+		if updated, err := client.readers(ctx); err == nil {
+			states = updated
+			if len(states) >= len(physical) {
+				return states
+			}
+		}
+	}
+	return states
+}
+
 func (backend *nativeBackend) Readers(ctx context.Context) ([]Reader, error) {
 	physical := discoverUSBSmartCardReaders(backend.sysRoot, "pcsc_driver_missing")
 	client, err := backend.dial(ctx)
+	if err != nil && len(physical) > 0 {
+		ensurePCSCDService(ctx)
+		dialDeadline := time.Now().Add(1500 * time.Millisecond)
+		for time.Now().Before(dialDeadline) {
+			select {
+			case <-ctx.Done():
+				break
+			case <-time.After(200 * time.Millisecond):
+			}
+			if c, dialErr := backend.dial(ctx); dialErr == nil {
+				client, err = c, nil
+				break
+			}
+		}
+	}
 	if err != nil {
 		if len(physical) > 0 {
 			for index := range physical {
@@ -60,6 +159,9 @@ func (backend *nativeBackend) Readers(ctx context.Context) ([]Reader, error) {
 	states, err := client.readers(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if len(physical) > 0 && len(states) < len(physical) {
+		states = backend.waitForPCSCReaders(ctx, client, physical, states)
 	}
 	readers := make([]Reader, 0, len(states))
 	for _, state := range states {
@@ -82,7 +184,7 @@ func (backend *nativeBackend) Readers(ctx context.Context) ([]Reader, error) {
 		}
 		readers = append(readers, reader)
 	}
-	return mergePCSCAndUSBReaders(readers, physical), nil
+	return filterVirtualPCDReaders(mergePCSCAndUSBReaders(readers, physical)), nil
 }
 
 func (backend *nativeBackend) readerUSBPath(ctx context.Context, client *pcscdClient, name string) (string, bool) {
@@ -175,11 +277,7 @@ func (card *nativeCard) TransmitRaw(ctx context.Context, command []byte) ([]byte
 	if err != nil {
 		return nil, 0, err
 	}
-	if len(response) < 2 {
-		return nil, 0, errors.New("pcsc: APDU response omitted its status word")
-	}
-	last := len(response) - 2
-	return append([]byte(nil), response[:last]...), uint16(response[last])<<8 | uint16(response[last+1]), nil
+	return splitAPDUResponse(response)
 }
 
 func (card *nativeCard) transmit(ctx context.Context, command []byte, depth int) ([]byte, uint16, error) {

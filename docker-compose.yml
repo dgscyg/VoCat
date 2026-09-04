@@ -53,6 +53,9 @@ services:
 
     volumes:
       # SQLite database + persistent state.
+      # Note for NAS (e.g. QNAP Container Station / Synology): replace named volume
+      # with a host absolute path (e.g. /share/Container/vocat/data:/opt/vocat/data)
+      # to avoid volume isolation issues between bootstrap-admin and runtime.
       - vocat-data:/opt/vocat/data
       # Required for modem, MHI/WWAN and PC/SC USB-reader discovery, including
       # devices added after the container starts. /sys must be writable so

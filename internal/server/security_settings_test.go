@@ -199,6 +199,16 @@ func TestHandleLoggingSettingsRoundTripAndEnforceCount(t *testing.T) {
 	}
 }
 
+func TestLoggingCountIsClampedToHardLimit(t *testing.T) {
+	config, err := parseLoggingConfig(loggingConfig{Mode: "count", Count: store.MaxLogEvents + 500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Count != store.MaxLogEvents {
+		t.Fatalf("count = %d, want %d", config.Count, store.MaxLogEvents)
+	}
+}
+
 func TestLoginLockoutViaHTTP(t *testing.T) {
 	app := newTestApplication(t)
 	for i := 0; i < 4; i++ {

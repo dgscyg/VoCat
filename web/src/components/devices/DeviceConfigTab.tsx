@@ -1,7 +1,8 @@
 import { useEffect, type ReactNode } from "react";
 import { SettingsRegular, DeleteRegular, SaveRegular } from "@fluentui/react-icons";
 import { Button, Input, Select } from "../ui";
-import { isQmiControl } from "./shared";
+import { isDeviceOnline, isQmiControl } from "./shared";
+import { CellularIMSConfigCard } from "./CellularIMSConfigCard";
 import type { DeviceConfig } from "../../types";
 import type { DeviceDetail } from "./types";
 import { useI18n } from "../../lib/i18n";
@@ -35,6 +36,8 @@ export function DeviceConfigTab({ editConfig, deviceStatus, saving, deleting, on
   const isQmi = isQmiControl(controlDevice);
   const isMbim = String(editConfig?.deviceBackend || "").toLowerCase() === "mbim";
 	const isReader = editConfig?.deviceType === "usb_sim_reader";
+	const supportsCellularIMS = !isReader && editConfig?.deviceType !== "wifi_410";
+	const deviceOnline = deviceStatus ? isDeviceOnline(deviceStatus) : false;
 
   useEffect(() => {
     if (isQmi && editConfig && editConfig.deviceBackend !== "qmi") onEditConfig({ ...editConfig, deviceBackend: "qmi" });
@@ -132,6 +135,11 @@ export function DeviceConfigTab({ editConfig, deviceStatus, saving, deleting, on
               />
             </div>
           </div>
+          {supportsCellularIMS ? (
+            <div className="lg:col-span-2">
+              <CellularIMSConfigCard deviceId={editConfig.id} deviceOnline={deviceOnline} />
+            </div>
+          ) : null}
         </div>
       ) : null}
     </div>

@@ -9,6 +9,10 @@ import (
 	"time"
 )
 
+// MaxLogEvents is the hard storage ceiling. Every new row beyond this limit
+// replaces the oldest row regardless of the optional, stricter retention rule.
+const MaxLogEvents = 10000
+
 func (s *Store) AppendAuditEvent(ctx context.Context, value AuditEvent) (AuditEvent, error) {
 	value.Action = strings.TrimSpace(value.Action)
 	if value.Action == "" {
@@ -123,6 +127,8 @@ func auditEvent(row rowScanner) (AuditEvent, error) {
 }
 
 func (s *Store) AppendLogEvent(ctx context.Context, value LogEvent) (LogEvent, error) {
+	s.logMu.Lock()
+	defer s.logMu.Unlock()
 	value.Level = strings.ToLower(strings.TrimSpace(value.Level))
 	if value.Level == "" {
 		return LogEvent{}, errors.New("log level is required")
@@ -137,7 +143,18 @@ func (s *Store) AppendLogEvent(ctx context.Context, value LogEvent) (LogEvent, e
 	if value.Time.IsZero() {
 		value.Time = time.Now().UTC()
 	}
-	result, err := s.db.ExecContext(ctx, `
+	value.Fields = fields
+	if !s.logClearedAt.IsZero() && !value.Time.After(s.logClearedAt) {
+		// The entry was queued before a user cleared the log. Silently discard it
+		// so an in-flight persistence worker cannot resurrect cleared history.
+		return value, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return LogEvent{}, fmt.Errorf("begin log append: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		INSERT INTO log_events (event_time, level, message, caller, fields_json)
 		VALUES (?, ?, ?, ?, ?)
 	`, value.Time.Unix(), value.Level, value.Message, value.Caller, string(fields))
@@ -148,7 +165,17 @@ func (s *Store) AppendLogEvent(ctx context.Context, value LogEvent) (LogEvent, e
 	if err != nil {
 		return LogEvent{}, fmt.Errorf("read log event id: %w", err)
 	}
-	value.Fields = fields
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM log_events
+		WHERE id <= COALESCE((
+			SELECT id FROM log_events ORDER BY id DESC LIMIT 1 OFFSET ?
+		), 0)
+	`, MaxLogEvents); err != nil {
+		return LogEvent{}, fmt.Errorf("enforce log event limit: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return LogEvent{}, fmt.Errorf("commit log append: %w", err)
+	}
 	return value, nil
 }
 
@@ -158,6 +185,10 @@ func (s *Store) ListLogEvents(ctx context.Context, filter LogFilter) ([]LogEvent
 	if filter.Level != "" {
 		clauses = append(clauses, `level = ?`)
 		args = append(args, strings.ToLower(filter.Level))
+	}
+	if filter.ExcludeMessage != "" {
+		clauses = append(clauses, `LOWER(TRIM(message)) <> ?`)
+		args = append(args, strings.ToLower(strings.TrimSpace(filter.ExcludeMessage)))
 	}
 	if !filter.Since.IsZero() {
 		clauses = append(clauses, `event_time >= ?`)
@@ -234,6 +265,29 @@ func (s *Store) CountLogEvents(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("count log events: %w", err)
 	}
 	return count, nil
+}
+
+// ClearLogEvents permanently removes all persisted logs. Entries timestamped
+// at or before clearedAt are also rejected if they were already queued by the
+// asynchronous persistence worker.
+func (s *Store) ClearLogEvents(ctx context.Context, clearedAt time.Time) (int64, error) {
+	s.logMu.Lock()
+	defer s.logMu.Unlock()
+	if clearedAt.IsZero() {
+		clearedAt = time.Now().UTC()
+	}
+	result, err := s.db.ExecContext(ctx, `DELETE FROM log_events`)
+	if err != nil {
+		return 0, fmt.Errorf("clear log events: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read cleared log count: %w", err)
+	}
+	if clearedAt.After(s.logClearedAt) {
+		s.logClearedAt = clearedAt
+	}
+	return affected, nil
 }
 
 // PruneLogEventsToCount keeps only the newest `keep` log rows, deleting the

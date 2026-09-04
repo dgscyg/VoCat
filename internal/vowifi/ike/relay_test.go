@@ -3,6 +3,7 @@ package ike
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -48,6 +49,16 @@ func (transport *fakeSessionTransport) RemoteAddr() *net.UDPAddr {
 func (*fakeSessionTransport) Float(context.Context) error { return nil }
 func (*fakeSessionTransport) RoundTrip(context.Context, []byte) ([]byte, error) {
 	return nil, context.DeadlineExceeded
+}
+func (t *fakeSessionTransport) RoundTripExchange(ctx context.Context, packets [][]byte) ([][]byte, error) {
+	if len(packets) == 0 {
+		return nil, errors.New("empty outbound packets")
+	}
+	resp, err := t.RoundTrip(ctx, packets[0])
+	if err != nil {
+		return nil, err
+	}
+	return [][]byte{resp}, nil
 }
 func (transport *fakeSessionTransport) SendESP(ctx context.Context, packet []byte) error {
 	return transport.SendSessionPacket(ctx, packet, false)

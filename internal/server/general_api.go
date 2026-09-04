@@ -152,7 +152,24 @@ func (s *Server) writeUIPreferences(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogHistory(w http.ResponseWriter, r *http.Request) {
-	if !requireMethod(w, r, http.MethodGet) {
+	if r.Method == http.MethodDelete {
+		clearedAt := time.Now().UTC()
+		if s.logs != nil {
+			s.logs.Clear()
+		}
+		deleted, err := s.store.ClearLogEvents(r.Context(), clearedAt)
+		if err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"data": map[string]any{"cleared": true, "deleted": deleted},
+		})
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET, DELETE")
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
 	limit, err := strconv.Atoi(r.URL.Query().Get("lines"))
@@ -170,7 +187,9 @@ func (s *Server) handleLogHistory(w http.ResponseWriter, r *http.Request) {
 	// backs the live stream).
 	entries := []loghub.Entry{}
 	if s.store != nil {
-		events, err := s.store.ListLogEvents(r.Context(), store.LogFilter{Limit: limit})
+		events, err := s.store.ListLogEvents(r.Context(), store.LogFilter{
+			Limit: limit, ExcludeMessage: "http request",
+		})
 		if err != nil {
 			s.writeStoreError(w, err)
 			return
@@ -179,11 +198,17 @@ func (s *Server) handleLogHistory(w http.ResponseWriter, r *http.Request) {
 			if storedLogLevel(event.Level) < minimum {
 				continue
 			}
-			entry := storedLogToEntry(event)
+			entry := loghub.SanitizeEntry(storedLogToEntry(event))
+			if loghub.IsHTTPAccessEntry(entry) {
+				continue
+			}
 			if search != "" && !storedLogContains(entry, search) {
 				continue
 			}
 			entries = append(entries, entry)
+			if len(entries) == limit {
+				break
+			}
 		}
 		// ListLogEvents is newest-first; present chronologically.
 		for i, j := 0, len(entries)-1; i < j; i, j = i+1, j-1 {
@@ -283,7 +308,8 @@ func (s *Server) handleLogStream(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			if logLevel(entry.Level) < minimum {
+			entry = loghub.SanitizeEntry(entry)
+			if loghub.IsHTTPAccessEntry(entry) || logLevel(entry.Level) < minimum {
 				continue
 			}
 			if _, err := w.Write([]byte("event: log\ndata: ")); err != nil {
@@ -308,7 +334,7 @@ func logLevel(value string) slog.Level {
 		return slog.LevelError
 	case "warn", "warning":
 		return slog.LevelWarn
-	case "debug":
+	case "debug", "all", "":
 		return slog.LevelDebug
 	default:
 		return slog.LevelInfo

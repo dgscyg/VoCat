@@ -169,6 +169,11 @@ docker run -d \
 
 GHCR イメージは `linux/amd64` と `linux/arm64` 向けに公開されています。
 
+> [!TIP]
+> **NAS / QNAP Container Station デプロイ時の注意点**:
+> QNAP QTS / QuTS hero (Container Station) などの NAS 環境では、非 root カスタム管理者権限とボリューム分離メカニズムにより、Docker の名前付きボリューム（例: `-v vocat-data:/opt/vocat/data`）を使用すると、初回の `bootstrap-admin` 初期化時とデーモン起動時で異なる隔離パスに書き込まれ、Web ログイン時にパスワードエラーとなる場合があります。
+> NAS 環境では、初期化と常駐コンテナの両方で名前付きボリュームの代わりにホストの絶対パスバインドマウント（例: QNAP の `-v /share/Container/vocat/data:/opt/vocat/data`）を使用することを推奨します。
+
 ## 設定
 
 Vocat は `VOCAT_CONFIG` からオプションの JSON 設定ファイルを読み込み、次に `VOCAT_*` 環境変数を適用します。環境変数が優先されます。

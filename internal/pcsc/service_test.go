@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -49,6 +50,25 @@ func TestDecodeIdentifiers(t *testing.T) {
 	}
 	if imsi != "123456789012345" {
 		t.Fatalf("IMSI = %q", imsi)
+	}
+}
+
+func TestSelectMFDoesNotRequestFCP(t *testing.T) {
+	card := &scriptedCard{replies: []scriptedReply{{sw: 0x9000}}}
+	if err := selectMF(context.Background(), card); err != nil {
+		t.Fatalf("selectMF: %v", err)
+	}
+	want := []byte{0x00, 0xA4, 0x00, 0x0C, 0x02, 0x3F, 0x00}
+	if len(card.calls) != 1 || !bytes.Equal(card.calls[0], want) {
+		t.Fatalf("SELECT MF APDU = % X, want % X", card.calls, want)
+	}
+}
+
+func TestSelectMFDoesNotTreatFCPPrefixAsSuccess(t *testing.T) {
+	card := &scriptedCard{replies: []scriptedReply{{sw: 0x622F}}}
+	err := selectMF(context.Background(), card)
+	if err == nil || !strings.Contains(err.Error(), "status 622F") {
+		t.Fatalf("selectMF warning error = %v", err)
 	}
 }
 

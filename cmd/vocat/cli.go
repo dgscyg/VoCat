@@ -16,8 +16,8 @@ func printUsage(w io.Writer) {
 
 Usage:
   vocat              No arguments: interactive management menu when run as
-                     root on a TTY, otherwise the server. systemd (non-TTY)
-                     starts the server unchanged.
+                     root on a TTY, otherwise the server. A managed service
+                     (systemd or OpenWrt procd) starts the server unchanged.
   vocat serve        Run the server in the foreground (use from a TTY when
                      vocat without arguments would enter the menu).
   vocat version      Print the build version and exit.

@@ -381,6 +381,50 @@ func migrationStatements(version int) []string {
 			`ALTER TABLE devices ADD COLUMN vowifi_allow_sha1 INTEGER NOT NULL DEFAULT 0 CHECK (vowifi_allow_sha1 IN (0, 1))`,
 			`ALTER TABLE devices ADD COLUMN vowifi_use_modp1024 INTEGER NOT NULL DEFAULT 0 CHECK (vowifi_use_modp1024 IN (0, 1))`,
 		}
+	case 20:
+		return []string{
+			`ALTER TABLE card_policies
+				ADD COLUMN cellular_ims_enabled INTEGER NOT NULL DEFAULT 0
+				CHECK (cellular_ims_enabled IN (0, 1))`,
+			`ALTER TABLE card_policies
+				ADD COLUMN cellular_ims_managed INTEGER NOT NULL DEFAULT 0
+				CHECK (cellular_ims_managed IN (0, 1))`,
+		}
+	case 21:
+		return []string{
+			// IMS is a persistent module-global QCFG setting. Stop all legacy
+			// per-card ownership without changing the modem itself during migration.
+			`UPDATE card_policies SET cellular_ims_managed = 0
+			WHERE cellular_ims_managed <> 0`,
+		}
+	case 22:
+		return []string{
+			// vsmartcard exposes VMware's software endpoints as four PC/SC
+			// readers named "Virtual PCD 00 00" ... "00 03". Older builds
+			// auto-provisioned them on an empty database, so they remained in
+			// the configured-device quota after discovery was corrected. Match
+			// the exact generated shape and leave physical or manually named
+			// readers untouched.
+			`DELETE FROM devices
+			WHERE id GLOB 'reader-[0-9a-f]*'
+				AND device_type = 'usb_sim_reader'
+				AND LOWER(TRIM(control_device)) GLOB 'virtual pcd [0-9][0-9] [0-9][0-9]'
+				AND LOWER(TRIM(usb_path)) = 'pcsc:' || LOWER(TRIM(control_device))
+				AND TRIM(interface) = ''
+				AND TRIM(at_port) = ''
+				AND TRIM(modem_imei) = ''`,
+		}
+	case 23:
+		return []string{
+			// SMS subscription identity is historical data. It must live on the
+			// message instead of being reconstructed from the device's current SIM.
+			`ALTER TABLE sms_messages
+				ADD COLUMN iccid TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE sms_messages
+				ADD COLUMN local_phone TEXT NOT NULL DEFAULT ''`,
+			`CREATE INDEX IF NOT EXISTS sms_messages_subscription_thread_idx
+				ON sms_messages(modem_imei, iccid, imsi, peer, message_time DESC, id DESC)`,
+		}
 	default:
 		return nil
 	}

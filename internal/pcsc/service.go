@@ -355,7 +355,11 @@ func selectUSIM(ctx context.Context, card Card) ([]byte, error) {
 }
 
 func selectMF(ctx context.Context, card Card) error {
-	_, sw, err := card.Transmit(ctx, []byte{0x00, 0xA4, 0x00, 0x04, 0x02, 0x3F, 0x00, 0x00})
+	// The MF FCP is not consumed here. Request no response data (P2=0C)
+	// instead of asking the reader to return a potentially long FCP template.
+	// This also avoids the affected native PC/SC path surfacing the template's
+	// leading 62 xx bytes as if they were an ISO 7816 warning status.
+	_, sw, err := card.Transmit(ctx, []byte{0x00, 0xA4, 0x00, 0x0C, 0x02, 0x3F, 0x00})
 	return requireStatus("select MF", sw, err)
 }
 
@@ -446,6 +450,15 @@ func requireStatus(operation string, sw uint16, err error) error {
 		return &PINError{Kind: ErrPINRequired, Tries: -1}
 	}
 	return fmt.Errorf("pcsc: %s failed with status %04X", operation, sw)
+}
+
+func splitAPDUResponse(response []byte) ([]byte, uint16, error) {
+	if len(response) < 2 {
+		return nil, 0, errors.New("pcsc: APDU response omitted its status word")
+	}
+	last := len(response) - 2
+	status := uint16(response[last])<<8 | uint16(response[last+1])
+	return append([]byte(nil), response[:last]...), status, nil
 }
 
 func decodeSwappedBCD(value []byte, dropFirstNibble bool) string {

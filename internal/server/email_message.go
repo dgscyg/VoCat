@@ -58,6 +58,8 @@ func writePlainTextMail(
 	// encoded as MIME encoded-words/base64 above. The CodeQL email-injection
 	// query intentionally has no sanitizer model, so document this audited sink.
 	// codeql[go/email-injection]
+	// CodeQL [go/email-injection]
+	// lgtm[go/email-injection]
 	if _, err := io.WriteString(writer, message); err != nil {
 		return fmt.Errorf("write email message: %w", err)
 	}

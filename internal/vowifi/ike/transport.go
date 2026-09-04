@@ -20,6 +20,7 @@ type datagramTransport interface {
 	RemoteAddr() *net.UDPAddr
 	Float(context.Context) error
 	RoundTrip(context.Context, []byte) ([]byte, error)
+	RoundTripExchange(context.Context, [][]byte) ([][]byte, error)
 	SendESP(context.Context, []byte) error
 	ReceiveESP(context.Context, []byte) (int, error)
 	SendSessionPacket(context.Context, []byte, bool) error
@@ -96,6 +97,29 @@ func roundTripDatagram(
 	read func([]byte, time.Time) (int, error),
 	packet []byte,
 ) ([]byte, error) {
+	writeAll := func(values [][]byte) error {
+		if len(values) > 0 {
+			return write(values[0])
+		}
+		return nil
+	}
+	responses, err := roundTripFragments(ctx, timeout, writeAll, read, [][]byte{packet})
+	if err != nil {
+		return nil, err
+	}
+	if len(responses) == 0 {
+		return nil, errors.New("ike: empty datagram response")
+	}
+	return responses[0], nil
+}
+
+func roundTripFragments(
+	ctx context.Context,
+	timeout time.Duration,
+	writeAll func([][]byte) error,
+	read func([]byte, time.Time) (int, error),
+	packets [][]byte,
+) ([][]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -110,20 +134,44 @@ func roundTripDatagram(
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if err := write(packet); err != nil {
+		if err := writeAll(packets); err != nil {
 			return nil, err
 		}
 		attemptDeadline := time.Now().Add(interval)
 		if deadline.Before(attemptDeadline) {
 			attemptDeadline = deadline
 		}
+		var (
+			totalExpected uint16
+			fragments     = make(map[uint16][]byte)
+		)
 		for time.Now().Before(attemptDeadline) {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
 			n, err := read(buffer, attemptDeadline)
 			if err == nil {
-				return append([]byte(nil), buffer[:n]...), nil
+				pkt := append([]byte(nil), buffer[:n]...)
+				header, body, parseErr := parseIKEPacket(pkt)
+				if parseErr == nil && header.NextPayload == payloadEncryptedFragment && len(body) >= 8 {
+					fragNum := binary.BigEndian.Uint16(body[4:6])
+					total := binary.BigEndian.Uint16(body[6:8])
+					if total > 1 {
+						if totalExpected == 0 {
+							totalExpected = total
+						}
+						fragments[fragNum] = pkt
+						if uint16(len(fragments)) == totalExpected {
+							res := make([][]byte, 0, totalExpected)
+							for i := uint16(1); i <= totalExpected; i++ {
+								res = append(res, fragments[i])
+							}
+							return res, nil
+						}
+						continue
+					}
+				}
+				return [][]byte{pkt}, nil
 			}
 			if timeoutError, ok := err.(net.Error); ok && timeoutError.Timeout() {
 				lastErr = err
@@ -222,25 +270,47 @@ func (transport *directUDP) Float(ctx context.Context) error {
 }
 
 func (transport *directUDP) RoundTrip(ctx context.Context, packet []byte) ([]byte, error) {
+	responses, err := transport.RoundTripExchange(ctx, [][]byte{packet})
+	if err != nil {
+		return nil, err
+	}
+	if len(responses) == 0 {
+		return nil, errors.New("ike: empty exchange response")
+	}
+	return responses[0], nil
+}
+
+func (transport *directUDP) RoundTripExchange(ctx context.Context, packets [][]byte) ([][]byte, error) {
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
 	if transport.conn == nil {
 		return nil, errors.New("ike: UDP transport is closed")
 	}
-	requestHeader, _, err := parseIKEPacket(packet)
+	if len(packets) == 0 {
+		return nil, errors.New("ike: outbound packet list is empty")
+	}
+	requestHeader, _, err := parseIKEPacket(packets[0])
 	if err != nil {
 		return nil, fmt.Errorf("ike: invalid outbound packet: %w", err)
 	}
-	wirePacket := packet
-	if transport.floated {
-		wirePacket = append([]byte{0, 0, 0, 0}, packet...)
-	}
-	write := func(value []byte) error {
-		if err := transport.conn.SetWriteDeadline(deadlineFor(ctx, transport.config.Timeout)); err != nil {
-			return err
+	var wirePackets [][]byte
+	for _, pkt := range packets {
+		wire := pkt
+		if transport.floated {
+			wire = append([]byte{0, 0, 0, 0}, pkt...)
 		}
-		_, err := transport.conn.Write(value)
-		return err
+		wirePackets = append(wirePackets, wire)
+	}
+	writeAll := func(values [][]byte) error {
+		for _, value := range values {
+			if err := transport.conn.SetWriteDeadline(deadlineFor(ctx, transport.config.Timeout)); err != nil {
+				return err
+			}
+			if _, err := transport.conn.Write(value); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	read := func(buffer []byte, attemptDeadline time.Time) (int, error) {
 		for {
@@ -252,10 +322,6 @@ func (transport *directUDP) RoundTrip(ctx context.Context, packet []byte) ([]byt
 				return 0, err
 			}
 			if transport.floated {
-				// IKE and ESP legitimately share UDP/4500. An ESP packet can
-				// arrive immediately before the IKE response that completes
-				// CHILD_SA setup; discard it here and keep the same absolute
-				// attempt deadline while waiting for marked IKE.
 				if !hasNonESPMarker(buffer[:n]) {
 					continue
 				}
@@ -268,7 +334,7 @@ func (transport *directUDP) RoundTrip(ctx context.Context, packet []byte) ([]byt
 			return n, nil
 		}
 	}
-	return roundTripDatagram(ctx, transport.config.Timeout, write, read, wirePacket)
+	return roundTripFragments(ctx, transport.config.Timeout, writeAll, read, wirePackets)
 }
 
 func (transport *directUDP) SendESP(ctx context.Context, packet []byte) error {
@@ -561,12 +627,26 @@ func (transport *socks5UDP) Float(_ context.Context) error {
 }
 
 func (transport *socks5UDP) RoundTrip(ctx context.Context, packet []byte) ([]byte, error) {
+	responses, err := transport.RoundTripExchange(ctx, [][]byte{packet})
+	if err != nil {
+		return nil, err
+	}
+	if len(responses) == 0 {
+		return nil, errors.New("ike: empty exchange response")
+	}
+	return responses[0], nil
+}
+
+func (transport *socks5UDP) RoundTripExchange(ctx context.Context, packets [][]byte) ([][]byte, error) {
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
 	if transport.udp == nil {
 		return nil, errors.New("ike: SOCKS5 UDP transport is closed")
 	}
-	requestHeader, _, err := parseIKEPacket(packet)
+	if len(packets) == 0 {
+		return nil, errors.New("ike: outbound packet list is empty")
+	}
+	requestHeader, _, err := parseIKEPacket(packets[0])
 	if err != nil {
 		return nil, fmt.Errorf("ike: invalid outbound packet: %w", err)
 	}
@@ -576,37 +656,55 @@ func (transport *socks5UDP) RoundTrip(ctx context.Context, packet []byte) ([]byt
 	// Once a gateway answers, keep it pinned for the lifetime of the IKE SA.
 	if !transport.floated && requestHeader.Exchange == exchangeIKEInit && requestHeader.MessageID == 0 && len(transport.remotes) > 1 {
 		var lastErr error
+		var cookieResponse [][]byte
 		for _, candidate := range transport.remotes {
 			transport.remote = cloneUDPAddr(candidate)
-			response, attemptErr := transport.roundTripLocked(ctx, packet, requestHeader)
+			responses, attemptErr := transport.roundTripFragmentsLocked(ctx, packets, requestHeader)
 			if attemptErr == nil {
-				return response, nil
+				if len(responses) > 0 && ikeInitResponseHasCookie(responses[0]) {
+					if cookieResponse == nil {
+						cookieResponse = responses
+					}
+					continue
+				}
+				return responses, nil
 			}
 			lastErr = attemptErr
 			if ctx.Err() != nil || !isNetworkTimeout(attemptErr) {
 				return nil, attemptErr
 			}
 		}
+		if cookieResponse != nil {
+			return cookieResponse, nil
+		}
 		return nil, fmt.Errorf("ike: all %d resolved ePDG addresses timed out: %w", len(transport.remotes), lastErr)
 	}
-	return transport.roundTripLocked(ctx, packet, requestHeader)
+	return transport.roundTripFragmentsLocked(ctx, packets, requestHeader)
 }
 
-func (transport *socks5UDP) roundTripLocked(ctx context.Context, packet []byte, requestHeader ikeHeader) ([]byte, error) {
-	wireIKE := packet
-	if transport.floated {
-		wireIKE = append([]byte{0, 0, 0, 0}, packet...)
-	}
-	datagram, err := marshalSOCKS5Datagram(transport.remote, wireIKE)
-	if err != nil {
-		return nil, err
-	}
-	write := func(value []byte) error {
-		if err := transport.udp.SetWriteDeadline(deadlineFor(ctx, transport.config.Timeout)); err != nil {
-			return err
+func (transport *socks5UDP) roundTripFragmentsLocked(ctx context.Context, packets [][]byte, requestHeader ikeHeader) ([][]byte, error) {
+	var datagrams [][]byte
+	for _, pkt := range packets {
+		wireIKE := pkt
+		if transport.floated {
+			wireIKE = append([]byte{0, 0, 0, 0}, pkt...)
 		}
-		_, err := transport.udp.Write(value)
-		return err
+		datagram, err := marshalSOCKS5Datagram(transport.remote, wireIKE)
+		if err != nil {
+			return nil, err
+		}
+		datagrams = append(datagrams, datagram)
+	}
+	writeAll := func(values [][]byte) error {
+		for _, value := range values {
+			if err := transport.udp.SetWriteDeadline(deadlineFor(ctx, transport.config.Timeout)); err != nil {
+				return err
+			}
+			if _, err := transport.udp.Write(value); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	read := func(buffer []byte, attemptDeadline time.Time) (int, error) {
 		for {
@@ -620,10 +718,6 @@ func (transport *socks5UDP) roundTripLocked(ctx context.Context, packet []byte, 
 				return 0, err
 			}
 			if transport.floated {
-				// The relay can deliver ESP before the marked IKE response on
-				// the same UDP/4500 association. Do not accept it as IKE, and
-				// do not abort the exchange; keep waiting within the original
-				// deadline.
 				if !hasNonESPMarker(payload) {
 					continue
 				}
@@ -636,7 +730,7 @@ func (transport *socks5UDP) roundTripLocked(ctx context.Context, packet []byte, 
 			return len(payload), nil
 		}
 	}
-	return roundTripDatagram(ctx, transport.config.Timeout, write, read, datagram)
+	return roundTripFragments(ctx, transport.config.Timeout, writeAll, read, datagrams)
 }
 
 func isNetworkTimeout(err error) bool {
@@ -824,9 +918,32 @@ func ikeResponseMatchesRequest(
 	}
 	var zeroSPI [8]byte
 	if request.ResponderSPI == zeroSPI {
-		return response.ResponderSPI != zeroSPI
+		if response.ResponderSPI != zeroSPI {
+			return true
+		}
+		return response.Exchange == exchangeIKEInit &&
+			response.MessageID == 0 &&
+			ikeInitResponseHasCookie(packet)
 	}
 	return response.ResponderSPI == request.ResponderSPI
+}
+
+func ikeInitResponseHasCookie(packet []byte) bool {
+	header, body, err := parseIKEPacket(packet)
+	if err != nil || header.Exchange != exchangeIKEInit || header.MessageID != 0 {
+		return false
+	}
+	payloads, err := parsePayloadChain(header.NextPayload, body)
+	if err != nil {
+		return false
+	}
+	for _, item := range payloadsOfType(payloads, payloadNotify) {
+		kind, data, err := parseNotify(item)
+		if err == nil && kind == notifyCookie && len(data) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func marshalSOCKS5Datagram(remote *net.UDPAddr, payload []byte) ([]byte, error) {

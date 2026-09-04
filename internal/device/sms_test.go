@@ -326,6 +326,19 @@ func TestManagerListReadAndDeleteSMS(t *testing.T) {
 	client.assertDone(t)
 }
 
+func TestManagerDeleteSMSFromStorageSelectsStorageAtomically(t *testing.T) {
+	client := &transcriptClient{steps: []clientStep{
+		{command: `AT+CPMS="SM"`, response: okResponse()},
+		{command: "AT+CMGD=7", response: okResponse()},
+	}}
+	manager, id := newStartedTestManager(t, client)
+
+	if err := manager.DeleteSMSFromStorage(context.Background(), id, " sm ", 7); err != nil {
+		t.Fatalf("DeleteSMSFromStorage: %v", err)
+	}
+	client.assertDone(t)
+}
+
 func TestManagerSendSMSRequiresMessageReference(t *testing.T) {
 	client := &transcriptClient{
 		steps: []clientStep{

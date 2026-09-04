@@ -18,7 +18,7 @@ const {
 } = await import(moduleURL);
 
 test("uses the current physical SIM when the device has no eSIM profiles", () => {
-  const iccid = "89441000400128014257";
+  const iccid = "8944100000000000001";
 
   assert.deepEqual(buildAutomaticTaskProfileOptions([], iccid, "Current SIM"), [
     {
@@ -30,7 +30,7 @@ test("uses the current physical SIM when the device has no eSIM profiles", () =>
 });
 
 test("does not duplicate the current SIM when it is already in the eSIM inventory", () => {
-  const iccid = "89441000400128014257";
+  const iccid = "8944100000000000001";
 
   assert.deepEqual(
     buildAutomaticTaskProfileOptions(
@@ -49,7 +49,7 @@ test("does not duplicate the current SIM when it is already in the eSIM inventor
 });
 
 test("does not replace a saved profile when a failed inventory only exposes the current SIM", () => {
-  const currentICCID = "89441000400128014257";
+  const currentICCID = "8944100000000000001";
   const savedICCID = "89104100000028106378";
   const options = buildAutomaticTaskProfileOptions([], currentICCID, "Current SIM");
 

@@ -204,6 +204,41 @@ func TestConcatSMSReadyToNotify(t *testing.T) {
 	}
 }
 
+func TestSaveSMSMessageWithResultDistinguishesIdempotentReplay(t *testing.T) {
+	ctx := context.Background()
+	database := openTestStore(t, ":memory:")
+	mustSaveDevice(t, database, "ec20-1", "EC20")
+	message := SMSMessage{
+		MessageID: "modem:SM:7:abcdef",
+		DeviceID:  "ec20-1",
+		ModemIMEI: "867394042309830",
+		Peer:      "+447700900123",
+		Direction: "inbound",
+		Body:      "hello",
+		Timestamp: time.Unix(1_700_000_000, 0).UTC(),
+		Status:    "received_unread",
+		Source:    "cellular_at",
+	}
+
+	first, err := database.SaveSMSMessageWithResult(ctx, message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Inserted {
+		t.Fatal("first save was not reported as inserted")
+	}
+	second, err := database.SaveSMSMessageWithResult(ctx, message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Inserted {
+		t.Fatal("idempotent modem replay was reported as inserted")
+	}
+	if second.Message.ID != first.Message.ID {
+		t.Fatalf("replay row id = %d, want %d", second.Message.ID, first.Message.ID)
+	}
+}
+
 func TestSaveConcatSMSFoldsSegmentsIntoOneRow(t *testing.T) {
 	ctx := context.Background()
 	database := openTestStore(t, ":memory:")

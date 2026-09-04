@@ -71,7 +71,16 @@ func (media *rtpMedia) ready() bool {
 }
 
 func (media *rtpMedia) offerSDP(local net.IP) []byte {
-	return media.buildSDP(local, "8 0", nil)
+	return media.buildSDP(local, "8 0 104 102 100", []string{
+		"a=rtpmap:8 PCMA/8000",
+		"a=rtpmap:0 PCMU/8000",
+		"a=rtpmap:104 AMR-WB/16000",
+		"a=fmtp:104 mode-change-capability=2;max-red=220",
+		"a=rtpmap:102 AMR/8000",
+		"a=fmtp:102 mode-change-capability=2;max-red=220",
+		"a=rtpmap:100 telephone-event/8000",
+		"a=fmtp:100 0-15",
+	})
 }
 
 func (media *rtpMedia) answerSDP(local net.IP) []byte {
@@ -81,8 +90,12 @@ func (media *rtpMedia) answerSDP(local net.IP) []byte {
 	if codec == "" {
 		return media.offerSDP(local)
 	}
+	rate := 8000
+	if codec == "AMR-WB" {
+		rate = 16000
+	}
 	return media.buildSDP(local, strconv.Itoa(int(payload)), []string{
-		fmt.Sprintf("a=rtpmap:%d %s/8000", payload, codec),
+		fmt.Sprintf("a=rtpmap:%d %s/%d", payload, codec, rate),
 	})
 }
 
@@ -110,7 +123,16 @@ func (media *rtpMedia) buildSDP(local net.IP, formats string, attributes []strin
 		fmt.Sprintf("m=audio %d RTP/AVP %s", port, formats),
 	}
 	if attributes == nil {
-		lines = append(lines, "a=rtpmap:8 PCMA/8000", "a=rtpmap:0 PCMU/8000")
+		lines = append(lines,
+			"a=rtpmap:8 PCMA/8000",
+			"a=rtpmap:0 PCMU/8000",
+			"a=rtpmap:104 AMR-WB/16000",
+			"a=fmtp:104 mode-change-capability=2;max-red=220",
+			"a=rtpmap:102 AMR/8000",
+			"a=fmtp:102 mode-change-capability=2;max-red=220",
+			"a=rtpmap:100 telephone-event/8000",
+			"a=fmtp:100 0-15",
+		)
 	} else {
 		lines = append(lines, attributes...)
 	}
@@ -137,15 +159,24 @@ func (media *rtpMedia) configureRemote(body []byte) error {
 				name = "PCMU"
 			case 8:
 				name = "PCMA"
+			case 100:
+				continue
+			default:
+				name = fmt.Sprintf("PAYLOAD-%d", parsed)
 			}
 		}
-		if name == "PCMA" || name == "PCMU" {
+		if name != "TELEPHONE-EVENT" {
 			codec, payload = name, byte(parsed)
 			break
 		}
 	}
+	if codec == "" && len(formats) > 0 {
+		if parsed, parseErr := strconv.Atoi(formats[0]); parseErr == nil {
+			codec, payload = fmt.Sprintf("PAYLOAD-%d", parsed), byte(parsed)
+		}
+	}
 	if codec == "" {
-		return errors.New("ims: remote endpoint did not accept PCMA or PCMU audio")
+		return errors.New("ims: remote SDP has no usable audio format")
 	}
 	media.mu.Lock()
 	media.remote = &net.UDPAddr{IP: address, Port: port}

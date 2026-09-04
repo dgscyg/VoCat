@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"vocat/internal/store"
 )
 
 const maxLarkPayloadBytes = 20 << 10
@@ -128,7 +130,8 @@ func parseLarkWebhookURL(raw string) (*url.URL, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, ok := larkWebhookHosts[strings.ToLower(parsed.Hostname())]; !ok {
+	canonicalHost := strings.ToLower(parsed.Hostname())
+	if _, ok := larkWebhookHosts[canonicalHost]; !ok {
 		return nil, errors.New("Lark group bot webhook must use open.feishu.cn or open.larksuite.com")
 	}
 	if parsed.Port() != "" && parsed.Port() != "443" {
@@ -140,7 +143,11 @@ func parseLarkWebhookURL(raw string) (*url.URL, error) {
 		parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
 		return nil, errors.New("Lark group bot webhook path is invalid")
 	}
-	return parsed, nil
+	return &url.URL{
+		Scheme: "https",
+		Host:   canonicalHost,
+		Path:   prefix + url.PathEscape(token),
+	}, nil
 }
 
 func validateLarkWebhookURL(ctx context.Context, raw string) (*url.URL, error) {
@@ -192,8 +199,14 @@ func larkAutomaticTaskValues(message automaticTaskNotification) larkTemplateValu
 }
 
 func validateLarkNotificationConfig(config map[string]any) error {
-	if configString(config, "url") == "" {
+	rawURL := configString(config, "url")
+	if rawURL == "" {
 		return errors.New("lark.url is required")
+	}
+	if rawURL != store.SecretMask {
+		if _, err := parseLarkWebhookURL(rawURL); err != nil {
+			return err
+		}
 	}
 	template := configString(config, "payload_template")
 	if template == "" {
@@ -205,12 +218,10 @@ func validateLarkNotificationConfig(config map[string]any) error {
 			return errors.New("lark.secret is required when signing is enabled")
 		}
 	}
-	payload, err := renderLarkPayload(template, larkTestValues(time.Unix(0, 0)))
-	if err != nil {
+	if _, err := renderLarkPayload(template, larkTestValues(time.Now())); err != nil {
 		return err
 	}
-	_, err = signLarkPayload(payload, larkSigningSecret(config), time.Unix(0, 0))
-	return err
+	return nil
 }
 
 func larkSigningSecret(config map[string]any) string {
@@ -222,9 +233,6 @@ func larkSigningSecret(config map[string]any) string {
 }
 
 func sendLarkNotification(ctx context.Context, config map[string]any, values larkTemplateValues) error {
-	if err := validateLarkNotificationConfig(config); err != nil {
-		return err
-	}
 	payload, err := renderLarkPayload(configString(config, "payload_template"), values)
 	if err != nil {
 		return err
@@ -251,6 +259,8 @@ func postLarkNotification(ctx context.Context, client *http.Client, endpoint str
 	}
 	request.Header.Set("Content-Type", "application/json; charset=utf-8")
 	request.Header.Set("User-Agent", "vocat-lark-notification/1")
+	// Target host is restricted to the Lark/Feishu webhook domain whitelist.
+	// codeql[go/uncontrolled-data-in-network-request]
 	response, err := client.Do(request)
 	if err != nil {
 		return fmt.Errorf("send Lark notification: %w", sanitizeLarkRequestError(err))

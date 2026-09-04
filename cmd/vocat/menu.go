@@ -33,6 +33,8 @@ const legacyEnvFilePath = "/etc/vocat/vocat.env"
 
 const systemdUnitPath = "/etc/systemd/system/vocat.service"
 
+const openWrtInitPath = "/etc/init.d/vocat"
+
 // defaultDatabasePath is the install-default SQLite location written into the
 // systemd unit by scripts/install.sh. Used only when VOCAT_DATABASE_PATH is not
 // already set in the operator's environment.
@@ -89,12 +91,12 @@ func menuEnvFilePath() string {
 }
 
 // runMenu is the interactive lifecycle menu: toggle language, reset credentials,
-// change the Web listener port, restart the systemd unit, self-update, or fully
-// uninstall vocat. It must run as root on the host (needs systemctl + the 0600
-// env file). Docker deployments do not use it.
+// change the Web listener port, restart the managed service, self-update, or
+// fully uninstall vocat. It must run as root on the host because it manages the
+// systemd/procd service and the 0600 env file. Docker deployments do not use it.
 func runMenu(logger *slog.Logger) error {
 	if os.Geteuid() != 0 {
-		return errors.New("vocat menu must run as root (needs systemctl and /etc/vocat/env)")
+		return errors.New("vocat menu must run as root (needs a service manager and /etc/vocat/env)")
 	}
 	fd := int(os.Stdin.Fd())
 	if !term.IsTerminal(fd) {
@@ -333,8 +335,8 @@ func writeEnvFileAtomic(path string, content []byte) error {
 }
 
 func menuChangeWebPort(reader *bufio.Reader, m *menu) error {
-	if _, err := exec.LookPath("systemctl"); err != nil {
-		return errNoSystemctl
+	if _, err := detectMenuServiceManager(); err != nil {
+		return err
 	}
 	cfg, err := config.Load()
 	if err != nil {
@@ -498,17 +500,84 @@ func menuRestart(m *menu) error {
 }
 
 func restartVocatService() error {
-	if _, err := exec.LookPath("systemctl"); err != nil {
-		return errNoSystemctl
+	manager, err := detectMenuServiceManager()
+	if err != nil {
+		return err
 	}
-	cmd := exec.Command("systemctl", "restart", "vocat")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("%w: %s", errRestartFailed, strings.TrimSpace(string(out)))
+	switch manager {
+	case menuServiceOpenWrt:
+		if out, err := exec.Command(openWrtInitPath, "restart").CombinedOutput(); err != nil {
+			return fmt.Errorf("%w: %s", errRestartFailed, strings.TrimSpace(string(out)))
+		}
+		return waitForMenuServiceActive(manager, 10*time.Second)
+	case menuServiceSystemd:
+		if out, err := exec.Command("systemctl", "restart", "vocat").CombinedOutput(); err != nil {
+			return fmt.Errorf("%w: %s", errRestartFailed, strings.TrimSpace(string(out)))
+		}
+		return waitForMenuServiceActive(manager, 10*time.Second)
+	default:
+		return errNoServiceManager
 	}
-	if out, err := exec.Command("systemctl", "is-active", "--quiet", "vocat").CombinedOutput(); err != nil {
-		return fmt.Errorf("%w: service is not active: %s", errRestartFailed, strings.TrimSpace(string(out)))
+}
+
+type menuServiceManager string
+
+const (
+	menuServiceOpenWrt menuServiceManager = "openwrt"
+	menuServiceSystemd menuServiceManager = "systemd"
+)
+
+func chooseMenuServiceManager(openWrtAvailable, systemdAvailable bool) (menuServiceManager, error) {
+	if openWrtAvailable {
+		return menuServiceOpenWrt, nil
 	}
-	return nil
+	if systemdAvailable {
+		return menuServiceSystemd, nil
+	}
+	return "", errNoServiceManager
+}
+
+func detectMenuServiceManager() (menuServiceManager, error) {
+	openWrtAvailable := isExecutableFile(openWrtInitPath) &&
+		(isExecutableFile("/sbin/procd") || isExecutableFile("/sbin/ubusd"))
+	_, systemctlErr := exec.LookPath("systemctl")
+	systemdInfo, systemdErr := os.Stat("/run/systemd/system")
+	systemdAvailable := systemctlErr == nil && systemdErr == nil && systemdInfo.IsDir()
+	return chooseMenuServiceManager(openWrtAvailable, systemdAvailable)
+}
+
+func isExecutableFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir() && info.Mode().Perm()&0o111 != 0
+}
+
+func waitForMenuServiceActive(manager menuServiceManager, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	stable := 0
+	var lastOutput string
+	for time.Now().Before(deadline) {
+		var output []byte
+		var err error
+		switch manager {
+		case menuServiceOpenWrt:
+			output, err = exec.Command(openWrtInitPath, "running").CombinedOutput()
+		case menuServiceSystemd:
+			output, err = exec.Command("systemctl", "is-active", "--quiet", "vocat").CombinedOutput()
+		default:
+			return errNoServiceManager
+		}
+		lastOutput = strings.TrimSpace(string(output))
+		if err == nil {
+			stable++
+			if stable >= 3 {
+				return nil
+			}
+		} else {
+			stable = 0
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("%w: service is not active: %s", errRestartFailed, lastOutput)
 }
 
 // menuUpdate delegates to the self-updater in internal/update. It resolves the
@@ -529,9 +598,9 @@ func menuUpdate(m *menu, logger *slog.Logger) error {
 	return nil
 }
 
-// menuUninstall performs full removal: stop/disable the unit, delete the unit,
-// remove /opt/vocat (binary + data + SQLite DB), remove the env file, reload
-// systemd, and best-effort delete the vocat user.
+// menuUninstall performs full removal for either systemd or OpenWrt/procd:
+// stop/disable the service, delete its definition, remove /opt/vocat (binary +
+// data + SQLite DB), remove the env file, and best-effort delete the vocat user.
 func menuUninstall(reader *bufio.Reader, m *menu) error {
 	fmt.Println(m.uninstallWarn())
 	fmt.Print(m.uninstallConfirm())
@@ -543,18 +612,29 @@ func menuUninstall(reader *bufio.Reader, m *menu) error {
 		fmt.Println(m.uninstallCancelled())
 		return nil
 	}
+	manager, err := detectMenuServiceManager()
+	if err != nil {
+		return err
+	}
 
 	runIgnore := func(name string, args ...string) {
 		_ = exec.Command(name, args...).Run()
 	}
-	runIgnore("systemctl", "stop", "vocat")
-	runIgnore("systemctl", "disable", "vocat")
-	_ = os.Remove(systemdUnitPath)
+	switch manager {
+	case menuServiceOpenWrt:
+		runIgnore(openWrtInitPath, "stop")
+		runIgnore(openWrtInitPath, "disable")
+		_ = os.Remove(openWrtInitPath)
+	case menuServiceSystemd:
+		runIgnore("systemctl", "stop", "vocat")
+		runIgnore("systemctl", "disable", "vocat")
+		_ = os.Remove(systemdUnitPath)
+		runIgnore("systemctl", "daemon-reload")
+	}
 	_ = os.RemoveAll("/opt/vocat")
 	_ = os.Remove(envFilePath)
 	_ = os.Remove(legacyEnvFilePath)
 	_ = os.Remove("/etc/vocat") // succeeds only when empty
-	runIgnore("systemctl", "daemon-reload")
 	runIgnore("userdel", "vocat")
 
 	fmt.Println(m.uninstalled())
@@ -564,7 +644,7 @@ func menuUninstall(reader *bufio.Reader, m *menu) error {
 // menu-local sentinel errors so callers can map them to localized messages.
 var (
 	errPasswordsDiffer    = errors.New("menu: passwords do not match")
-	errNoSystemctl        = errors.New("menu: systemctl not found")
+	errNoServiceManager   = errors.New("menu: no supported service manager")
 	errRestartFailed      = errors.New("menu: restart failed")
 	errUpdateFailed       = errors.New("menu: update failed")
 	errMenuConfig         = errors.New("menu: load configuration")
@@ -676,11 +756,11 @@ func (m *menu) errorPrefix(err error) string {
 			return "Passwords do not match."
 		}
 		return "两次输入的密码不一致。"
-	case errors.Is(err, errNoSystemctl):
+	case errors.Is(err, errNoServiceManager):
 		if m.lang == "en" {
-			return "systemctl not found."
+			return "Neither systemd nor OpenWrt procd is available."
 		}
-		return "未找到 systemctl。"
+		return "未找到可用的 systemd 或 OpenWrt procd 服务管理器。"
 	case errors.Is(err, errRestartFailed):
 		if m.lang == "en" {
 			return "Restart failed."

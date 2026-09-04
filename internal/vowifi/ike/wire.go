@@ -31,9 +31,10 @@ const (
 	payloadDelete    = 42
 	payloadTSi       = 44
 	payloadTSr       = 45
-	payloadEncrypted = 46
-	payloadCP        = 47
-	payloadEAP       = 48
+	payloadEncrypted         = 46
+	payloadCP                = 47
+	payloadEAP               = 48
+	payloadEncryptedFragment = 53
 
 	protocolIKE = 1
 	protocolESP = 3
@@ -55,14 +56,16 @@ const (
 	dhMODP2048               = 14
 	transformAttributeKeyLen = 14
 
-	notifyInitialContact  = 16384
-	notifyMOBIKESupported = 16396
-	notifyNATSource       = 16388
-	notifyNATDestination  = 16389
-	notifyEAPOnlyAuth     = 16417
-	notifyDeviceIdentity  = 41101
-	notifyInvalidKE       = 17
-	notifyNoProposal      = 14
+	notifyInitialContact         = 16384
+	notifyMOBIKESupported        = 16396
+	notifyNATSource              = 16388
+	notifyNATDestination         = 16389
+	notifyCookie                 = 16390
+	notifyEAPOnlyAuth            = 16417
+	notifyFragmentationSupported = 16430
+	notifyDeviceIdentity         = 41101
+	notifyInvalidKE              = 17
+	notifyNoProposal             = 14
 )
 
 var (

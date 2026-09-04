@@ -98,7 +98,12 @@ export function OverviewVowifiCard({ device }: { device: DeviceDetail }) {
               </div>
             ) : null}
             <FieldRow label={t("数据平面")} value={rt?.dataplaneMode || "--"} monospace />
-            <FieldRow label={t("运营商配置")} value={rt?.carrierProfile || "standard-3gpp"} monospace copyable />
+            <FieldRow
+              label={t("运营商配置")}
+              value={!rt?.carrierProfile || rt.carrierProfile === "standard-3gpp" ? "3GPP Standard" : rt.carrierProfile}
+              monospace
+              copyable
+            />
             <FieldRow label={t("匹配依据")} value={rt?.carrierProfileFrom || "standard"} monospace />
             <FieldRow label={t("最后原因")} value={rt?.lastReason || "--"} />
             <FieldRow label={t("错误分类")} value={rt?.lastErrorClass || "--"} monospace copyable />

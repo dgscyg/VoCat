@@ -30,9 +30,9 @@ func testNotificationMetadata(t *testing.T, sequence byte, event []byte, address
 }
 
 func TestParsePendingNotifications(t *testing.T) {
-	installMetadata := testNotificationMetadata(t, 7, []byte{7, 0x80}, "install.example.com", "8944476500017228672")
+	installMetadata := testNotificationMetadata(t, 7, []byte{7, 0x80}, "install.example.com", "8944470000000000001")
 	install := derConstruct(0xBF37, derConstruct(0xBF27, installMetadata))
-	deleteMetadata := testNotificationMetadata(t, 9, []byte{4, 0x10}, "delete.example.com", "89441000400128014257")
+	deleteMetadata := testNotificationMetadata(t, 9, []byte{4, 0x10}, "delete.example.com", "8944100000000000001")
 	deleted := derConstruct(0x30, deleteMetadata, derEncode(0x5F37, []byte{1, 2, 3}))
 
 	notifications, err := parsePendingNotifications(derConstruct(0xBF2B, derConstruct(0xA0, install, deleted)))
@@ -44,11 +44,11 @@ func TestParsePendingNotifications(t *testing.T) {
 	}
 	// Results are grouped by receiver, then sorted by sequence number.
 	if got := notifications[0]; got.SequenceNumber != 9 || got.Event != "delete" ||
-		got.Address != "delete.example.com" || got.ICCID != "89441000400128014257" || !bytes.Equal(got.raw, deleted) {
+		got.Address != "delete.example.com" || got.ICCID != "8944100000000000001" || !bytes.Equal(got.raw, deleted) {
 		t.Fatalf("delete notification = %#v, raw=%X", got, got.raw)
 	}
 	if got := notifications[1]; got.SequenceNumber != 7 || got.Event != "install" ||
-		got.Address != "install.example.com" || got.ICCID != "8944476500017228672" || !bytes.Equal(got.raw, install) {
+		got.Address != "install.example.com" || got.ICCID != "8944470000000000001" || !bytes.Equal(got.raw, install) {
 		t.Fatalf("install notification = %#v, raw=%X", got, got.raw)
 	}
 

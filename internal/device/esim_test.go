@@ -55,9 +55,9 @@ func esimTestProfile(t *testing.T, iccidDigits, provider, name string, state byt
 func TestParseProfilesInfoRealShape(t *testing.T) {
 	// BF2D root (this card echoes the request tag) -> A0 list -> E3 records.
 	body := tlv([]byte{0xA0},
-		esimTestProfile(t, "89441000400128014257", "Vodafone UK", "Vodafone UK eSIM", 0x00),
-		esimTestProfile(t, "89441000430011604140", "Vodafone UK", "Vodafone UK eSIM", 0x01),
-		esimTestProfile(t, "89852351225001058508", "Webbing", "WEBBING", 0x00),
+		esimTestProfile(t, "8944100000000000001", "Vodafone UK", "Vodafone UK eSIM", 0x00),
+		esimTestProfile(t, "8944100000000000002", "Vodafone UK", "Vodafone UK eSIM", 0x01),
+		esimTestProfile(t, "8985200000000000001", "Webbing", "WEBBING", 0x00),
 	)
 	payload := tlv([]byte{0xBF, 0x2D}, body)
 
@@ -65,10 +65,10 @@ func TestParseProfilesInfoRealShape(t *testing.T) {
 	if len(profiles) != 3 {
 		t.Fatalf("expected 3 profiles, got %d: %#v", len(profiles), profiles)
 	}
-	if profiles[0].ICCID != "89441000400128014257" || profiles[0].State != 0 {
+	if profiles[0].ICCID != "8944100000000000001" || profiles[0].State != 0 {
 		t.Fatalf("profile[0] = %#v", profiles[0])
 	}
-	if profiles[1].ICCID != "89441000430011604140" || profiles[1].State != 1 || profiles[1].StateText != "已启用" {
+	if profiles[1].ICCID != "8944100000000000002" || profiles[1].State != 1 || profiles[1].StateText != "已启用" {
 		t.Fatalf("profile[1] = %#v", profiles[1])
 	}
 	if profiles[2].ServiceProvider != "Webbing" || profiles[2].Name != "WEBBING" || profiles[2].State != 0 {
@@ -82,8 +82,8 @@ func TestParseProfilesInfoRealShape(t *testing.T) {
 }
 
 func TestParseProfilesInfoSkipsNestedMetadataE3WithoutICCID(t *testing.T) {
-	real := esimTestProfile(t, "89441000400316048687", "Vodafone UK", "Vodafone UK eSIM", 0x01)
-	duplicate := esimTestProfile(t, "89441000400316048687", "Duplicate", "Duplicate", 0x00)
+	real := esimTestProfile(t, "8944100000000000003", "Vodafone UK", "Vodafone UK eSIM", 0x01)
+	duplicate := esimTestProfile(t, "8944100000000000003", "Duplicate", "Duplicate", 0x00)
 	metadata := tlv([]byte{0xE3}, tlv([]byte{0x80}, []byte{0x01}))
 	empty := tlv([]byte{0xE3})
 	payload := tlv([]byte{0xBF, 0x2D}, tlv([]byte{0xA0}, metadata, real, empty, duplicate))
@@ -92,13 +92,13 @@ func TestParseProfilesInfoSkipsNestedMetadataE3WithoutICCID(t *testing.T) {
 	if len(profiles) != 1 {
 		t.Fatalf("profiles = %#v, want one addressable profile", profiles)
 	}
-	if profiles[0].ICCID != "89441000400316048687" || profiles[0].Name != "Vodafone UK eSIM" {
+	if profiles[0].ICCID != "8944100000000000003" || profiles[0].Name != "Vodafone UK eSIM" {
 		t.Fatalf("profile = %#v", profiles[0])
 	}
 }
 
 func TestICCIDRoundTrip(t *testing.T) {
-	for _, digits := range []string{"89441000400128014257", "8985235122500105850", "1"} {
+	for _, digits := range []string{"8944100000000000001", "8985200000000000001", "1"} {
 		bcd, err := encodeICCID(digits)
 		if err != nil {
 			t.Fatalf("encodeICCID(%q): %v", digits, err)
@@ -110,7 +110,7 @@ func TestICCIDRoundTrip(t *testing.T) {
 			t.Fatalf("round trip %q -> %q", digits, got)
 		}
 	}
-	if _, err := encodeICCID("894410004001280142571"); err == nil {
+	if _, err := encodeICCID("894410000000000000001"); err == nil {
 		t.Fatal("21-digit ICCID was accepted")
 	}
 }
@@ -126,11 +126,11 @@ func TestEnableProfileRequestPads18DigitICCIDToTenOctets(t *testing.T) {
 }
 
 func TestDeleteProfileRequestAndResult(t *testing.T) {
-	request, err := buildDeleteProfileRequest("89441000400128014257")
+	request, err := buildDeleteProfileRequest("89441000000000000001")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.ToUpper(hex.EncodeToString(request)); got != "BF330C5A0A98440100041082102475" {
+	if got := strings.ToUpper(hex.EncodeToString(request)); got != "BF330C5A0A98440100000000000010" {
 		t.Fatalf("DeleteProfile request = %s", got)
 	}
 	result, ok := deleteProfileResult([]byte{0xBF, 0x33, 0x03, 0x80, 0x01, 0x00})
@@ -144,28 +144,28 @@ func TestDeleteProfileRequestAndResult(t *testing.T) {
 }
 
 func TestSetNicknameRequestAndResult(t *testing.T) {
-	request, err := buildSetNicknameRequest("89441000400128014257", "Test")
+	request, err := buildSetNicknameRequest("89441000000000000001", "Test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.ToUpper(hex.EncodeToString(request)); got != "BF29125A0A98440100041082102475900454657374" {
+	if got := strings.ToUpper(hex.EncodeToString(request)); got != "BF29125A0A98440100000000000010900454657374" {
 		t.Fatalf("SetNickname request = %s", got)
 	}
 	result, ok := setNicknameResult([]byte{0xBF, 0x29, 0x03, 0x80, 0x01, 0x00})
 	if !ok || result != 0 {
 		t.Fatalf("SetNickname result = (%d, %v)", result, ok)
 	}
-	if _, err := buildSetNicknameRequest("89441000400128014257", strings.Repeat("名", 65)); !errors.Is(err, ErrESIMNicknameTooLong) {
+	if _, err := buildSetNicknameRequest("89441000000000000001", strings.Repeat("名", 65)); !errors.Is(err, ErrESIMNicknameTooLong) {
 		t.Fatalf("long nickname error = %v", err)
 	}
 }
 
 func TestDisableProfileRequestAndResult(t *testing.T) {
-	request, err := buildDisableProfileRequest("89441000400128014257")
+	request, err := buildDisableProfileRequest("89441000000000000001")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.ToUpper(hex.EncodeToString(request)); got != "BF3211A00C5A0A984401000410821024758101FF" {
+	if got := strings.ToUpper(hex.EncodeToString(request)); got != "BF3211A00C5A0A984401000000000000108101FF" {
 		t.Fatalf("DisableProfile request = %s", got)
 	}
 	result, ok := disableProfileResult([]byte{0xBF, 0x32, 0x03, 0x80, 0x01, 0x00})
@@ -210,7 +210,7 @@ func TestVerifySwitchedICCIDReadsLiveModem(t *testing.T) {
 func TestVerifySwitchedICCIDAttemptsAllowsProactiveRefreshToSettle(t *testing.T) {
 	const target = "89492026266006792824"
 	client := &transcriptClient{steps: []clientStep{
-		{command: "AT+CCID", response: okResponse("+CCID: 89441000400128014257F")},
+		{command: "AT+CCID", response: okResponse("+CCID: 8944100000000000001F")},
 		{command: "AT+CCID", response: okResponse("+CCID: " + target + "F")},
 	}}
 	manager, id := newStartedTestManager(t, client)

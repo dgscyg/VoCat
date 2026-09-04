@@ -8,18 +8,21 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 19
+const schemaVersion = 23
 
 var ErrNotFound = errors.New("store: not found")
 
 // Store owns the SQLite connection used by the process.
 type Store struct {
-	db *sql.DB
+	db           *sql.DB
+	logMu        sync.Mutex
+	logClearedAt time.Time
 }
 
 type Admin struct {
@@ -124,7 +127,8 @@ func migrate(ctx context.Context, db *sql.DB) error {
 					(nextVersion == 8 && strings.Contains(statement, "ADD COLUMN device_type")) ||
 					(nextVersion == 14 && strings.Contains(statement, "ADD COLUMN")) ||
 					(nextVersion == 16 && strings.Contains(statement, "ADD COLUMN sim_pin")) ||
-					(nextVersion == 19 && strings.Contains(statement, "ADD COLUMN"))
+					(nextVersion == 19 && strings.Contains(statement, "ADD COLUMN")) ||
+					(nextVersion == 23 && strings.Contains(statement, "ADD COLUMN"))
 				if duplicateAdditiveColumn && strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
 					continue
 				}

@@ -13,6 +13,154 @@ import (
 
 var apnPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?$`)
 
+// qmiDataSession is deliberately independent from the QMI library types so
+// the manager can be tested and built on non-Linux hosts. A live session owns
+// its WDS client ID and must remain open for as long as the packet call exists.
+type qmiDataSession interface {
+	Start(context.Context, string, string, string, uint8, uint8) (uint32, error)
+	Stop(context.Context, uint32) error
+	StopAny(context.Context, bool) error
+	Connected(context.Context) (bool, error)
+	RawIP(context.Context) (bool, error)
+	SetRawIP(context.Context) error
+	RuntimeIPv4(context.Context) (qmiIPv4Settings, error)
+	Close() error
+}
+
+// qmiDataEventSource is an optional capability implemented by native QMI
+// sessions. The event channel only carries a wake-up signal; the caller must
+// query NetworkStatus before deciding whether recovery is required.
+type qmiDataEventSource interface {
+	RegisterPacketStatusEvents(context.Context) error
+	PacketStatusEvents() <-chan struct{}
+}
+
+// DeviceLifecycleEvent reports a physical modem discovery transition. It is
+// intentionally separate from packet-service events: a disappearance ends a
+// data-session lifecycle immediately and must not be treated as a recoverable
+// network probe failure.
+type DeviceLifecycleEvent struct {
+	ID      string
+	Present bool
+}
+
+// SubscribeDeviceLifecycleEvents subscribes to hotplug/discovery transitions.
+// Subscribers receive a best-effort wake-up and should re-read the current
+// device state before starting any new operation.
+func (manager *Manager) SubscribeDeviceLifecycleEvents(ctx context.Context) (<-chan DeviceLifecycleEvent, error) {
+	if manager == nil {
+		return nil, ErrDataBackendUnavailable
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	events := make(chan DeviceLifecycleEvent, 4)
+	manager.deviceEventsMu.Lock()
+	if manager.deviceEventSubscribers == nil {
+		manager.deviceEventSubscribers = make(map[chan DeviceLifecycleEvent]struct{})
+	}
+	manager.deviceEventSubscribers[events] = struct{}{}
+	manager.deviceEventsMu.Unlock()
+	if done := ctx.Done(); done != nil {
+		go func() {
+			<-done
+			manager.removeDeviceLifecycleSubscriber(events)
+		}()
+	}
+	return events, nil
+}
+
+func (manager *Manager) removeDeviceLifecycleSubscriber(events chan DeviceLifecycleEvent) {
+	manager.deviceEventsMu.Lock()
+	defer manager.deviceEventsMu.Unlock()
+	if _, ok := manager.deviceEventSubscribers[events]; !ok {
+		return
+	}
+	delete(manager.deviceEventSubscribers, events)
+	close(events)
+}
+
+func (manager *Manager) publishDeviceLifecycleEvent(event DeviceLifecycleEvent) {
+	if strings.TrimSpace(event.ID) == "" {
+		return
+	}
+	manager.deviceEventsMu.Lock()
+	defer manager.deviceEventsMu.Unlock()
+	for events := range manager.deviceEventSubscribers {
+		select {
+		case events <- event:
+		default:
+			// A later discovery or monitor pass will re-read state; do not let a
+			// slow subscriber block USB discovery for every other device.
+		}
+	}
+}
+
+type qmiDataSessionOpener func(context.Context, string) (qmiDataSession, error)
+
+type qmiIPv4Settings struct {
+	Address string
+	Prefix  int
+	Gateway string
+	DNS     []string
+	MTU     int
+}
+
+// SubscribeNetworkStatusEvents subscribes to modem-side packet-service
+// indications. The channel carries the physical device ID and is only a
+// wake-up signal; callers must query NetworkStatus before changing state.
+// Subscriptions are global so a server can keep one listener while devices
+// are added, removed, or remapped.
+func (manager *Manager) SubscribeNetworkStatusEvents(ctx context.Context) (<-chan string, error) {
+	if manager == nil {
+		return nil, ErrDataBackendUnavailable
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	events := make(chan string, 1)
+	manager.networkEventsMu.Lock()
+	if manager.networkEventSubscribers == nil {
+		manager.networkEventSubscribers = make(map[chan string]struct{})
+	}
+	manager.networkEventSubscribers[events] = struct{}{}
+	manager.networkEventsMu.Unlock()
+	if done := ctx.Done(); done != nil {
+		go func() {
+			<-done
+			manager.removeNetworkStatusEventSubscriber(events)
+		}()
+	}
+	return events, nil
+}
+
+func (manager *Manager) removeNetworkStatusEventSubscriber(events chan string) {
+	manager.networkEventsMu.Lock()
+	defer manager.networkEventsMu.Unlock()
+	if _, ok := manager.networkEventSubscribers[events]; !ok {
+		return
+	}
+	delete(manager.networkEventSubscribers, events)
+	close(events)
+}
+
+func (manager *Manager) publishNetworkStatusEvent(deviceID string) {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return
+	}
+	manager.networkEventsMu.Lock()
+	defer manager.networkEventsMu.Unlock()
+	for events := range manager.networkEventSubscribers {
+		select {
+		case events <- deviceID:
+		default:
+			// A pending wake-up is enough; the subscriber will query the latest
+			// state and the periodic monitor remains the safety net.
+		}
+	}
+}
+
 // ValidAPN reports whether value can safely be used as a modem PDP-context APN.
 // An empty value is valid and means that the modem/operator default should be used.
 func ValidAPN(value string) bool {
@@ -72,22 +220,11 @@ func (manager *Manager) SetNetwork(
 		return NetworkResult{}, errors.New("IP version must be IP, IPV6, or IPV4V6")
 	}
 
-	state.opMu.Lock()
-	defer state.opMu.Unlock()
-	if err := manager.validateActive(id, state); err != nil {
-		return NetworkResult{}, err
-	}
-	if request.Enabled {
-		if err := manager.regionBlockError(state); err != nil {
-			manager.setResult(id, state, nil, err)
-			return NetworkResult{}, err
-		}
-	}
 	candidate := manager.candidateFor(state)
 	backend := strings.ToLower(strings.TrimSpace(request.Backend))
 	// qmi_wwan (usbnet=0) only forwards packets after a WDS session. A stored
 	// "at" backend activates the modem PDP and copies CGCONTRDP onto wwan0,
-	// but RX stays 0 until qmi-network starts.
+	// but RX stays 0 until the native QMI WDS session starts.
 	if qmiWWANRawIP(candidate.NetworkInterface) && candidate.QMIControl != "" {
 		backend = "qmi"
 	} else if backend == "" {
@@ -101,22 +238,74 @@ func (manager *Manager) SetNetwork(
 		return NetworkResult{}, fmt.Errorf("unsupported cellular data backend %q", request.Backend)
 	}
 	if backend == "qmi" {
+		// QMI WDS owns a different control surface from the serial AT actor. Do
+		// not hold opMu while an external QMI transaction is in flight: a stale
+		// WDS client may take seconds to time out, and blocking opMu here also
+		// blocks SMS synchronization, IMS status and ordinary health probes.
+		state.dataMu.Lock()
+		defer state.dataMu.Unlock()
+		if err := manager.validateActive(id, state); err != nil {
+			return NetworkResult{}, err
+		}
+		candidate = manager.candidateFor(state)
+		if request.Enabled {
+			if err := manager.regionBlockError(state); err != nil {
+				return NetworkResult{}, err
+			}
+		}
 		if candidate.QMIControl == "" || candidate.NetworkInterface == "" {
 			return NetworkResult{}, fmt.Errorf("%w: QMI control device and network interface are required", ErrDataBackendUnavailable)
 		}
-		var atClient modem.Client
-		if client, clientErr := manager.clientLocked(ctx, state, candidate); clientErr == nil {
-			atClient = client
+		// OpenStick's native WWAN path must drive registration through QMI NAS.
+		// AT+COPS only updates the legacy AT facade on this firmware and can leave
+		// NAS in not-registered-searching, which then makes WDS dialing report a
+		// generic-no-service call failure.
+		if request.Enabled && isNativeQMICandidate(candidate) {
+			registrationContext, cancel := context.WithTimeout(ctx, manager.scanTimeout)
+			registrationSession, openErr := manager.openNativeQMIRegistration(registrationContext, candidate)
+			if openErr != nil {
+				cancel()
+				manager.setResult(id, state, nil, openErr)
+				return NetworkResult{}, fmt.Errorf("prepare native QMI registration: %w", openErr)
+			}
+			registrationErr := ensureNativeQMIRegistration(
+				registrationContext,
+				registrationSession,
+				qmiRegistrationRequestAutomatic(),
+				true,
+			)
+			_ = registrationSession.Close()
+			cancel()
+			if registrationErr != nil {
+				manager.setResult(id, state, nil, registrationErr)
+				return NetworkResult{}, registrationErr
+			}
 		}
-		result, err := setQMINetwork(ctx, candidate, request.Enabled, apn, ipVersion, request.Username, request.Password, authentication, atClient)
+		result, err := manager.setQMINetwork(ctx, state, candidate, request.Enabled, apn, ipVersion, request.Username, request.Password, authentication)
 		if err != nil && (request.Username != "" || request.Password != "") {
-			// qmi-network output is outside our control and may echo values read
-			// from its temporary profile. Do not return that output when the
-			// profile contains credentials.
+			// Keep credential-bearing request failures generic. Lower layers may
+			// include request fields in diagnostic errors. Preserve the sentinel
+			// class so callers can still classify an unavailable backend.
+			if errors.Is(err, ErrDataBackendUnavailable) {
+				return NetworkResult{}, fmt.Errorf("%w: authenticated QMI cellular data operation failed", ErrDataBackendUnavailable)
+			}
 			return NetworkResult{}, fmt.Errorf("%w: authenticated QMI cellular data operation failed", ErrCellularData)
 		}
 		return result, wrapCellularData(err)
 	}
+
+	state.opMu.Lock()
+	defer state.opMu.Unlock()
+	if err := manager.validateActive(id, state); err != nil {
+		return NetworkResult{}, err
+	}
+	if request.Enabled {
+		if err := manager.regionBlockError(state); err != nil {
+			manager.setResult(id, state, nil, err)
+			return NetworkResult{}, err
+		}
+	}
+	candidate = manager.candidateFor(state)
 
 	client, err := manager.clientLocked(ctx, state, candidate)
 	if err != nil {
@@ -208,7 +397,7 @@ var (
 )
 
 func wrapCellularData(err error) error {
-	if err == nil || errors.Is(err, ErrCellularData) || errors.Is(err, ErrDataBackendUnavailable) {
+	if err == nil || errors.Is(err, ErrCellularData) || errors.Is(err, ErrDataBackendUnavailable) || errors.Is(err, ErrDataOperationInProgress) {
 		return err
 	}
 	return fmt.Errorf("%w: %w", ErrCellularData, err)
@@ -237,6 +426,46 @@ func normalizeIPVersion(value string) string {
 	default:
 		return ""
 	}
+}
+
+// PrepareRegistration writes the PDP context that the modem will use during
+// the next EPS attach without starting a host data session. Some roaming SIMs
+// are rejected during registration when EC20 firmware restores a stale APN
+// after a baseband reboot, even when cellular data is disabled in VoCat.
+func (manager *Manager) PrepareRegistration(
+	ctx context.Context,
+	id string,
+	apn string,
+	ipVersion string,
+) error {
+	apn = strings.TrimSpace(apn)
+	if apn == "" {
+		return nil
+	}
+	if !ValidAPN(apn) {
+		return ErrInvalidNetworkAPN
+	}
+	ipVersion = normalizeIPVersion(ipVersion)
+	if ipVersion == "" {
+		return errors.New("IP version must be IP, IPV6, or IPV4V6")
+	}
+	state, err := manager.lookup(id)
+	if err != nil {
+		return err
+	}
+	state.opMu.Lock()
+	defer state.opMu.Unlock()
+	if err := manager.validateActive(id, state); err != nil {
+		return err
+	}
+	client, err := manager.clientLocked(ctx, state, manager.candidateFor(state))
+	if err != nil {
+		manager.setResult(id, state, nil, err)
+		return err
+	}
+	_, err = manager.command(ctx, client, fmt.Sprintf(`AT+CGDCONT=1,"%s","%s"`, ipVersion, apn))
+	manager.setResult(id, state, nil, err)
+	return err
 }
 
 func (manager *Manager) USBNetMode(ctx context.Context, id string) (USBNetMode, error) {

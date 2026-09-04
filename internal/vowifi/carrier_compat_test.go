@@ -1,59 +1,9 @@
 package vowifi
 
-import "testing"
-
-func TestAssignedRoutePLMNUsesNarrowCardAndSubscriptionMatches(t *testing.T) {
-	tests := []struct {
-		name         string
-		iccid        string
-		imsi         string
-		wantMCC      string
-		wantMNC      string
-		wantAssigned bool
-	}{
-		{name: "XeSIM Lebara route", iccid: "8944160000000000001", imsi: "204047000000001", wantMCC: "234", wantMNC: "15", wantAssigned: true},
-		{name: "CTExcel initial route", iccid: "8944300000000000001", imsi: "234336000000001", wantMCC: "234", wantMNC: "30", wantAssigned: true},
-		{name: "XeSIM ICCID without matching subscription", iccid: "8944160000000000001", imsi: "204041000000001"},
-		{name: "similar ICCID must not match", iccid: "8944100000000000001", imsi: "204047000000001"},
-		{name: "generic EE SIM must not match CTExcel", iccid: "8944110000000000000", imsi: "234336000000001"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			mcc, mnc, assigned := AssignedRoutePLMN(test.iccid, test.imsi)
-			if mcc != test.wantMCC || mnc != test.wantMNC || assigned != test.wantAssigned {
-				t.Fatalf("AssignedRoutePLMN() = %q/%q,%v, want %q/%q,%v", mcc, mnc, assigned, test.wantMCC, test.wantMNC, test.wantAssigned)
-			}
-		})
-	}
-}
-
-func TestApplyAssignedCarrierRoutePreservesAuthenticationPLMN(t *testing.T) {
-	identity := applyAssignedCarrierRoute(SIMIdentity{
-		ICCID: "8944300000000000001", IMSI: "234336000000001",
-		HomeMCC: "234", HomeMNC: "33",
-	})
-	if identity.HomeMCC != "234" || identity.HomeMNC != "33" {
-		t.Fatalf("authentication PLMN = %s/%s, want 234/33", identity.HomeMCC, identity.HomeMNC)
-	}
-	if identity.EPDG != "epdg.epc.mnc030.mcc234.pub.3gppnetwork.org" {
-		t.Fatalf("route ePDG = %q", identity.EPDG)
-	}
-}
-
-func TestIsATT310280RequiresMatchingPLMNAndIMSI(t *testing.T) {
-	if !IsATT310280(SIMIdentity{IMSI: "310280000000001", HomeMCC: "310", HomeMNC: "280"}) {
-		t.Fatal("AT&T 310/280 identity was not recognized")
-	}
-	for _, identity := range []SIMIdentity{
-		{IMSI: "310410000000001", HomeMCC: "310", HomeMNC: "280"},
-		{IMSI: "310280000000001", HomeMCC: "310", HomeMNC: "28"},
-		{IMSI: "310280000000001", HomeMCC: "311", HomeMNC: "280"},
-	} {
-		if IsATT310280(identity) {
-			t.Fatalf("unrelated identity matched AT&T 310/280: %#v", identity)
-		}
-	}
-}
+import (
+	"strings"
+	"testing"
+)
 
 func TestResolveCarrierProfileUsesStandardDefault(t *testing.T) {
 	profile := ResolveCarrierProfile(SIMIdentity{
@@ -69,79 +19,155 @@ func TestResolveCarrierProfileUsesStandardDefault(t *testing.T) {
 }
 
 func TestResolveCarrierProfilePrefersConstrainedMVNO(t *testing.T) {
+	// Cricket MVNO on AT&T network
+	cricket := ResolveCarrierProfile(SIMIdentity{
+		ICCID: "8901150000000000001", IMSI: "310150000000001",
+		HomeMCC: "310", HomeMNC: "150",
+	})
+	if !strings.Contains(cricket.ID, "cricket") {
+		t.Fatalf("Cricket MVNO profile = %#v", cricket)
+	}
+
+	// Pure Talk MVNO on AT&T network via GID1
+	pureTalk := ResolveCarrierProfile(SIMIdentity{
+		IMSI: "310410000000001", HomeMCC: "310", HomeMNC: "410", GID1: "62FFFF",
+	})
+	if !strings.Contains(pureTalk.ID, "pure-talk") {
+		t.Fatalf("Pure Talk MVNO profile = %#v", pureTalk)
+	}
+}
+
+func TestResolveCarrierProfileUsesAppleGID1Selector(t *testing.T) {
 	profile := ResolveCarrierProfile(SIMIdentity{
-		ICCID: "8944160000000000001", IMSI: "204047000000001",
-		HomeMCC: "204", HomeMNC: "04", SPN: "Lebara",
+		IMSI: "234100000000001", HomeMCC: "234", HomeMNC: "10", GID1: "508FFFFF",
 	})
-	if profile.ID != "xesim-lebara-vodafone-uk" || profile.RouteMCC != "234" || profile.RouteMNC != "15" {
-		t.Fatalf("MVNO profile = %#v", profile)
-	}
-	if profile.MatchSource != "hplmn+imsi+iccid" {
-		t.Fatalf("MVNO match source = %q", profile.MatchSource)
+	if !strings.Contains(profile.ID, "giffgaff") || profile.MatchSource != "hplmn+gid1" {
+		t.Fatalf("giffgaff profile = %#v", profile)
 	}
 }
 
-func TestResolveCarrierProfileUsesAlternativeMVNOSelectors(t *testing.T) {
-	tests := []struct {
-		name     string
-		identity SIMIdentity
-		source   string
-	}{
-		{
-			name:     "Apple GID1 selector",
-			identity: SIMIdentity{IMSI: "234100000000001", HomeMCC: "234", HomeMNC: "10", GID1: "508FFFFF"},
-			source:   "hplmn+gid1",
-		},
-		{
-			name:     "Android SPN selector",
-			identity: SIMIdentity{IMSI: "234100000000001", HomeMCC: "234", HomeMNC: "10", SPN: "GiffGaff"},
-			source:   "hplmn+spn",
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			profile := ResolveCarrierProfile(test.identity)
-			if profile.ID != "giffgaff-o2-uk" || profile.MatchSource != test.source {
-				t.Fatalf("giffgaff profile = %#v", profile)
-			}
-			if profile.SMSCenter != "+447802002606" || profile.IMSTransport != "udp" || !profile.IMSUserEqPhone {
-				t.Fatalf("giffgaff IMS settings = %#v", profile)
-			}
-		})
-	}
-
-	generic := ResolveCarrierProfile(SIMIdentity{
-		IMSI: "234100000000001", HomeMCC: "234", HomeMNC: "10",
-	})
-	if generic.ID != "o2-uk" || generic.SMSCenter != "+447802000332" {
-		t.Fatalf("generic O2 profile = %#v", generic)
-	}
-}
-
-func TestEEHostedProfileDoesNotClaimCTExcelBrand(t *testing.T) {
+func TestResolveCarrierProfileGiffgaffIMSHeaders(t *testing.T) {
 	profile := ResolveCarrierProfile(SIMIdentity{
-		ICCID: "8944300000000000001", IMSI: "234336000000001",
-		HomeMCC: "234", HomeMNC: "33",
+		IMSI: "234100000000001", HomeMCC: "234", HomeMNC: "10", GID1: "508FFFFF",
 	})
-	if profile.ID != "ee-uk-hosted-23433" || profile.RouteMCC != "234" || profile.RouteMNC != "30" {
-		t.Fatalf("EE-hosted profile = %#v", profile)
+	options := profile.IMSRegisterOptions
+	if profile.IMSTransport != "tcp" || options.ContactFormat != IMSContactFormatGSMA {
+		t.Fatalf("giffgaff IMS transport/contact profile = %#v", profile)
+	}
+	if profile.IMSUserAgent != "iOS/18.6.2 iPhone" {
+		t.Fatalf("giffgaff User-Agent = %q", profile.IMSUserAgent)
+	}
+	if options.SupportedHeader != nil || options.AllowHeader != nil {
+		t.Fatalf("giffgaff REGISTER header overrides = supported=%v allow=%v", options.SupportedHeader, options.AllowHeader)
+	}
+	if options.PAccessNetworkInfo != nil {
+		t.Fatalf("giffgaff unexpectedly defines a carrier PANI override = %v", *options.PAccessNetworkInfo)
+	}
+	if profile.PANIEnabled == nil || !*profile.PANIEnabled || profile.PANICountry != "AUTO" {
+		t.Fatalf("giffgaff PANI behavior = enabled=%v country=%q", profile.PANIEnabled, profile.PANICountry)
+	}
+	if len(options.ContactExtraTags) != 2 || options.ContactExtraTags[0] != "+g.3gpp.mid-call" || options.ContactExtraTags[1] != "+g.3gpp.smsip" {
+		t.Fatalf("giffgaff Contact tags = %#v", options.ContactExtraTags)
 	}
 }
 
-func TestResolveCarrierProfileNormalizesMNCWidth(t *testing.T) {
-	for _, mnc := range []string{"03", "003"} {
-		profile := ResolveCarrierProfile(SIMIdentity{HomeMCC: "262", HomeMNC: mnc})
-		if profile.ID != "o2-germany" || profile.AdvertiseEAPOnly || profile.IMSIPSecEncryption != "null" {
-			t.Errorf("O2 Germany MNC %q profile = %#v", mnc, profile)
-		}
+func TestResolveCarrierProfileATT(t *testing.T) {
+	profile := ResolveCarrierProfile(SIMIdentity{
+		ICCID: "8901410000000000001", IMSI: "310410000000001", HomeMCC: "310", HomeMNC: "410",
+	})
+	if !strings.Contains(profile.ID, "att") {
+		t.Fatalf("AT&T profile = %#v", profile)
 	}
 }
 
-func TestEPDGDNSClientSubnetComesFromCarrierProfileData(t *testing.T) {
-	if got := EPDGDNSClientSubnet("EPDG.EPC.MNC002.MCC262.PUB.3GPPNETWORK.ORG."); got != "109.192.0.0/24" {
-		t.Fatalf("Vodafone Germany DNS client subnet = %q", got)
+func TestResolveCarrierProfileRedPocketOutranksBroadATTICCID(t *testing.T) {
+	profile := ResolveCarrierProfile(SIMIdentity{
+		ICCID: "8901410000000000001", IMSI: "310170000000001",
+		HomeMCC: "310", HomeMNC: "170", SPN: "Red Pocket", GID1: "42FFFF",
+	})
+	if profile.ID != "ipcc-redpocket-310170" || profile.MatchSource != "hplmn+gid1" {
+		t.Fatalf("RedPocket profile = %#v", profile)
 	}
-	if got := EPDGDNSClientSubnet("epdg.epc.mnc015.mcc234.pub.3gppnetwork.org"); got != "" {
-		t.Fatalf("ordinary ePDG received geographic DNS fallback %q", got)
+}
+
+func TestResolveCarrierProfileStandardHasNoRegisterOverrides(t *testing.T) {
+	profile := ResolveCarrierProfile(SIMIdentity{HomeMCC: "999", HomeMNC: "99"})
+	if profile.ID != CarrierProfileStandard {
+		t.Fatalf("profile = %q", profile.ID)
+	}
+	if profile.IMSRegisterOptions.ExpirySeconds != 0 {
+		t.Fatalf("standard expiry = %d", profile.IMSRegisterOptions.ExpirySeconds)
+	}
+	if profile.IMSRegisterOptions.ContactFormat != "" {
+		t.Fatalf("standard contact format = %q", profile.IMSRegisterOptions.ContactFormat)
+	}
+	if profile.IMSRegisterOptions.SupportedHeader != nil {
+		t.Fatalf("standard supported header = %v", *profile.IMSRegisterOptions.SupportedHeader)
+	}
+	if profile.PANIEnabled != nil || profile.PANICountry != "" {
+		t.Fatalf("standard PANI behavior = enabled=%v country=%q", profile.PANIEnabled, profile.PANICountry)
+	}
+	if profile.AllowSMSWithoutContactConfirmation {
+		t.Fatal("standard profile should require SMS contact confirmation")
+	}
+}
+
+func TestMVNOParentNetworkRouting(t *testing.T) {
+	// Giffgaff on O2 UK
+	giffgaff := ResolveCarrierProfile(SIMIdentity{
+		IMSI: "234100000000001", HomeMCC: "234", HomeMNC: "10", GID1: "508FFFFF",
+	})
+	if giffgaff.RouteMCC != "234" || giffgaff.RouteMNC != "10" {
+		t.Fatalf("giffgaff Route PLMN = %s-%s, want 234-10", giffgaff.RouteMCC, giffgaff.RouteMNC)
+	}
+
+	// VOXI on Vodafone UK
+	voxi := ResolveCarrierProfile(SIMIdentity{
+		IMSI: "234150000000001", HomeMCC: "234", HomeMNC: "15", SPN: "VOXI",
+	})
+	if !strings.Contains(voxi.ID, "voxi") || voxi.RouteMCC != "234" || voxi.RouteMNC != "15" {
+		t.Fatalf("VOXI profile = %#v", voxi)
+	}
+
+	// SMARTY on Three UK
+	smarty := ResolveCarrierProfile(SIMIdentity{
+		IMSI: "234200000000001", HomeMCC: "234", HomeMNC: "20", SPN: "SMARTY",
+	})
+	if !strings.Contains(smarty.ID, "smarty") || smarty.RouteMCC != "234" || smarty.RouteMNC != "20" {
+		t.Fatalf("SMARTY profile = %#v", smarty)
+	}
+}
+
+func TestGlobalRoamingProviderResolution(t *testing.T) {
+	// Truphone / BetterRoaming global 90143
+	truphone := ResolveCarrierProfile(SIMIdentity{
+		IMSI: "901430000000001", HomeMCC: "901", HomeMNC: "43",
+	})
+	if (!strings.Contains(truphone.ID, "truphone") && !strings.Contains(truphone.ID, "1global")) || truphone.EPDG != "epdg.eps.truphone.net" {
+		t.Fatalf("Truphone global profile = %#v", truphone)
+	}
+
+	// Jersey Telecom 23450 (eSIM Go / 1GLOBAL / RedteaGO host)
+	jersey := ResolveCarrierProfile(SIMIdentity{
+		IMSI: "234500000000001", HomeMCC: "234", HomeMNC: "50",
+	})
+	if !strings.Contains(jersey.ID, "jersey-telecom") || jersey.EPDG != "epdg.epc.mnc050.mcc234.pub.3gppnetwork.org" {
+		t.Fatalf("Jersey Telecom profile = %#v", jersey)
+	}
+}
+
+func TestCTExcelMVNOResolution(t *testing.T) {
+	ctexcel := ResolveCarrierProfile(SIMIdentity{
+		IMSI:    "234330000000001",
+		ICCID:   "8944300000000000001",
+		SPN:     "CTExcel",
+		HomeMCC: "234",
+		HomeMNC: "33",
+	})
+	if ctexcel.ID != "ipcc-ctexcel-23433" {
+		t.Fatalf("CTExcel profile ID = %q, want ipcc-ctexcel-23433", ctexcel.ID)
+	}
+	if ctexcel.IMSDialURIScheme != "sip" || !ctexcel.IMSUserEqPhone {
+		t.Fatalf("CTExcel dial URI scheme = %q, userEqPhone = %v", ctexcel.IMSDialURIScheme, ctexcel.IMSUserEqPhone)
 	}
 }

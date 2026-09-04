@@ -18,6 +18,7 @@ import (
 	"vocat/internal/modem"
 	"vocat/internal/store"
 	"vocat/internal/update"
+	"vocat/internal/vowifi"
 )
 
 func decodeData(t *testing.T, recorder *httptest.ResponseRecorder) map[string]any {
@@ -69,6 +70,127 @@ func TestParseModemAPNProfiles(t *testing.T) {
 	}
 	if profiles[1].CID != 2 || profiles[1].APN != "ims" || profiles[1].IPVersion != "IP" {
 		t.Fatalf("second profile = %#v", profiles[1])
+	}
+}
+
+type fakeCellularIMSController struct {
+	fakeDeviceController
+	status device.CellularIMSStatus
+	setTo  *device.CellularIMSMode
+	setErr error
+}
+
+type rebootDataController struct{ fakeDeviceController }
+
+func (controller *rebootDataController) SetNetwork(_ context.Context, _ string, request device.NetworkRequest) (device.NetworkResult, error) {
+	return device.NetworkResult{Enabled: request.Enabled}, nil
+}
+
+func (controller *fakeCellularIMSController) CellularIMS(context.Context, string) (device.CellularIMSStatus, error) {
+	return controller.status, controller.setErr
+}
+
+func (controller *fakeCellularIMSController) SetCellularIMS(_ context.Context, _ string, mode device.CellularIMSMode) (device.CellularIMSStatus, error) {
+	controller.setTo = &mode
+	return controller.status, controller.setErr
+}
+
+func TestCellularIMSPatchAppliesModuleModeWithoutPersistingCardPolicy(t *testing.T) {
+	test := newSettingsAPITest(t)
+	controller := &fakeCellularIMSController{
+		fakeDeviceController: fakeDeviceController{entry: device.Device{
+			ID: "physical-1", Discovered: true,
+		}},
+		status: device.CellularIMSStatus{Supported: true, Mode: device.CellularIMSModeForceEnabled, Configured: true, Changed: true, Rebooting: true},
+	}
+	test.server.devices = controller
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPatch, "/api/devices/configured-1/cellular-ims", strings.NewReader(`{"mode":"force_enabled"}`))
+	request.Header.Set("Content-Type", "application/json")
+	if !test.server.handleCellularIMS(recorder, request, store.Device{ID: "configured-1"}, "physical-1") {
+		t.Fatal("handleCellularIMS returned false")
+	}
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body)
+	}
+	if controller.setTo == nil || *controller.setTo != device.CellularIMSModeForceEnabled {
+		t.Fatalf("SetCellularIMS captured %v", controller.setTo)
+	}
+	if policies, err := test.database.ListCardPolicies(context.Background()); err != nil || len(policies) != 0 {
+		t.Fatalf("module IMS action unexpectedly persisted a card policy: %v", err)
+	}
+}
+
+func TestCellularIMSPatchKeepsLegacyFalseAsMBNDefault(t *testing.T) {
+	test := newSettingsAPITest(t)
+	controller := &fakeCellularIMSController{
+		fakeDeviceController: fakeDeviceController{entry: device.Device{ID: "physical-1", Discovered: true}},
+		status:               device.CellularIMSStatus{Supported: true, Mode: device.CellularIMSModeMBNDefault},
+	}
+	test.server.devices = controller
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPatch, "/api/devices/configured-1/cellular-ims", strings.NewReader(`{"enabled":false}`))
+	request.Header.Set("Content-Type", "application/json")
+	test.server.handleCellularIMS(recorder, request, store.Device{ID: "configured-1"}, "physical-1")
+	if recorder.Code != http.StatusOK || controller.setTo == nil || *controller.setTo != device.CellularIMSModeMBNDefault {
+		t.Fatalf("legacy false status=%d mode=%v body=%s", recorder.Code, controller.setTo, recorder.Body)
+	}
+}
+
+func TestCellularIMSPatchRejectsUnknownMode(t *testing.T) {
+	test := newSettingsAPITest(t)
+	controller := &fakeCellularIMSController{
+		fakeDeviceController: fakeDeviceController{entry: device.Device{ID: "physical-1", Discovered: true}},
+	}
+	test.server.devices = controller
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPatch, "/api/devices/configured-1/cellular-ims", strings.NewReader(`{"mode":"disabled"}`))
+	request.Header.Set("Content-Type", "application/json")
+	test.server.handleCellularIMS(recorder, request, store.Device{ID: "configured-1"}, "physical-1")
+	if recorder.Code != http.StatusBadRequest || controller.setTo != nil {
+		t.Fatalf("unknown mode status=%d applied=%v body=%s", recorder.Code, controller.setTo, recorder.Body)
+	}
+}
+
+func TestManualModemRebootInvalidatesConnectedDataRuntime(t *testing.T) {
+	test := newSettingsAPITest(t)
+	const iccid = "8944305293607130156"
+	controller := &rebootDataController{fakeDeviceController: fakeDeviceController{entry: device.Device{
+		ID: "physical-1", Discovered: true,
+		Candidate: modem.Candidate{USBPath: "/sys/bus/usb/devices/1-1"},
+		Snapshot:  &device.Snapshot{DeviceID: "physical-1", SIMReady: true, ICCID: iccid, PSAttached: true},
+	}}}
+	test.server.devices = controller
+	config := store.Device{
+		ID: "configured-1", Name: "modem", DeviceType: store.DeviceTypePCIeEC20EC25,
+		USBPath: "/sys/bus/usb/devices/1-1", NetworkEnabled: true, DeviceBackend: "qmi",
+	}
+	if err := test.database.UpsertDevice(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+	runtime := test.server.cellularDataRuntime()
+	root, cancelRoot := context.WithCancel(context.Background())
+	defer cancelRoot()
+	runtime.start(root)
+	requested := runtime.request(config.ID, controller.entry.ID, device.NetworkRequest{Enabled: true, Backend: "qmi"})
+	waitContext, cancelWait := context.WithTimeout(context.Background(), time.Second)
+	connected, err := runtime.wait(waitContext, config.ID, requested.Revision)
+	cancelWait()
+	if err != nil || !connected.Connected {
+		t.Fatalf("initial runtime = %+v, err = %v", connected, err)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/devices/configured-1/actions/reboot", nil)
+	if !test.server.handleDevicePath(recorder, request, config.ID, []string{"actions", "reboot"}) {
+		t.Fatal("handleDevicePath returned false")
+	}
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body)
+	}
+	status := runtime.status(config.ID, true)
+	if status.Connected || status.Phase != "recovering" || !status.DesiredEnabled {
+		t.Fatalf("runtime after reboot = %+v", status)
 	}
 }
 
@@ -266,6 +388,143 @@ func TestHandleUSSDContinueRequiresSession(t *testing.T) {
 	}
 }
 
+// fakeUSSIController implements both VoWiFiController and the optional
+// imsUSSIController interface so the HTTP layer USSI path can be exercised
+// without a real runtime manager.
+type fakeUSSIController struct {
+	fakeVoWiFiController
+	sendErr    error
+	sendResult vowifi.USSISubmitResult
+	sendCalled int
+	lastInput  string
+}
+
+func (controller *fakeUSSIController) SendUSSI(
+	_ context.Context,
+	_ string,
+	request vowifi.USSISubmitRequest,
+) (vowifi.USSISubmitResult, error) {
+	controller.sendCalled++
+	controller.lastInput = request.Input
+	if request.Code != "" {
+		controller.lastInput = request.Code
+	}
+	return controller.sendResult, controller.sendErr
+}
+
+func TestHandleUSSDRoutesOverIMSWhenReady(t *testing.T) {
+	controller := &fakeUSSIController{
+		fakeVoWiFiController: fakeVoWiFiController{state: vowifi.State{IMSReady: true}},
+		sendResult:           vowifi.USSISubmitResult{Status: "final", Text: "IMS balance"},
+	}
+	devices := fakeDeviceController{ussdResult: device.USSDResult{Status: "final", Text: "cellular"}}
+	server := &Server{
+		logger:              regionTestLogger(),
+		maxRequestBodyBytes: 4096,
+		devices:             devices,
+		vowifi:              controller,
+	}
+	request := httptest.NewRequest(http.MethodPost, "/actions/ussd", strings.NewReader(`{"command":"*100#"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	server.handleUSSD(recorder, request, store.Device{ID: "dev1", VoWiFiEnabled: true}, "dev1")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := decodeData(t, recorder)
+	result, _ := data["result"].(map[string]any)
+	if result["text"] != "IMS balance" {
+		t.Fatalf("result = %v, want IMS routed response", result)
+	}
+	if controller.sendCalled != 1 {
+		t.Fatalf("SendUSSI called %d times, want 1", controller.sendCalled)
+	}
+}
+
+func TestHandleUSSDFallsBackToCellularWhenIMSNotReady(t *testing.T) {
+	controller := &fakeUSSIController{
+		fakeVoWiFiController: fakeVoWiFiController{state: vowifi.State{}},
+	}
+	devices := fakeDeviceController{ussdResult: device.USSDResult{Status: "final", Text: "cellular"}}
+	server := &Server{
+		logger:              regionTestLogger(),
+		maxRequestBodyBytes: 4096,
+		devices:             devices,
+		vowifi:              controller,
+	}
+	request := httptest.NewRequest(http.MethodPost, "/actions/ussd", strings.NewReader(`{"command":"*100#"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	server.handleUSSD(recorder, request, store.Device{ID: "dev1", VoWiFiEnabled: true}, "dev1")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := decodeData(t, recorder)
+	result, _ := data["result"].(map[string]any)
+	if result["text"] != "cellular" {
+		t.Fatalf("result = %v, want cellular fallback", result)
+	}
+	if controller.sendCalled != 0 {
+		t.Fatalf("SendUSSI called %d times, want 0", controller.sendCalled)
+	}
+}
+
+func TestHandleUSSDContinueUsesIMSForUSSIPersistedSession(t *testing.T) {
+	database, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.UpsertDevice(context.Background(), store.Device{ID: "dev1", Name: "test", DeviceType: store.DeviceTypePCIeEC20EC25, VoWiFiEnabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	controller := &fakeUSSIController{
+		fakeVoWiFiController: fakeVoWiFiController{state: vowifi.State{IMSReady: true}},
+		sendResult:           vowifi.USSISubmitResult{Status: "awaiting_input", Text: "Sub-menu"},
+	}
+	server := &Server{
+		logger:              regionTestLogger(),
+		maxRequestBodyBytes: 4096,
+		store:               database,
+		vowifi:              controller,
+	}
+	sessionID := server.openUSSDSession("dev1")
+	request := httptest.NewRequest(http.MethodPost, "/actions/ussd/continue", strings.NewReader(`{"session_id":"`+sessionID+`","input":"1"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	server.handleUSSDContinue(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := decodeData(t, recorder)
+	result, _ := data["result"].(map[string]any)
+	if result["text"] != "Sub-menu" {
+		t.Fatalf("result = %v, want IMS continue response", result)
+	}
+	if controller.sendCalled != 1 || controller.lastInput != "1" {
+		t.Fatalf("SendUSSI called %d times with input %q, want 1/1", controller.sendCalled, controller.lastInput)
+	}
+}
+
+func TestHandleUSSDCancelDropsUSSIPersistedSession(t *testing.T) {
+	server := &Server{
+		logger:              regionTestLogger(),
+		maxRequestBodyBytes: 4096,
+		vowifi:              &fakeUSSIController{},
+	}
+	sessionID := server.openUSSDSession("dev1")
+	request := httptest.NewRequest(http.MethodPost, "/actions/ussd/cancel", strings.NewReader(`{"session_id":"`+sessionID+`"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	server.handleUSSDCancel(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	if _, err := server.ussdSessionDevice(sessionID); !errors.Is(err, device.ErrUSSDSessionNotFound) {
+		t.Fatalf("session token was not dropped: %v", err)
+	}
+}
+
 func TestHandleCardPoliciesListsAll(t *testing.T) {
 	database, err := store.Open(context.Background(), ":memory:")
 	if err != nil {
@@ -442,7 +701,7 @@ func TestHandleESIMNotificationsListAndRetry(t *testing.T) {
 	controller := &fakeEsimNotificationController{items: []device.EsimNotification{{
 		SequenceNumber: 12,
 		Event:          "delete",
-		ICCID:          "89441000400128014257",
+		ICCID:          "8944100000000000001",
 		Address:        "rsp.example.com",
 		AIDHex:         "A0000005591010FFFFFFFF8900000100",
 		CanRetry:       true,
@@ -861,7 +1120,7 @@ func TestHandleCellularDataRejectsDisableWhileExportProxyActive(t *testing.T) {
 		t.Fatal(err)
 	}
 	recorder = patchOff()
-	if recorder.Code != http.StatusOK {
+	if recorder.Code != http.StatusAccepted {
 		t.Fatalf("disable after proxy off status = %d, body = %s", recorder.Code, recorder.Body)
 	}
 	stored, err = database.Device(ctx, "modem-1")

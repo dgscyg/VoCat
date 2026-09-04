@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -18,8 +19,35 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"vocat/internal/auth"
+	"vocat/internal/loghub"
 	"vocat/internal/store"
 )
+
+func TestUserOperationLoggerExcludesReadTraffic(t *testing.T) {
+	hub := loghub.New(slog.NewTextHandler(io.Discard, nil), 100)
+	server := &Server{logger: slog.New(hub)}
+	handler := server.logUserOperation(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/devices", nil))
+	if history := hub.History(10, slog.LevelDebug, ""); len(history) != 0 {
+		t.Fatalf("GET traffic produced diagnostic logs: %#v", history)
+	}
+
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPatch, "/api/devices/dev1/network", nil))
+	history := hub.History(10, slog.LevelDebug, "")
+	if len(history) != 1 {
+		t.Fatalf("mutation log count = %d, want 1", len(history))
+	}
+	if history[0].Message != "user operation completed" || history[0].Fields["category"] != "network" {
+		t.Fatalf("mutation log = %#v", history[0])
+	}
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodDelete, "/api/logs/history", nil))
+	if history = hub.History(10, slog.LevelDebug, ""); len(history) != 1 {
+		t.Fatalf("log clear endpoint produced an operation log: %#v", history)
+	}
+}
 
 type testApplication struct {
 	server *httptest.Server

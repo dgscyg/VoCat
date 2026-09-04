@@ -1,6 +1,7 @@
 package device
 
 import (
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -264,6 +265,94 @@ func TestParseCMGLPreservesUndecodableRecord(t *testing.T) {
 	}
 }
 
+func TestDecodeAlphanumericTPAddress(t *testing.T) {
+	// "TEST" encoded as 4 GSM-7 septets packed into 4 bytes (non-standard septet count format: length=4).
+	cursor := &pduCursor{data: []byte{0x04, 0xd0, 0xd4, 0xe2, 0x94, 0x0a}}
+	address, err := readTPAddress(cursor)
+	if err != nil {
+		t.Fatalf("readTPAddress error = %v", err)
+	}
+	if address != "TEST" {
+		t.Fatalf("readTPAddress = %q, want TEST", address)
+	}
+	if cursor.index != len(cursor.data) {
+		t.Fatalf("cursor did not consume all bytes: %d/%d", cursor.index, len(cursor.data))
+	}
+}
+
+func TestDecodeAlphanumericTPAddressStandard3GPP(t *testing.T) {
+	// "Google" (6 chars) encoded per 3GPP TS 23.040 §9.1.2.5:
+	// length = 0x0B (11 useful semi-octets), TOA = 0xD0 (Alphanumeric),
+	// 6 bytes payload: C7 F7 FB CC 2E 03
+	cursor := &pduCursor{data: []byte{0x0b, 0xd0, 0xc7, 0xf7, 0xfb, 0xcc, 0x2e, 0x03}}
+	address, err := readTPAddress(cursor)
+	if err != nil {
+		t.Fatalf("readTPAddress standard 3GPP error = %v", err)
+	}
+	if address != "Google" {
+		t.Fatalf("readTPAddress standard 3GPP = %q, want Google", address)
+	}
+	if cursor.index != len(cursor.data) {
+		t.Fatalf("cursor did not consume all bytes: %d/%d", cursor.index, len(cursor.data))
+	}
+
+	// "TEST" (4 chars) with standard 3GPP semi-octets (length = 0x08, 8 semi-octets -> 4 bytes)
+	cursorTest := &pduCursor{data: []byte{0x08, 0xd0, 0xd4, 0xe2, 0x94, 0x0a}}
+	addressTest, err := readTPAddress(cursorTest)
+	if err != nil {
+		t.Fatalf("readTPAddress standard 3GPP TEST error = %v", err)
+	}
+	if addressTest != "TEST" {
+		t.Fatalf("readTPAddress standard 3GPP TEST = %q, want TEST", addressTest)
+	}
+}
+
+func TestDecodeDeliverPDUWithAlphanumericSender(t *testing.T) {
+	// SMS-DELIVER with alphanumeric originator "VoCat" and empty user data.
+	// SMSC length=0, first octet=0x04, OA length=0x05, OA TON=0xD0,
+	// OA bytes pack "VoCat" (5 septets -> 5 bytes), PID=0x00, DCS=0x00,
+	// SCTS=7 bytes, UDL=0x00.
+	message, err := decodeSMSPDU("000405D0D6F7304C0700004210203040500000")
+	if err != nil {
+		t.Fatalf("decodeSMSPDU error = %v", err)
+	}
+	if message.From != "VoCat" {
+		t.Fatalf("From = %q, want VoCat", message.From)
+	}
+	if message.Direction != SMSDirectionReceived {
+		t.Fatalf("Direction = %q", message.Direction)
+	}
+}
+
+func TestDecodeDeliverPDUWithShortStandardAlphanumericSender(t *testing.T) {
+	// TP-OA length is expressed in useful semi-octets. The three-character
+	// sender "OKX" therefore has length 6, even though it contains 3 septets.
+	// A previous short-address heuristic interpreted 6 as the character count
+	// and swallowed PID, DCS, and timestamp bytes into the sender address.
+	text := "Your OKX verification code is: 123456"
+	textSeptets, ok := encodeGSM7(text)
+	if !ok {
+		t.Fatal("test text is not GSM-7 encodable")
+	}
+	pdu := []byte{0x00, 0x04, 0x06, 0xd0}
+	pdu = append(pdu, packSeptets([]byte{'O', 'K', 'X'}, 0)...)
+	pdu = append(pdu,
+		0x00, 0x00, // PID and GSM-7 DCS.
+		0x62, 0x80, 0x20, 0x91, 0x40, 0x95, 0x00, // 2026-08-02 19:04:59 UTC.
+		byte(len(textSeptets)),
+	)
+	pdu = append(pdu, packSeptets(textSeptets, 0)...)
+
+	message, err := decodeSMSPDU(hex.EncodeToString(pdu))
+	if err != nil {
+		t.Fatalf("decode short alphanumeric sender: %v", err)
+	}
+	if message.From != "OKX" || message.Text != text ||
+		message.Encoding != SMSEncodingGSM7PDU || message.DataCodingScheme != 0 {
+		t.Fatalf("message = %#v", message)
+	}
+}
+
 func TestDecode8BitPDUShowsHexPayload(t *testing.T) {
 	// SMS-DELIVER with no SMSC, from +12345, DCS=0xF5 (8-bit data,
 	// alphabet bits 0x0c), UDL=3. User data bytes are 0xAA 0xBB 0xCC.
@@ -279,5 +368,89 @@ func TestDecode8BitPDUShowsHexPayload(t *testing.T) {
 		message.Text != "AABBCC" ||
 		message.RawUserData != "AABBCC" {
 		t.Fatalf("8-bit message = %#v", message)
+	}
+}
+
+func TestDecodeUserDataUnderstandsDCSGroups(t *testing.T) {
+	septets, ok := encodeGSM7("HELLO")
+	if !ok {
+		t.Fatal("encode GSM-7 test text")
+	}
+	packed := packSeptets(septets, 0)
+	for _, dcs := range []byte{0x00, 0xc8, 0xd0, 0xf0} {
+		message := SMSMessage{}
+		if err := decodeUserData(packed, 0, dcs, len(septets), &message); err != nil {
+			t.Fatalf("decode DCS 0x%02X: %v", dcs, err)
+		}
+		if message.Text != "HELLO" || message.Encoding != SMSEncodingGSM7PDU {
+			t.Fatalf("DCS 0x%02X message = %#v", dcs, message)
+		}
+	}
+
+	ucs2 := []byte{0x4f, 0x60, 0x59, 0x7d}
+	for _, dcs := range []byte{0x08, 0xe0} {
+		message := SMSMessage{}
+		if err := decodeUserData(ucs2, 0, dcs, len(ucs2), &message); err != nil {
+			t.Fatalf("decode DCS 0x%02X: %v", dcs, err)
+		}
+		if message.Text != "你好" || message.Encoding != SMSEncodingUCS2PDU {
+			t.Fatalf("DCS 0x%02X message = %#v", dcs, message)
+		}
+	}
+}
+
+func TestDecodeGSM7NationalLanguageTables(t *testing.T) {
+	// National language locking shift IEI 0x25, Turkish table 1. In that
+	// locking table septet 0x07 is the dotless i (ı), rather than default ì.
+	header := []byte{0x03, 0x25, 0x01, 0x01}
+	headerSeptets := (len(header)*8 + 6) / 7
+	data := packSeptets([]byte{0x07}, headerSeptets*7)
+	copy(data, header)
+
+	message := SMSMessage{}
+	if err := decodeUserData(data, 0x40, 0x00, headerSeptets+1, &message); err != nil {
+		t.Fatalf("decode Turkish locking table: %v", err)
+	}
+	if message.Text != "ı" || message.Encoding != SMSEncodingGSM7PDU {
+		t.Fatalf("message = %#v", message)
+	}
+}
+
+func TestDecode8BitTextEncodingsAndPreservesBinary(t *testing.T) {
+	tests := []struct {
+		name     string
+		payload  []byte
+		wantText string
+		encoding SMSEncoding
+	}{
+		{name: "UTF-8", payload: []byte("验证码 123456"), wantText: "验证码 123456", encoding: SMSEncodingUTF8PDU},
+		{name: "GB18030", payload: []byte{0xd1, 0xe9, 0xd6, 0xa4, 0xc2, 0xeb}, wantText: "验证码", encoding: SMSEncodingGB18030},
+		{name: "Latin-1", payload: []byte{'C', 'a', 'f', 0xe9}, wantText: "Café", encoding: SMSEncodingLatin1},
+		{name: "binary", payload: []byte{0xaa, 0xbb, 0xcc}, wantText: "AABBCC", encoding: SMSEncoding8BitPDU},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			message := SMSMessage{}
+			if err := decodeUserData(test.payload, 0, 0x04, len(test.payload), &message); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if message.Text != test.wantText || message.Encoding != test.encoding {
+				t.Fatalf("message = %#v", message)
+			}
+		})
+	}
+}
+
+func TestDecodePortAddressed8BitSMSRemainsBinary(t *testing.T) {
+	header := []byte{0x04, 0x04, 0x02, 0x0b, 0x84}
+	data := append(append([]byte(nil), header...), []byte("plain-looking payload")...)
+	message := SMSMessage{}
+	if err := decodeUserData(data, 0x40, 0x04, len(data), &message); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	payload := data[len(header):]
+	if message.Text != strings.ToUpper(hex.EncodeToString(payload)) ||
+		message.Encoding != SMSEncoding8BitPDU {
+		t.Fatalf("message = %#v", message)
 	}
 }

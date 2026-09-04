@@ -187,6 +187,11 @@ pas une découverte multi-périphériques ou à chaud complète.
 
 L'image GHCR est publiée pour `linux/amd64` et `linux/arm64`.
 
+> [!TIP]
+> **Note de déploiement NAS / QNAP Container Station** :
+> Sur les systèmes NAS tels que QNAP QTS / QuTS hero (Container Station), les comptes administrateurs personnalisés et les mécanismes d'isolation de volumes peuvent faire en sorte que les volumes nommés Docker (ex. `-v vocat-data:/opt/vocat/data`) soient résolus vers des chemins isolés différents entre l'initialisation unique `bootstrap-admin` et le conteneur de service principal, entraînant des erreurs de mot de passe incorrect sur l'interface Web.
+> Pour les environnements NAS, il est fortement recommandé de remplacer les volumes nommés par un montage bind avec chemin absolu de l'hôte (ex. `-v /share/Container/vocat/data:/opt/vocat/data` sur QNAP) pour l'initialisation et l'exécution afin de garantir une persistance cohérente de la base de données SQLite.
+
 ## Configuration
 
 Vocat lit un fichier de configuration JSON optionnel depuis `VOCAT_CONFIG`, puis applique les variables d'environnement `VOCAT_*`. Les variables d'environnement ont la priorité.

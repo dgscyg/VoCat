@@ -130,6 +130,11 @@ func (s *Server) handleCallAction(w http.ResponseWriter, r *http.Request, config
 			}
 		}
 		if err != nil {
+			s.logger.Warn("VoWiFi call operation failed",
+				"category", "call", "event", "call."+action,
+				"device_id", config.ID, "number", number, "call_id", callID,
+				"transport", transport, "raw_error", err,
+			)
 			writeError(w, http.StatusBadGateway, "vowifi_call_failed", err.Error())
 			return true
 		}
@@ -156,6 +161,11 @@ func (s *Server) handleCallAction(w http.ResponseWriter, r *http.Request, config
 		return true
 	}
 	if !strings.EqualFold(strings.TrimSpace(response.Final), "OK") {
+		s.logger.Warn("cellular call operation rejected",
+			"category", "call", "event", "call."+action,
+			"device_id", config.ID, "number", number, "transport", transport,
+			"modem_final", response.Final, "raw_response", response.Text(),
+		)
 		writeError(w, http.StatusBadGateway, "call_rejected", "modem did not accept the call action")
 		return true
 	}

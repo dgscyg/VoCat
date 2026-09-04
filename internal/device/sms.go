@@ -266,8 +266,24 @@ func (manager *Manager) DeleteSMS(
 	id string,
 	index int,
 ) error {
+	return manager.DeleteSMSFromStorage(ctx, id, "", index)
+}
+
+// DeleteSMSFromStorage removes one message from a specific modem storage.
+// Selecting CPMS and deleting the index share the same device lock so a
+// concurrent SM/ME scan cannot change the active storage between commands.
+func (manager *Manager) DeleteSMSFromStorage(
+	ctx context.Context,
+	id string,
+	storage string,
+	index int,
+) error {
 	if index <= 0 {
 		return ErrSMSInvalidMessageIndex
+	}
+	storage = strings.ToUpper(strings.TrimSpace(storage))
+	if storage != "" && storage != "SM" && storage != "ME" {
+		return fmt.Errorf("unsupported SMS storage %q", storage)
 	}
 	state, err := manager.lookup(id)
 	if err != nil {
@@ -282,6 +298,12 @@ func (manager *Manager) DeleteSMS(
 	if err != nil {
 		manager.setResult(id, state, nil, err)
 		return err
+	}
+	if storage != "" {
+		if _, err := manager.command(ctx, client, fmt.Sprintf("AT+CPMS=%q", storage)); err != nil {
+			manager.setResult(id, state, nil, err)
+			return err
+		}
 	}
 	_, err = manager.command(ctx, client, fmt.Sprintf("AT+CMGD=%d", index))
 	manager.setResult(id, state, nil, err)
@@ -384,7 +406,7 @@ func parseCMGLHeader(line string) smsRecordHeader {
 	}
 	var ok bool
 	header.index, ok = parseDecimal(values[0])
-	if !ok || header.index <= 0 {
+	if !ok || header.index < 0 {
 		header.err = errors.New("invalid CMGL message index")
 	}
 	header.status = parseSMSStorageStatus(values[1])

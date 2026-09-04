@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -77,6 +79,53 @@ func TestIncomingCallCanBeRejected(t *testing.T) {
 	calls := session.Calls()
 	if len(calls) != 1 || calls[0].State != "ended" || calls[0].EndedAt == nil {
 		t.Fatalf("terminal call status = %#v", calls)
+	}
+}
+
+func TestIncomingCallTriggersOnIncomingCallCallback(t *testing.T) {
+	var captured ReceivedCall
+	called := make(chan struct{}, 1)
+	provider := &Provider{
+		config: Config{
+			OnIncomingCall: func(_ context.Context, call ReceivedCall) error {
+				captured = call
+				called <- struct{}{}
+				return nil
+			},
+		},
+	}
+	session := &Session{
+		provider: provider,
+		fromTag:  "local-tag",
+		calls:    make(map[string]*imsCall),
+		request: vowifi.IMSRequest{
+			DeviceID: "ec20-test",
+			Identity: vowifi.SIMIdentity{IMSI: "123456789012345"},
+		},
+		identity: identitySet{public: "sip:+447700900123@example.test"},
+	}
+	packet, err := parseSIPPacket([]byte(strings.Join([]string{
+		"INVITE sip:user@example.test SIP/2.0",
+		"Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-notify",
+		"From: <tel:+447700999888>;tag=caller-tag",
+		"To: <tel:+447700900123>",
+		"Call-ID: notify-call-id",
+		"CSeq: 1 INVITE",
+		"Content-Length: 0", "", "",
+	}, "\r\n")))
+	if err != nil || packet.Request == nil {
+		t.Fatalf("parse INVITE: %v", err)
+	}
+	session.handleCallRequest(packet.Request, func([]byte) error { return nil })
+
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnIncomingCall was not invoked within timeout")
+	}
+
+	if captured.DeviceID != "ec20-test" || captured.Caller != "+447700999888" || captured.Called != "+447700900123" || captured.CallID != "notify-call-id" {
+		t.Fatalf("captured call = %#v", captured)
 	}
 }
 
@@ -176,19 +225,69 @@ func TestOutgoingLocalNumberUsesIMSPhoneContextAndMMTelHeaders(t *testing.T) {
 	wire := <-wireResult
 
 	for _, expected := range []string{
-		"INVITE sip:888@ims.mnc033.mcc234.3gppnetwork.org SIP/2.0\r\n",
-		"To: <sip:888@ims.mnc033.mcc234.3gppnetwork.org>\r\n",
+		"INVITE tel:888;phone-context=ims.mnc033.mcc234.3gppnetwork.org SIP/2.0\r\n",
+		"To: <tel:888;phone-context=ims.mnc033.mcc234.3gppnetwork.org>\r\n",
 		"From: <sip:+447700900123@ims.mnc033.mcc234.3gppnetwork.org>;tag=local-tag\r\n",
 		"P-Preferred-Identity: <tel:+447700900123>\r\n",
 		"P-Preferred-Service: " + mmtelServiceURN + "\r\n",
 		`Accept-Contact: *;+g.3gpp.icsi-ref="` + mmtelFeatureTag + `"` + "\r\n",
-		"P-Access-Network-Info: IEEE-802.11;i-wlan-node-id=000000000000;country=GB;network-provided\r\n",
+		"P-Access-Network-Info: IEEE-802.11;i-wlan-node-id=" + defaultPANIWLANNode + "\r\n",
 		"User-Agent: VoCat Test\r\n",
 		"Accept: application/sdp\r\n",
 	} {
 		if !strings.Contains(wire, expected) {
 			t.Fatalf("INVITE omitted %q:\n%s", expected, wire)
 		}
+	}
+}
+
+func TestDialogRequestOmitsPAccessNetworkInfoWhenProfileDisablesPANI(t *testing.T) {
+	profileDir := t.TempDir()
+	profile := `{"version":1,"profiles":[{"id":"test-pani-disabled","match":{"home_plmns":["00101"]},"ims":{"pani_enabled":false}}]}`
+	if err := os.WriteFile(filepath.Join(profileDir, "pani-disabled.json"), []byte(profile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	emptyProfileDir := t.TempDir()
+	t.Cleanup(func() {
+		if err := vowifi.LoadCarrierProfileDirectory(emptyProfileDir); err != nil {
+			t.Errorf("clear external carrier profiles: %v", err)
+		}
+	})
+	if err := vowifi.LoadCarrierProfileDirectory(profileDir); err != nil {
+		t.Fatal(err)
+	}
+
+	identity := vowifi.SIMIdentity{HomeMCC: "001", HomeMNC: "01", IMSI: "001010123456789"}
+	pani := resolveSessionPAccessNetworkInfo(identity, nil)
+	if pani != "" {
+		t.Fatalf("disabled profile PANI = %q, want empty", pani)
+	}
+	client, peer := net.Pipe()
+	t.Cleanup(func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("close client connection: %v", err)
+		}
+	})
+	t.Cleanup(func() {
+		if err := peer.Close(); err != nil {
+			t.Errorf("close peer connection: %v", err)
+		}
+	})
+	session := &Session{
+		request:   vowifi.IMSRequest{Identity: identity},
+		transport: "tcp",
+		conn:      client,
+	}
+	call := &imsCall{
+		target: "sip:callee@example.test",
+		from:   "<sip:caller@example.test>;tag=local",
+		to:     "<sip:callee@example.test>;tag=remote",
+		callID: "pani-disabled-call",
+	}
+
+	request := string(session.buildDialogRequest(call, "BYE", 2))
+	if strings.Contains(request, "\r\nP-Access-Network-Info:") {
+		t.Fatalf("BYE contains disabled P-Access-Network-Info header:\n%s", request)
 	}
 }
 

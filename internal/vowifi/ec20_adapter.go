@@ -29,7 +29,9 @@ var (
 const (
 	usimAIDPrefix         = "A0000000871002"
 	isimAIDPrefix         = "A0000000871004"
+	efDIRFileID           = 0x2f00
 	efADDecimal           = 28589 // 0x6FAD
+	efEHPLMNDecimal       = 28441 // 0x6F19 (3GPP TS 31.102 EF_EHPLMN)
 	channelCleanupTimeout = 3 * time.Second
 )
 
@@ -239,12 +241,77 @@ func (adapter *EC20Adapter) readHomePLMN(
 			return mcc, mnc, nil
 		}
 	}
-	// Exact assigned HPLMN prefixes are data, not an MNC-length heuristic. The
-	// target Vodafone UK SIM is 234/15. Unknown assignments remain fail-closed.
+	// Exact assigned HPLMN prefixes are data, not an MNC-length heuristic.
 	if mcc, mnc, ok := assignedHomePLMN(imsi); ok {
 		return mcc, mnc, nil
 	}
+	// 3GPP TS 31.102 Section 4.2.84: Query EF_EHPLMN (Equivalent Home PLMN).
+	if ehplmns, err := adapter.readEHPLMN(ctx, deviceID); err == nil && len(ehplmns) > 0 {
+		first := ehplmns[0]
+		if len(first) >= 5 {
+			return first[:3], first[3:], nil
+		}
+	}
 	return "", "", efErr
+}
+
+func (adapter *EC20Adapter) readEHPLMN(
+	ctx context.Context,
+	deviceID string,
+) ([]string, error) {
+	commands := []string{
+		fmt.Sprintf("AT+CRSM=176,%d,0,0,0", efEHPLMNDecimal),
+		fmt.Sprintf("AT+CRSM=176,%d,0,0,12", efEHPLMNDecimal),
+	}
+	var lastErr error
+	for _, command := range commands {
+		response, err := adapter.execute(ctx, deviceID, command)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		data, err := parseCRSMData(response)
+		if err != nil || len(data) < 3 {
+			lastErr = err
+			continue
+		}
+		plmns := parsePLMNListFromBytes(data)
+		if len(plmns) > 0 {
+			return plmns, nil
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("vocat: EF_EHPLMN is empty or unavailable")
+	}
+	return nil, lastErr
+}
+
+func parsePLMNListFromBytes(data []byte) []string {
+	var plmns []string
+	for i := 0; i+3 <= len(data); i += 3 {
+		b1, b2, b3 := data[i], data[i+1], data[i+2]
+		mcc1 := b1 & 0x0f
+		mcc2 := (b1 >> 4) & 0x0f
+		mcc3 := b2 & 0x0f
+		mnc3 := (b2 >> 4) & 0x0f
+		mnc1 := b3 & 0x0f
+		mnc2 := (b3 >> 4) & 0x0f
+
+		if mcc1 > 9 || mcc2 > 9 || mcc3 > 9 || mnc1 > 9 || mnc2 > 9 {
+			continue
+		}
+		mcc := fmt.Sprintf("%d%d%d", mcc1, mcc2, mcc3)
+		var mnc string
+		if mnc3 <= 9 {
+			mnc = fmt.Sprintf("%d%d%d", mnc1, mnc2, mnc3)
+		} else {
+			mnc = fmt.Sprintf("%d%d", mnc1, mnc2)
+		}
+		if len(mcc) == 3 && (len(mnc) == 2 || len(mnc) == 3) {
+			plmns = append(plmns, mcc+mnc)
+		}
+	}
+	return plmns
 }
 
 func assignedHomePLMN(imsi string) (mcc, mnc string, ok bool) {
@@ -959,6 +1026,19 @@ func (adapter *EC20Adapter) discoverAKAApplication(
 			}
 		}
 	}
+	// CUAD is optional and is rejected by a number of EC20 firmware branches.
+	// In that case do not immediately fall back to the seven-byte registered
+	// application-provider prefix: cards may expose multiple USIM instances and
+	// require the complete PIX from EF_DIR to select the provisioned one.  Read
+	// EF_DIR over the standards-based basic channel, which remains available on
+	// the same firmware that rejects CCHO/CGLA.
+	if discovered, discoverErr := adapter.discoverBasicApplicationAID(
+		ctx,
+		deviceID,
+		usimAIDPrefix,
+	); discoverErr == nil {
+		return discovered, "USIM", nil
+	}
 
 	// AT+CUAD is optional on older EC20 firmware. CCHO still provides a
 	// standards-based, evidence-bearing probe of the assigned USIM AID.
@@ -985,6 +1065,64 @@ func (adapter *EC20Adapter) discoverPreferredAKAApplication(
 	// AT+CUAD is optional. Returning the standard AID prefix still lets CCHO
 	// perform the authoritative application probe on older EC20 firmware.
 	return aidPrefix, application, nil
+}
+
+func (adapter *EC20Adapter) discoverBasicApplicationAID(
+	ctx context.Context,
+	deviceID string,
+	aidPrefix string,
+) (string, error) {
+	selectFile := func(fileID uint16) error {
+		apdu := []byte{
+			0x00, 0xa4, 0x00, 0x04, 0x02,
+			byte(fileID >> 8), byte(fileID), 0x00,
+		}
+		raw, err := adapter.transmitBasicAPDU(ctx, deviceID, apdu, false)
+		if err != nil {
+			return err
+		}
+		_, status, err := splitAPDUStatus(raw)
+		if err != nil {
+			return err
+		}
+		if status != 0x9000 {
+			return fmt.Errorf("vocat: EC20 basic-channel SELECT returned %04X", status)
+		}
+		return nil
+	}
+	if err := selectFile(0x3f00); err != nil {
+		return "", fmt.Errorf("select EC20 MF for application discovery: %w", err)
+	}
+	if err := selectFile(efDIRFileID); err != nil {
+		return "", fmt.Errorf("select EC20 EF_DIR for application discovery: %w", err)
+	}
+	for record := 1; record <= 32; record++ {
+		raw, err := adapter.transmitBasicAPDU(
+			ctx,
+			deviceID,
+			[]byte{0x00, 0xb2, byte(record), 0x04, 0x00},
+			false,
+		)
+		if err != nil {
+			return "", fmt.Errorf("read EC20 EF_DIR record %d: %w", record, err)
+		}
+		body, status, err := splitAPDUStatus(raw)
+		if err != nil {
+			return "", err
+		}
+		if status == 0x6a83 || status == 0x9402 {
+			break
+		}
+		if status != 0x9000 {
+			continue
+		}
+		for _, candidate := range collectApplicationAIDs(body) {
+			if strings.HasPrefix(candidate, aidPrefix) {
+				return candidate, nil
+			}
+		}
+	}
+	return "", ErrEC20ApplicationAbsent
 }
 
 func (adapter *EC20Adapter) openLogicalChannel(
@@ -1108,8 +1246,17 @@ func (adapter *EC20Adapter) transmitBasicAPDU(
 		if err != nil {
 			return nil, err
 		}
-		collected = append(collected, body...)
 		sw1 := byte(status >> 8)
+		if sw1 == 0x6c {
+			// The UICC knows the exact response length. Retry the original APDU
+			// with the advised Le without retaining the procedure response.
+			if len(current) < 5 {
+				return nil, errors.New("vocat: EC20 APDU cannot apply corrected response length")
+			}
+			current[len(current)-1] = byte(status)
+			continue
+		}
+		collected = append(collected, body...)
 		if sw1 != 0x61 && sw1 != 0x9f {
 			collected = append(collected, byte(status>>8), byte(status))
 			return collected, nil

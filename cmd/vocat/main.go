@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,8 +42,288 @@ import (
 	"vocat/web"
 )
 
+const (
+	flightModeTransitionTimeout = 45 * time.Second
+	deviceStartupTimeout        = 4 * time.Minute
+	stableModemWaitTimeout      = 45 * time.Second
+	ec20RegistrationGrace       = 2 * time.Minute
+	ec20RegistrationEscalation  = 3 * time.Minute
+)
+
+type registrationRecoveryAction uint8
+
+const (
+	registrationRecoveryNone registrationRecoveryAction = iota
+	registrationRecoveryReregister
+	registrationRecoveryReboot
+)
+
+type registrationRecoveryEpisode struct {
+	iccid       string
+	searchingAt time.Time
+	lastAttempt time.Time
+	attempts    int
+	pending     registrationRecoveryAction
+}
+
+type registrationRecoveryTracker struct {
+	mu         sync.Mutex
+	grace      time.Duration
+	escalation time.Duration
+	episodes   map[string]registrationRecoveryEpisode
+}
+
+type registrationRecoveryDevices interface {
+	Refresh(context.Context, string) (device.Snapshot, error)
+	PrepareRegistration(context.Context, string, string, string) error
+	ReRegisterOperator(context.Context, string) (device.OperatorSelection, error)
+	Reboot(context.Context, string) error
+}
+
+type registrationRecoveryPolicies interface {
+	CardPolicy(context.Context, string) (store.CardPolicy, error)
+}
+
+func explicitRegistrationRecoveryFlightMode(snapshot device.Snapshot) bool {
+	return snapshot.ModeKnown && snapshot.OperatingMode == 4
+}
+
+func newRegistrationRecoveryTracker(grace, escalation time.Duration) *registrationRecoveryTracker {
+	return &registrationRecoveryTracker{
+		grace: grace, escalation: escalation,
+		episodes: make(map[string]registrationRecoveryEpisode),
+	}
+}
+
+func (tracker *registrationRecoveryTracker) observe(
+	deviceID string,
+	snapshot *device.Snapshot,
+	now time.Time,
+) registrationRecoveryAction {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	if snapshot == nil {
+		return registrationRecoveryNone
+	}
+	if explicitRegistrationRecoveryFlightMode(*snapshot) ||
+		snapshot.RegistrationStatus == 1 || snapshot.RegistrationStatus == 5 {
+		delete(tracker.episodes, deviceID)
+		return registrationRecoveryNone
+	}
+	iccid := strings.TrimSpace(snapshot.ICCID)
+	episode, found := tracker.episodes[deviceID]
+	if found && iccid != "" && episode.iccid != iccid {
+		delete(tracker.episodes, deviceID)
+		found = false
+	}
+	// A CFUN reboot temporarily clears the snapshot while the SIM and ICCID are
+	// still initializing. Preserve an existing episode through that interval so
+	// the one-reboot limit cannot be re-armed by the reboot itself.
+	if !snapshot.SIMReady ||
+		!strings.HasPrefix(strings.ToUpper(strings.TrimSpace(snapshot.Model)), "EC20") ||
+		iccid == "" ||
+		(snapshot.RegistrationStatus != 0 && snapshot.RegistrationStatus != 2) {
+		return registrationRecoveryNone
+	}
+	if !found {
+		tracker.episodes[deviceID] = registrationRecoveryEpisode{iccid: iccid, searchingAt: now}
+		return registrationRecoveryNone
+	}
+	if episode.pending != registrationRecoveryNone {
+		return registrationRecoveryNone
+	}
+	if episode.attempts == 0 && now.Sub(episode.searchingAt) >= tracker.grace {
+		episode.pending = registrationRecoveryReregister
+		tracker.episodes[deviceID] = episode
+		return registrationRecoveryReregister
+	}
+	if episode.attempts == 1 && now.Sub(episode.lastAttempt) >= tracker.escalation {
+		episode.pending = registrationRecoveryReboot
+		tracker.episodes[deviceID] = episode
+		return registrationRecoveryReboot
+	}
+	return registrationRecoveryNone
+}
+
+func (tracker *registrationRecoveryTracker) complete(
+	deviceID string,
+	expectedICCID string,
+	action registrationRecoveryAction,
+	issued bool,
+	now time.Time,
+) {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	episode, found := tracker.episodes[deviceID]
+	if !found || episode.iccid != strings.TrimSpace(expectedICCID) || episode.pending != action {
+		return
+	}
+	episode.pending = registrationRecoveryNone
+	if issued {
+		episode.attempts++
+		episode.lastAttempt = now
+	}
+	tracker.episodes[deviceID] = episode
+}
+
+func registrationRecoveryEligible(snapshot device.Snapshot, expectedICCID string) bool {
+	iccid := strings.TrimSpace(snapshot.ICCID)
+	return snapshot.SIMReady && !snapshot.FlightMode && !snapshot.RadioOff &&
+		strings.HasPrefix(strings.ToUpper(strings.TrimSpace(snapshot.Model)), "EC20") &&
+		iccid != "" && iccid == strings.TrimSpace(expectedICCID) &&
+		(snapshot.RegistrationStatus == 0 || snapshot.RegistrationStatus == 2)
+}
+
+func registrationRecoverySuperseded(snapshot device.Snapshot, expectedICCID string) bool {
+	iccid := strings.TrimSpace(snapshot.ICCID)
+	model := strings.ToUpper(strings.TrimSpace(snapshot.Model))
+	if explicitRegistrationRecoveryFlightMode(snapshot) || (model != "" && !strings.HasPrefix(model, "EC20")) {
+		return true
+	}
+	if iccid != "" && iccid != strings.TrimSpace(expectedICCID) {
+		return true
+	}
+	if snapshot.RegistrationStatus == 1 || snapshot.RegistrationStatus == 5 {
+		return true
+	}
+	return snapshot.SIMReady && iccid != "" &&
+		snapshot.RegistrationStatus != 0 && snapshot.RegistrationStatus != 2
+}
+
+func revalidateRegistrationRecovery(
+	ctx context.Context,
+	devices registrationRecoveryDevices,
+	deviceID string,
+	expectedICCID string,
+) (device.Snapshot, bool, error) {
+	snapshot, err := devices.Refresh(ctx, deviceID)
+	if err != nil {
+		return device.Snapshot{}, false, err
+	}
+	return snapshot, registrationRecoveryEligible(snapshot, expectedICCID), nil
+}
+
+func runRegistrationRecovery(
+	ctx context.Context,
+	logger *slog.Logger,
+	policies registrationRecoveryPolicies,
+	devices registrationRecoveryDevices,
+	deviceID string,
+	expectedICCID string,
+	action registrationRecoveryAction,
+) bool {
+	issued := false
+	current, eligible, err := revalidateRegistrationRecovery(ctx, devices, deviceID, expectedICCID)
+	if err != nil || !eligible {
+		return false
+	}
+	if action == registrationRecoveryReboot {
+		// Revalidate immediately before the destructive operation so a recovered
+		// modem, SIM swap, or flight-mode transition cannot inherit a stale action.
+		if _, eligible, err = revalidateRegistrationRecovery(ctx, devices, deviceID, expectedICCID); err != nil || !eligible {
+			return false
+		}
+		if err = devices.Reboot(ctx, deviceID); err != nil {
+			logger.Warn("EC20 registration recovery reboot failed", "device_id", deviceID, "error", err)
+			return true
+		}
+		// CFUN reboot resets EC20 CID 1 on affected firmware. Wait for the AT
+		// transport to return, then reload the current card policy and revalidate
+		// before every modem operation.
+		for attempt := 0; attempt < 12 && ctx.Err() == nil; attempt++ {
+			timer := time.NewTimer(5 * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return true
+			case <-timer.C:
+			}
+			current, eligible, err = revalidateRegistrationRecovery(ctx, devices, deviceID, expectedICCID)
+			if err != nil {
+				continue
+			}
+			if !eligible {
+				if registrationRecoverySuperseded(current, expectedICCID) {
+					return true
+				}
+				continue
+			}
+			policy, policyErr := policies.CardPolicy(ctx, strings.TrimSpace(current.ICCID))
+			if policyErr == nil && strings.TrimSpace(policy.APN) != "" {
+				current, eligible, err = revalidateRegistrationRecovery(ctx, devices, deviceID, expectedICCID)
+				if err != nil {
+					continue
+				}
+				if !eligible {
+					if registrationRecoverySuperseded(current, expectedICCID) {
+						return true
+					}
+					continue
+				}
+				ipVersion := policy.IPVersion
+				if ipVersion == "" {
+					ipVersion = "IPV4V6"
+				}
+				if err = devices.PrepareRegistration(ctx, deviceID, policy.APN, ipVersion); err != nil {
+					continue
+				}
+			}
+			current, eligible, err = revalidateRegistrationRecovery(ctx, devices, deviceID, expectedICCID)
+			if err != nil {
+				continue
+			}
+			if !eligible {
+				if registrationRecoverySuperseded(current, expectedICCID) {
+					return true
+				}
+				continue
+			}
+			if _, err = devices.ReRegisterOperator(ctx, deviceID); err == nil {
+				logger.Info("EC20 registration recovery rebooted modem", "device_id", deviceID)
+				return true
+			}
+		}
+		logger.Warn("EC20 registration recovery could not resume after reboot", "device_id", deviceID)
+		return true
+	}
+
+	policy, policyErr := policies.CardPolicy(ctx, strings.TrimSpace(current.ICCID))
+	if policyErr == nil && strings.TrimSpace(policy.APN) != "" {
+		if _, eligible, err = revalidateRegistrationRecovery(ctx, devices, deviceID, expectedICCID); err != nil || !eligible {
+			return issued
+		}
+		ipVersion := policy.IPVersion
+		if ipVersion == "" {
+			ipVersion = "IPV4V6"
+		}
+		issued = true
+		if err = devices.PrepareRegistration(ctx, deviceID, policy.APN, ipVersion); err != nil {
+			logger.Warn("EC20 registration recovery could not prepare PDP context", "device_id", deviceID, "error", err)
+		}
+	}
+	if _, eligible, err = revalidateRegistrationRecovery(ctx, devices, deviceID, expectedICCID); err != nil || !eligible {
+		return issued
+	}
+	issued = true
+	if _, err = devices.ReRegisterOperator(ctx, deviceID); err != nil {
+		logger.Warn("EC20 registration recovery failed", "device_id", deviceID, "error", err)
+		return true
+	}
+	logger.Info("EC20 registration recovery requested", "device_id", deviceID)
+	return issued
+}
+
+func deviceStartupContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), deviceStartupTimeout)
+}
+
+func startupFlightModeContext(parent context.Context) (context.Context, context.CancelFunc) {
+	// Bound each EC20 CFUN transition inside the larger device-startup budget.
+	return context.WithTimeout(parent, flightModeTransitionTimeout)
+}
+
 func main() {
-	logs := loghub.New(slog.NewJSONHandler(os.Stdout, nil), 2000)
+	logs := loghub.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}), 2000)
 	logger := slog.New(logs)
 
 	args := os.Args[1:]
@@ -205,18 +487,35 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	}
 
 	cardReaders := pcsc.New()
-	deviceManager, err := device.NewManager(device.Options{CardReaders: cardReaders, Logger: logger})
+	deviceLogger := logger.With("category", "hardware")
+	deviceManager, err := device.NewManager(device.Options{CardReaders: cardReaders, Logger: deviceLogger})
 	if err != nil {
 		return fmt.Errorf("create device manager: %w", err)
 	}
-	if err := deviceManager.Start(startupContext); err != nil {
+	// Device startup has a separate budget because EC20 CFUN transitions can
+	// temporarily remove the USB serial transport, and OpenStick 410 deliberately
+	// delays its persisted VoWiFi policy after a cold boot. Do not reuse the short
+	// database/configuration deadline for this hardware lifecycle.
+	deviceStartupContext, cancelDeviceStartup := deviceStartupContext(startupContext)
+	defer cancelDeviceStartup()
+	stableModemContext, cancelStableModem := context.WithTimeout(deviceStartupContext, stableModemWaitTimeout)
+	if err := deviceManager.WaitForStableModem(
+		stableModemContext,
+		20*time.Second,
+		time.Second,
+		20*time.Second,
+	); err != nil {
+		logger.Warn("wait for stable modem enumeration", "error", err)
+	}
+	cancelStableModem()
+	if err := deviceManager.Start(deviceStartupContext); err != nil {
 		logger.Warn("device discovery is not available at startup", "error", err)
 	}
-	if err := provisionDiscoveredDevices(startupContext, database, deviceManager); err != nil {
+	if err := provisionDiscoveredDevices(deviceStartupContext, database, deviceManager); err != nil {
 		logger.Warn("automatic first-run device provisioning failed", "error", err)
 	}
-	configureDeviceBackends(startupContext, logger, database, deviceManager)
-	restoreDefaultCellularRadios(startupContext, logger, database, deviceManager)
+	configureDeviceBackends(deviceStartupContext, logger, database, deviceManager)
+	restoreDefaultCellularRadios(deviceStartupContext, logger, database, deviceManager)
 	defer func() {
 		stopContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -226,23 +525,34 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	}()
 	pollContext, cancelPolling := context.WithCancel(context.Background())
 	defer cancelPolling()
-	go pollDeviceSnapshots(pollContext, logger, database, deviceManager)
-	go restoreConfiguredCellularData(pollContext, logger, database, deviceManager)
-	go collectCellularTraffic(pollContext, logger, database)
-	go persistLogsToStore(pollContext, logger, logs, database)
-	if developerEnabled {
-		go watchDeveloperDisable(pollContext, logger, database)
-	}
+
+	var onIncomingCall func(context.Context, ims.ReceivedCall) error
 
 	vowifiManager, err := configureVoWiFiRuntime(
-		startupContext,
+		deviceStartupContext,
 		logger,
 		database,
 		deviceManager,
 		cardReaders,
+		func(ctx context.Context, call ims.ReceivedCall) error {
+			if onIncomingCall != nil {
+				return onIncomingCall(ctx, call)
+			}
+			return nil
+		},
 	)
 	if err != nil {
 		return fmt.Errorf("configure VoWiFi runtime: %w", err)
+	}
+	// Start background consumers only after the synchronous radio/VoWiFi
+	// startup sequence. A snapshot refresh also takes the device operation
+	// mutex; starting it earlier can strand cold boot forever behind a serial
+	// read from an unstable USB enumeration.
+	go pollDeviceSnapshots(pollContext, deviceLogger, database, deviceManager)
+	go collectCellularTraffic(pollContext, logger, database)
+	go persistLogsToStore(pollContext, logger, logs, database)
+	if developerEnabled {
+		go watchDeveloperDisable(pollContext, logger, database)
 	}
 	go reconcileCardPolicies(pollContext, logger, database, deviceManager, vowifiManager)
 	defer func() {
@@ -273,10 +583,25 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	if err != nil {
 		return err
 	}
+	onIncomingCall = func(ctx context.Context, call ims.ReceivedCall) error {
+		deviceConfig, _ := database.Device(ctx, call.DeviceID)
+		handler.NotifyIncomingCall(ctx, server.IncomingCallNotification{
+			DeviceID:    call.DeviceID,
+			DeviceName:  strings.TrimSpace(deviceConfig.Name),
+			DeviceLabel: firstNonEmpty(deviceConfig.Name, deviceConfig.ID, "--"),
+			Caller:      call.Caller,
+			Called:      call.Called,
+			Time:        call.Timestamp,
+			Environment: "vowifi",
+		})
+		return nil
+	}
 	go handler.StartLogRetentionLoop(pollContext, time.Minute)
 	go handler.StartSMSSyncLoop(pollContext, 15*time.Second)
+	handler.StartCellularDataReconciler(pollContext)
 	handler.StartTelegramBot(pollContext)
 	handler.StartSMSNotificationDispatchers(pollContext)
+	go handler.StartCellularCallMonitor(pollContext)
 	handler.StartAutomaticTasks(pollContext)
 
 	serverConfig := func(handler http.Handler) *http.Server {
@@ -335,9 +660,13 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 
 	select {
 	case err := <-serverError:
+		cancelDeviceStartup()
 		_ = protocolMux.Close()
 		return err
 	case <-signalContext.Done():
+		// Stop delayed OpenStick 410 startup work before the deferred VoWiFi
+		// manager shutdown begins, so it cannot enqueue a late enable request.
+		cancelDeviceStartup()
 		logger.Info("shutdown signal received")
 	}
 	// Long-lived SSE and polling handlers use this context. Stop them before
@@ -391,6 +720,9 @@ func configureDeviceBackends(
 		if err := manager.SetBackend(entry.ID, config.DeviceBackend); err != nil {
 			logger.Warn("configure device backend", "device_id", config.ID, "backend", config.DeviceBackend, "error", err)
 		}
+		if err := manager.SetESIMTransport(entry.ID, config.ESIMTransport); err != nil {
+			logger.Warn("configure eSIM transport", "device_id", config.ID, "transport", config.ESIMTransport, "error", err)
+		}
 	}
 }
 
@@ -436,7 +768,7 @@ func restoreDefaultCellularRadios(
 				continue
 			}
 		}
-		restoreContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+		restoreContext, cancel := startupFlightModeContext(ctx)
 		_, err = manager.SetFlight(restoreContext, entry.ID, false)
 		cancel()
 		if err != nil {
@@ -447,58 +779,38 @@ func restoreDefaultCellularRadios(
 	}
 }
 
-func restoreConfiguredCellularData(
+func configuredCellularNetworkRequest(
 	ctx context.Context,
-	logger *slog.Logger,
 	database *store.Store,
-	manager *device.Manager,
-) {
-	configs, err := database.ListDevices(ctx)
+	config store.Device,
+	snapshot *device.Snapshot,
+) device.NetworkRequest {
+	request := device.NetworkRequest{
+		Enabled: true, APN: config.APN, IPVersion: "IPV4V6", Backend: config.DeviceBackend,
+	}
+	if snapshot == nil {
+		return request
+	}
+	iccid := strings.TrimSpace(snapshot.ICCID)
+	policy, err := database.CardPolicy(ctx, iccid)
 	if err != nil {
-		logger.Warn("startup cellular data recovery: list devices", "error", err)
-		return
+		return request
 	}
-	mapper := integration.ATMapper{Store: database, Devices: manager}
-	for _, config := range configs {
-		if config.DeviceType == store.DeviceTypeUSBSIMReader {
-			continue
-		}
-		if !config.NetworkEnabled || config.VoWiFiEnabled {
-			continue
-		}
-		entry, err := mapper.Get(config.ID)
-		if err != nil {
-			continue
-		}
-		networkRequest := device.NetworkRequest{
-			Enabled: true, APN: config.APN, IPVersion: "IPV4V6", Backend: config.DeviceBackend,
-		}
-		if entry.Snapshot != nil {
-			iccid := strings.TrimSpace(entry.Snapshot.ICCID)
-			if policy, policyErr := database.CardPolicy(ctx, iccid); policyErr == nil {
-				networkRequest.APN = policy.APN
-				if policy.IPVersion != "" {
-					networkRequest.IPVersion = policy.IPVersion
-				}
-				if profile, profileErr := database.CardAPNProfileByAPN(ctx, iccid, policy.APN, policy.IPVersion); profileErr == nil {
-					networkRequest.Username = profile.Username
-					networkRequest.Password = profile.Password
-					networkRequest.Authentication = profile.AuthType
-					if entry.Snapshot.RegistrationStatus == 5 && profile.RoamingIPVersion != "" {
-						networkRequest.IPVersion = profile.RoamingIPVersion
-					}
-				}
-			}
-		}
-		dataContext, cancel := context.WithTimeout(ctx, 60*time.Second)
-		_, err = manager.SetNetwork(dataContext, entry.ID, networkRequest)
-		cancel()
-		if err != nil {
-			logger.Warn("startup cellular data recovery failed", "device_id", config.ID)
-			continue
-		}
-		logger.Info("restored protected cellular data route", "device_id", config.ID, "interface", config.Interface)
+	request.APN = policy.APN
+	if policy.IPVersion != "" {
+		request.IPVersion = policy.IPVersion
 	}
+	profile, err := database.CardAPNProfileByAPN(ctx, iccid, policy.APN, policy.IPVersion)
+	if err != nil {
+		return request
+	}
+	request.Username = profile.Username
+	request.Password = profile.Password
+	request.Authentication = profile.AuthType
+	if snapshot.RegistrationStatus == 5 && profile.RoamingIPVersion != "" {
+		request.IPVersion = profile.RoamingIPVersion
+	}
+	return request
 }
 
 func watchDeveloperDisable(
@@ -531,6 +843,7 @@ func configureVoWiFiRuntime(
 	database *store.Store,
 	deviceManager *device.Manager,
 	cardReaders *pcsc.Service,
+	onIncomingCall func(context.Context, ims.ReceivedCall) error,
 ) (*vowifiruntime.Manager, error) {
 	mapper := integration.ATMapper{
 		Store:   database,
@@ -573,7 +886,7 @@ func configureVoWiFiRuntime(
 		Devices: mapper,
 	}
 	manager := vowifiruntime.New(vowifiruntime.Options{
-		Logger:  logger,
+		Logger:  logger.With("category", "vowifi"),
 		OnState: projector.Save,
 		Factory: func(factoryContext context.Context, deviceID string) (*vowifi.Orchestrator, error) {
 			deviceConfig, err := database.Device(factoryContext, deviceID)
@@ -586,7 +899,7 @@ func configureVoWiFiRuntime(
 			} else if deviceConfig.DeviceType == store.DeviceTypeWiFi410 {
 				adapter = nativeQMIAdapter
 			}
-			return newVoWiFiOrchestrator(deviceConfig, database, adapter, logger)
+			return newVoWiFiOrchestrator(deviceConfig, database, adapter, logger, onIncomingCall)
 		},
 	})
 
@@ -616,7 +929,18 @@ func configureVoWiFiRuntime(
 					)
 				}
 			}
-			if _, err := manager.RequestEnabled(deviceConfig.ID, true); err != nil {
+			requestEnable := func() error {
+				_, requestErr := manager.RequestEnabled(deviceConfig.ID, true)
+				return requestErr
+			}
+			if err := requestVoWiFiStartup(
+				ctx,
+				logger,
+				deviceConfig.DeviceType,
+				deviceConfig.ID,
+				wifi410VoWiFiStartupDelay,
+				requestEnable,
+			); err != nil {
 				_ = manager.Close(context.Background())
 				return nil, fmt.Errorf("start device %q VoWiFi policy: %w", deviceConfig.ID, err)
 			}
@@ -628,7 +952,54 @@ func configureVoWiFiRuntime(
 const (
 	vowifiStartupRadioAttempts = 3
 	vowifiStartupRadioDelay    = time.Second
+	wifi410VoWiFiStartupDelay  = 80 * time.Second
 )
+
+// requestVoWiFiStartup delays only the persisted startup policy for OpenStick
+// 410 devices. Their Qualcomm UIM and Vodafone ePDG path need a short quiet
+// period after a cold boot; user-triggered reconnects and every other device
+// type continue to execute immediately.
+func requestVoWiFiStartup(
+	ctx context.Context,
+	logger *slog.Logger,
+	deviceType string,
+	deviceID string,
+	delay time.Duration,
+	request func() error,
+) error {
+	if deviceType != store.DeviceTypeWiFi410 || delay <= 0 {
+		return request()
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Info(
+		"OpenStick 410 VoWiFi startup delayed",
+		"device_id", deviceID,
+		"delay", delay,
+	)
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		if err := request(); err != nil {
+			logger.Warn(
+				"OpenStick 410 delayed VoWiFi startup failed",
+				"device_id", deviceID,
+				"error", err,
+			)
+		}
+	}()
+	return nil
+}
+
+func shouldDelayWiFi410VoWiFi(deviceType string, now, notBefore time.Time) bool {
+	return deviceType == store.DeviceTypeWiFi410 && now.Before(notBefore)
+}
 
 type flightModeSetter interface {
 	SetFlight(context.Context, string, bool) (device.FlightResult, error)
@@ -651,9 +1022,15 @@ func protectVoWiFiStartupRadioWithRetry(
 	attempts int,
 	delay time.Duration,
 ) error {
+	if attempts <= 0 {
+		return nil
+	}
+	retryBudget := time.Duration(attempts)*flightModeTransitionTimeout + time.Duration(attempts-1)*delay
+	retryContext, cancelRetry := context.WithTimeout(ctx, retryBudget)
+	defer cancelRetry()
 	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
-		flightContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+		flightContext, cancel := context.WithTimeout(retryContext, flightModeTransitionTimeout)
 		_, lastErr = manager.SetFlight(flightContext, physicalID, true)
 		cancel()
 		if lastErr == nil {
@@ -664,11 +1041,11 @@ func protectVoWiFiStartupRadioWithRetry(
 		}
 		timer := time.NewTimer(delay)
 		select {
-		case <-ctx.Done():
+		case <-retryContext.Done():
 			if !timer.Stop() {
 				<-timer.C
 			}
-			return errors.Join(lastErr, ctx.Err())
+			return errors.Join(lastErr, retryContext.Err())
 		case <-timer.C:
 		}
 	}
@@ -681,30 +1058,63 @@ type vowifiDeviceAdapter interface {
 	vowifi.RadioController
 }
 
+// receivedIMSSMSMessageID returns a session-independent, subscription-scoped
+// identity for an IMS SMS.
+func receivedIMSSMSMessageID(message ims.ReceivedSMS) string {
+	if message.Concat == nil || message.Concat.Total <= 1 {
+		return message.MessageID
+	}
+	subscriptionID := firstNonEmpty(
+		strings.TrimSpace(message.ICCID),
+		strings.TrimSpace(message.IMSI),
+	)
+	if subscriptionID == "" {
+		// Without a subscription identity, reusing the concat reference after an
+		// eSIM switch is indistinguishable from a later segment. Keep the IMS
+		// delivery identity instead of risking a cross-profile merge.
+		return message.MessageID
+	}
+	// A segment of a carrier-split long SMS over IMS. Address the whole
+	// message by the configured device rather than the current IMS session's
+	// reported IMEI, and include the subscription so a later eSIM profile cannot
+	// reuse the same sender/reference tuple and merge into the old message.
+	fingerprint := sha256.Sum256([]byte(subscriptionID))
+	deviceSubscription := message.DeviceID + ":subscription:" + hex.EncodeToString(fingerprint[:])
+	return store.StableConcatMessageID(
+		"ims", "", deviceSubscription, message.From,
+		message.Concat.Reference, message.Concat.Total,
+	)
+}
+
 func newVoWiFiOrchestrator(
 	deviceConfig store.Device,
 	database *store.Store,
 	adapter vowifiDeviceAdapter,
 	logger *slog.Logger,
+	onIncomingCall func(context.Context, ims.ReceivedCall) error,
 ) (*vowifi.Orchestrator, error) {
 	apn := deviceConfig.APN
 	if apn == "" {
 		apn = "ims"
 	}
+	vowifiLogger := logger.With("category", "vowifi", "device_id", deviceConfig.ID)
 	tunnelProvider, err := ike.NewProvider(ike.Config{
-		APN: apn, Logger: logger, AutoProposalFallback: true,
+		APN: apn, Logger: vowifiLogger, AutoProposalFallback: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("device %q IKE provider: %w", deviceConfig.ID, err)
 	}
 	imsProvider, err := ims.NewProvider(adapter, ims.Config{
-		Logger: logger,
+		Logger: vowifiLogger,
 		// Carrier-specific transport and SMSC defaults live in the shared data
 		// profile. Prefer network-provided P-CSCF hints, then safely try the
 		// alternate transport only if no SIP response was observed.
 		Transport:             "tcp",
 		AutoTransportFallback: true,
+		OnIncomingCall:        onIncomingCall,
 		OnSMS: func(ctx context.Context, message ims.ReceivedSMS) error {
+			localPhone, _ := database.PhoneNumberForICCID(ctx, message.ICCID)
+			modemIMEI := firstNonEmpty(message.ModemIMEI, deviceConfig.ModemIMEI)
 			extra, _ := json.Marshal(map[string]any{
 				"transport":                "ims",
 				"encoding":                 message.Encoding,
@@ -715,26 +1125,20 @@ func newVoWiFiOrchestrator(
 				"service_center_timestamp": message.ServiceCenterTimestamp,
 				"raw_rpdu":                 message.RawRPDU,
 				"raw_tpdu":                 message.RawTPDU,
+				"decode_error":             message.DecodeError,
 			})
 			partsTotal := 1
 			if message.Concat != nil && message.Concat.Total > 0 {
 				partsTotal = message.Concat.Total
 			}
-			messageID := message.MessageID
-			if message.Concat != nil && message.Concat.Total > 1 {
-				// A segment of a carrier-split long SMS over IMS. Address the whole
-				// message with a stable id so SaveSMSMessage folds every segment
-				// into one progressively merged row instead of one row per segment.
-				messageID = store.StableConcatMessageID(
-					"ims", deviceConfig.ModemIMEI, message.DeviceID, message.From,
-					message.Concat.Reference, message.Concat.Total,
-				)
-			}
+			messageID := receivedIMSSMSMessageID(message)
 			_, saveErr := database.SaveSMSMessage(ctx, store.SMSMessage{
 				MessageID:  messageID,
 				DeviceID:   message.DeviceID,
-				ModemIMEI:  deviceConfig.ModemIMEI,
+				ModemIMEI:  modemIMEI,
+				ICCID:      message.ICCID,
 				IMSI:       message.IMSI,
+				LocalPhone: localPhone,
 				Peer:       message.From,
 				Direction:  "inbound",
 				Body:       message.Text,
@@ -750,7 +1154,7 @@ func newVoWiFiOrchestrator(
 		OnSMSStatus: func(ctx context.Context, report ims.ReceivedSMSStatus) error {
 			deliveryReport := store.SMSDeliveryReport{
 				DeviceID:          report.DeviceID,
-				ModemIMEI:         deviceConfig.ModemIMEI,
+				ModemIMEI:         firstNonEmpty(report.ModemIMEI, deviceConfig.ModemIMEI),
 				IMSI:              report.IMSI,
 				Peer:              report.To,
 				Source:            "ims",
@@ -778,6 +1182,34 @@ func newVoWiFiOrchestrator(
 			// A late report from before this process started must still be
 			// acknowledged, otherwise the SMSC will keep retransmitting it.
 			return nil
+		},
+		OnUSSD: func(ctx context.Context, message ims.ReceivedUSSD) error {
+			localPhone, _ := database.PhoneNumberForICCID(ctx, message.ICCID)
+			extra, _ := json.Marshal(map[string]any{
+				"transport":   "ims-ussd",
+				"dcs":         message.DCS,
+				"call_id":     message.CallID,
+				"received_at": message.Timestamp,
+				"raw_body":    message.RawBody,
+			})
+			_, saveErr := database.SaveSMSMessage(ctx, store.SMSMessage{
+				MessageID:  message.MessageID,
+				DeviceID:   message.DeviceID,
+				ModemIMEI:  deviceConfig.ModemIMEI,
+				ICCID:      message.ICCID,
+				IMSI:       message.IMSI,
+				LocalPhone: localPhone,
+				Peer:       message.From,
+				Direction:  "inbound",
+				Body:       message.Text,
+				Timestamp:  message.Timestamp,
+				Status:     "received",
+				Source:     "ims-ussd",
+				PartsTotal: 1,
+				Read:       false,
+				Extra:      extra,
+			})
+			return saveErr
 		},
 	})
 	if err != nil {
@@ -888,6 +1320,10 @@ func persistLogsToStore(
 			if !ok {
 				return
 			}
+			if loghub.IsHTTPAccessEntry(entry) {
+				continue
+			}
+			entry = loghub.SanitizeEntry(entry)
 			var fields json.RawMessage
 			if len(entry.Fields) > 0 {
 				if raw, err := json.Marshal(entry.Fields); err == nil {
@@ -913,6 +1349,27 @@ func pollDeviceSnapshots(
 	database *store.Store,
 	manager *device.Manager,
 ) {
+	recoveryTracker := newRegistrationRecoveryTracker(ec20RegistrationGrace, ec20RegistrationEscalation)
+	recoverRegistration := func(entry device.Device, snapshot device.Snapshot, action registrationRecoveryAction) {
+		if action == registrationRecoveryNone {
+			return
+		}
+		go func() {
+			recoveryContext, cancel := context.WithTimeout(ctx, 3*time.Minute)
+			defer cancel()
+			expectedICCID := strings.TrimSpace(snapshot.ICCID)
+			issued := runRegistrationRecovery(
+				recoveryContext,
+				logger,
+				database,
+				manager,
+				entry.ID,
+				expectedICCID,
+				action,
+			)
+			recoveryTracker.complete(entry.ID, expectedICCID, action, issued, time.Now())
+		}()
+	}
 	refresh := func() {
 		discoveryContext, cancelDiscovery := context.WithTimeout(ctx, 10*time.Second)
 		_, err := manager.Discover(discoveryContext)
@@ -953,6 +1410,7 @@ func pollDeviceSnapshots(
 				if refreshErr == nil && ctx.Err() == nil {
 					enforceCardRegion(ctx, logger, database, manager, entry.ID, &snapshot)
 					enforceDefaultSafeCardPolicy(ctx, logger, database, manager, entry.ID, &snapshot)
+					recoverRegistration(entry, snapshot, recoveryTracker.observe(entry.ID, &snapshot, time.Now()))
 				}
 			}()
 		}
@@ -993,7 +1451,7 @@ func enforceDefaultSafeCardPolicy(
 		logger.Warn("default card policy: read policy", "iccid", iccid, "error", err)
 		return
 	}
-	flightContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+	flightContext, cancel := context.WithTimeout(ctx, flightModeTransitionTimeout)
 	_, err := manager.SetFlight(flightContext, physicalID, true)
 	cancel()
 	if err != nil {
@@ -1035,6 +1493,7 @@ func reconcileCardPolicies(
 	vowifiManager *vowifiruntime.Manager,
 ) {
 	observedCards := make(map[string]string)
+	wifi410StartupNotBefore := time.Now().Add(wifi410VoWiFiStartupDelay)
 	reconcile := func() {
 		policies, policyListErr := database.ListCardPolicies(ctx)
 		if policyListErr == nil {
@@ -1110,12 +1569,15 @@ func reconcileCardPolicies(
 			state, stateErr := vowifiManager.State(config.ID)
 			if policy.VoWiFiEnabled {
 				if !entry.Snapshot.FlightMode {
-					flightContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+					flightContext, cancel := context.WithTimeout(ctx, flightModeTransitionTimeout)
 					_, _ = manager.SetFlight(flightContext, entry.ID, true)
 					cancel()
 				}
 				switch {
 				case stateErr != nil || !state.Enabled:
+					if shouldDelayWiFi410VoWiFi(config.DeviceType, time.Now(), wifi410StartupNotBefore) {
+						continue
+					}
 					_, _ = vowifiManager.RequestEnabled(config.ID, true)
 				case state.ICCID != "" && !strings.EqualFold(strings.TrimSpace(state.ICCID), iccid):
 					_, _ = vowifiManager.RequestReconnect(config.ID)
@@ -1129,7 +1591,7 @@ func reconcileCardPolicies(
 				continue
 			}
 			if policy.AirplaneEnabled != entry.Snapshot.FlightMode {
-				flightContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+				flightContext, cancel := context.WithTimeout(ctx, flightModeTransitionTimeout)
 				_, _ = manager.SetFlight(flightContext, entry.ID, policy.AirplaneEnabled)
 				cancel()
 			}
@@ -1179,7 +1641,7 @@ func enforceCardRegion(
 	}
 	if reason := device.RegionBlockReason(imsi); reason != "" {
 		if !snapshot.FlightMode {
-			flightContext, cancelFlight := context.WithTimeout(ctx, 30*time.Second)
+			flightContext, cancelFlight := context.WithTimeout(ctx, flightModeTransitionTimeout)
 			_, err := manager.SetFlight(flightContext, id, true)
 			cancelFlight()
 			if err != nil && ctx.Err() == nil {
@@ -1257,4 +1719,14 @@ func liftCardRegionBlock(
 		"region marker removed; allowed SIM remains RF protected",
 		"device_id", id, "iccid", snapshot.ICCID, "imsi", snapshot.IMSI,
 	)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }

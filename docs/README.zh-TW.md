@@ -169,6 +169,11 @@ docker run -d \
 
 GHCR 映像發佈為 `linux/amd64` 與 `linux/arm64`。
 
+> [!TIP]
+> **NAS / 威聯通 (QNAP Container Station) 部署說明**：
+> 在威聯通等 NAS 系統的 Container Station 下部署時，由於系統的非 Root 自訂管理員權限與磁碟區隔離機制，使用 Docker 具名磁碟區（如 `-v vocat-data:/opt/vocat/data`）在執行一次性初始化 `bootstrap-admin` 與啟動常駐服務時，兩者的磁碟區極易被解析至不同的隔離路徑，導致 Web 端登入時提示密碼錯誤。
+> 建議在 NAS 環境下部署時，將 `-v vocat-data:/opt/vocat/data` 替換為宿主機的絕對路徑掛載（例如威聯通上的 `-v /share/Container/vocat/data:/opt/vocat/data`），以確保初始化與執行期讀寫同一個 SQLite 資料庫檔案。
+
 ## 配置
 
 Vocat 先從 `VOCAT_CONFIG` 讀取可選的 JSON 配置檔,再套用 `VOCAT_*` 環境變數。環境變數優先級更高。

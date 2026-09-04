@@ -36,13 +36,17 @@ func parseLoggingConfig(config loggingConfig) (loggingConfig, error) {
 	if config.Count < 1 {
 		config.Count = 10000
 	}
+	if config.Count > store.MaxLogEvents {
+		config.Count = store.MaxLogEvents
+	}
 	if config.Days < 1 {
 		config.Days = 30
 	}
 	return config, nil
 }
 
-// loadLoggingConfig reads the persisted retention policy, defaulting to unlimited.
+// loadLoggingConfig reads the persisted retention policy. "unlimited" means
+// no user-selected limit below the global 10,000-row hard ceiling.
 func (s *Server) loadLoggingConfig(ctx context.Context) loggingConfig {
 	config := defaultLoggingConfig()
 	setting, err := s.store.AppSetting(ctx, loggingSettingKey)
@@ -64,13 +68,17 @@ func (s *Server) applyLogRetention(ctx context.Context) error {
 	switch config.Mode {
 	case "days":
 		cutoff := time.Now().UTC().Add(-time.Duration(config.Days) * 24 * time.Hour)
-		_, err := s.store.PruneLogEvents(ctx, cutoff)
+		if _, err := s.store.PruneLogEvents(ctx, cutoff); err != nil {
+			return err
+		}
+		_, err := s.store.PruneLogEventsToCount(ctx, store.MaxLogEvents)
 		return err
 	case "count":
 		_, err := s.store.PruneLogEventsToCount(ctx, config.Count)
 		return err
 	default:
-		return nil
+		_, err := s.store.PruneLogEventsToCount(ctx, store.MaxLogEvents)
+		return err
 	}
 }
 
@@ -116,6 +124,7 @@ func (s *Server) handleLoggingSettings(w http.ResponseWriter, r *http.Request) {
 				"count":       config.Count,
 				"days":        config.Days,
 				"stored_logs": stored,
+				"max_logs":    store.MaxLogEvents,
 			},
 		})
 	case http.MethodPut:
@@ -152,6 +161,7 @@ func (s *Server) handleLoggingSettings(w http.ResponseWriter, r *http.Request) {
 				"count":       config.Count,
 				"days":        config.Days,
 				"stored_logs": stored,
+				"max_logs":    store.MaxLogEvents,
 			},
 		})
 	default:

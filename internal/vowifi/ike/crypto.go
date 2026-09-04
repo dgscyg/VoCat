@@ -280,6 +280,239 @@ func decryptPayloads(
 	return header, payloads, nil
 }
 
+const defaultIKEFragmentSize = 1100
+
+func encryptPayloadsFragmented(
+	header ikeHeader,
+	inner []payload,
+	suite negotiatedSuite,
+	encryptionKey []byte,
+	integrityKey []byte,
+	maxFragmentSize int,
+	random io.Reader,
+) ([][]byte, error) {
+	if random == nil {
+		random = rand.Reader
+	}
+	if maxFragmentSize <= 0 {
+		maxFragmentSize = defaultIKEFragmentSize
+	}
+	first, plaintext, err := marshalPayloadChain(inner)
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(encryptionKey)
+	if err != nil {
+		return nil, fmt.Errorf("ike: initialize AES: %w", err)
+	}
+	_, checksumLength, err := suite.integrityLengths()
+	if err != nil {
+		return nil, err
+	}
+
+	maxChunk := maxFragmentSize - ikeHeaderLength - 8 - block.BlockSize() - block.BlockSize() - checksumLength
+	if maxChunk < 64 {
+		maxChunk = 64
+	}
+
+	var chunks [][]byte
+	for len(plaintext) > 0 {
+		take := len(plaintext)
+		if take > maxChunk {
+			take = maxChunk
+		}
+		chunks = append(chunks, plaintext[:take])
+		plaintext = plaintext[take:]
+	}
+	totalFragments := uint16(len(chunks))
+	if totalFragments == 0 {
+		totalFragments = 1
+		chunks = [][]byte{nil}
+	}
+
+	var packets [][]byte
+	for index, chunk := range chunks {
+		fragNum := uint16(index + 1)
+		fragNext := uint8(payloadNone)
+		if fragNum == 1 {
+			fragNext = first
+		}
+
+		paddingLength := block.BlockSize() - (len(chunk)+1)%block.BlockSize()
+		if paddingLength == block.BlockSize() {
+			paddingLength = 0
+		}
+		padding := make([]byte, paddingLength)
+		if _, err := io.ReadFull(random, padding); err != nil {
+			return nil, fmt.Errorf("ike: generate encrypted payload padding: %w", err)
+		}
+		paddedChunk := append(append([]byte(nil), chunk...), padding...)
+		paddedChunk = append(paddedChunk, byte(paddingLength))
+
+		iv := make([]byte, block.BlockSize())
+		if _, err := io.ReadFull(random, iv); err != nil {
+			return nil, fmt.Errorf("ike: generate encrypted payload IV: %w", err)
+		}
+		ciphertext := make([]byte, len(paddedChunk))
+		cipher.NewCBCEncrypter(block, iv).CryptBlocks(ciphertext, paddedChunk)
+
+		skfLength := 4 + 4 + len(iv) + len(ciphertext) + checksumLength
+		if skfLength > 65535 {
+			return nil, errors.New("ike: encrypted fragment exceeds 65535 bytes")
+		}
+
+		body := make([]byte, skfLength)
+		body[0] = fragNext
+		body[1] = 0
+		binary.BigEndian.PutUint16(body[2:4], uint16(skfLength))
+		binary.BigEndian.PutUint16(body[4:6], fragNum)
+		binary.BigEndian.PutUint16(body[6:8], totalFragments)
+		copy(body[8:], iv)
+		copy(body[8+len(iv):], ciphertext)
+
+		fragHeader := header
+		fragHeader.NextPayload = payloadEncryptedFragment
+		packet := fragHeader.marshal(body)
+		checksum, err := integrityMAC(suite, integrityKey, packet[:len(packet)-checksumLength])
+		if err != nil {
+			return nil, err
+		}
+		copy(packet[len(packet)-checksumLength:], checksum)
+		packets = append(packets, packet)
+	}
+	return packets, nil
+}
+
+func decryptSingleFragment(
+	packet []byte,
+	suite negotiatedSuite,
+	encryptionKey []byte,
+	integrityKey []byte,
+) (ikeHeader, uint8, uint16, uint16, []byte, error) {
+	header, body, err := parseIKEPacket(packet)
+	if err != nil {
+		return ikeHeader{}, 0, 0, 0, nil, err
+	}
+	if header.NextPayload != payloadEncryptedFragment || len(body) < 8 {
+		return ikeHeader{}, 0, 0, 0, nil, fmt.Errorf("%w: message is not an encrypted IKE fragment", errUnexpectedPacket)
+	}
+	skfLength := int(binary.BigEndian.Uint16(body[2:4]))
+	if skfLength != len(body) {
+		return ikeHeader{}, 0, 0, 0, nil, fmt.Errorf("%w: encrypted fragment length mismatch", errMalformedPacket)
+	}
+	block, err := aes.NewCipher(encryptionKey)
+	if err != nil {
+		return ikeHeader{}, 0, 0, 0, nil, fmt.Errorf("ike: initialize AES: %w", err)
+	}
+	_, checksumLength, err := suite.integrityLengths()
+	if err != nil {
+		return ikeHeader{}, 0, 0, 0, nil, err
+	}
+	if len(body) < 8+block.BlockSize()+block.BlockSize()+checksumLength {
+		return ikeHeader{}, 0, 0, 0, nil, fmt.Errorf("%w: encrypted fragment is too short", errMalformedPacket)
+	}
+	expected, err := integrityMAC(suite, integrityKey, packet[:len(packet)-checksumLength])
+	if err != nil {
+		return ikeHeader{}, 0, 0, 0, nil, err
+	}
+	actual := packet[len(packet)-checksumLength:]
+	if subtle.ConstantTimeCompare(actual, expected) != 1 {
+		return ikeHeader{}, 0, 0, 0, nil, errIntegrityMismatch
+	}
+
+	fragNext := body[0]
+	fragNum := binary.BigEndian.Uint16(body[4:6])
+	totalFrags := binary.BigEndian.Uint16(body[6:8])
+	if fragNum == 0 || totalFrags == 0 || fragNum > totalFrags {
+		return ikeHeader{}, 0, 0, 0, nil, fmt.Errorf("%w: invalid fragment numbers %d/%d", errMalformedPacket, fragNum, totalFrags)
+	}
+
+	ivStart := 8
+	ciphertextStart := ivStart + block.BlockSize()
+	ciphertextEnd := len(body) - checksumLength
+	ciphertext := body[ciphertextStart:ciphertextEnd]
+	if len(ciphertext) == 0 || len(ciphertext)%block.BlockSize() != 0 {
+		return ikeHeader{}, 0, 0, 0, nil, fmt.Errorf("%w: fragment ciphertext is not block aligned", errMalformedPacket)
+	}
+	plaintext := make([]byte, len(ciphertext))
+	cipher.NewCBCDecrypter(block, body[ivStart:ciphertextStart]).CryptBlocks(plaintext, ciphertext)
+	paddingLength := int(plaintext[len(plaintext)-1])
+	if paddingLength+1 > len(plaintext) {
+		return ikeHeader{}, 0, 0, 0, nil, fmt.Errorf("%w: invalid encrypted fragment padding", errMalformedPacket)
+	}
+	plaintext = plaintext[:len(plaintext)-paddingLength-1]
+	return header, fragNext, fragNum, totalFrags, plaintext, nil
+}
+
+func decryptPayloadsAny(
+	packet []byte,
+	fragments [][]byte,
+	suite negotiatedSuite,
+	encryptionKey []byte,
+	integrityKey []byte,
+) (ikeHeader, []payload, error) {
+	if len(fragments) > 0 {
+		var (
+			firstHeader   ikeHeader
+			firstNext     uint8
+			totalExpected uint16
+			plaintexts    = make(map[uint16][]byte)
+		)
+		for _, fragPacket := range fragments {
+			hdr, next, num, total, plain, err := decryptSingleFragment(fragPacket, suite, encryptionKey, integrityKey)
+			if err != nil {
+				return ikeHeader{}, nil, err
+			}
+			if totalExpected == 0 {
+				firstHeader = hdr
+				totalExpected = total
+			} else if total != totalExpected || hdr.MessageID != firstHeader.MessageID || hdr.Exchange != firstHeader.Exchange {
+				return ikeHeader{}, nil, fmt.Errorf("%w: inconsistent fragment headers", errMalformedPacket)
+			}
+			if num == 1 {
+				firstNext = next
+			}
+			plaintexts[num] = plain
+		}
+		if uint16(len(plaintexts)) != totalExpected {
+			return ikeHeader{}, nil, fmt.Errorf("%w: missing fragments: received %d of %d", errMalformedPacket, len(plaintexts), totalExpected)
+		}
+		var fullPlaintext []byte
+		for i := uint16(1); i <= totalExpected; i++ {
+			chunk, ok := plaintexts[i]
+			if !ok {
+				return ikeHeader{}, nil, fmt.Errorf("%w: missing fragment %d", errMalformedPacket, i)
+			}
+			fullPlaintext = append(fullPlaintext, chunk...)
+		}
+		payloads, err := parsePayloadChain(firstNext, fullPlaintext)
+		if err != nil {
+			return ikeHeader{}, nil, err
+		}
+		return firstHeader, payloads, nil
+	}
+
+	header, _, err := parseIKEPacket(packet)
+	if err != nil {
+		return ikeHeader{}, nil, err
+	}
+	if header.NextPayload == payloadEncryptedFragment {
+		hdr, next, num, total, plain, err := decryptSingleFragment(packet, suite, encryptionKey, integrityKey)
+		if err != nil {
+			return ikeHeader{}, nil, err
+		}
+		if num != 1 || total != 1 {
+			return ikeHeader{}, nil, fmt.Errorf("%w: standalone fragment with total=%d", errMalformedPacket, total)
+		}
+		payloads, err := parsePayloadChain(next, plain)
+		if err != nil {
+			return ikeHeader{}, nil, err
+		}
+		return hdr, payloads, nil
+	}
+	return decryptPayloads(packet, suite, encryptionKey, integrityKey)
+}
+
 var modpPrimes = map[uint16]string{
 	dhMODP1024: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1" +
 		"29024E088A67CC74020BBEA63B139B22514A08798E3404DD" +

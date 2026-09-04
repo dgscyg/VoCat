@@ -21,16 +21,18 @@ import (
 // device carrying a fixed snapshot, enough to drive the region guards. The scan,
 // USSD, and USB-net results are configurable for the feature endpoint tests.
 type fakeDeviceController struct {
-	entry      device.Device
-	atResponse modem.Response
-	atErr      error
-	atHandler  func(string) (modem.Response, error)
-	scanResult device.OperatorScanResult
-	scanErr    error
-	ussdResult device.USSDResult
-	ussdErr    error
-	usbNetMode device.USBNetMode
-	usbNetErr  error
+	entry       device.Device
+	atResponse  modem.Response
+	atErr       error
+	atHandler   func(string) (modem.Response, error)
+	scanResult  device.OperatorScanResult
+	scanErr     error
+	ussdResult  device.USSDResult
+	ussdErr     error
+	usbNetMode  device.USBNetMode
+	usbNetErr   error
+	smsMessages []device.SMSMessage
+	smsErr      error
 }
 
 func (f fakeDeviceController) Discover(context.Context) ([]device.Device, error) {
@@ -93,12 +95,15 @@ func (f fakeDeviceController) SendSMS(context.Context, string, string, string) (
 	return device.SMSSendResult{}, nil
 }
 func (f fakeDeviceController) ListSMS(context.Context, string) ([]device.SMSMessage, error) {
-	return nil, nil
+	return append([]device.SMSMessage(nil), f.smsMessages...), f.smsErr
 }
 func (f fakeDeviceController) ReadSMS(context.Context, string, int) (device.SMSMessage, error) {
 	return device.SMSMessage{}, nil
 }
 func (f fakeDeviceController) DeleteSMS(context.Context, string, int) error { return nil }
+func (f fakeDeviceController) DeleteSMSFromStorage(context.Context, string, string, int) error {
+	return nil
+}
 func (f fakeDeviceController) ESIMListProfiles(context.Context, string) (device.EsimInfo, error) {
 	return device.EsimInfo{}, nil
 }

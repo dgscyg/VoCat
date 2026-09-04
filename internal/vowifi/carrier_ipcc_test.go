@@ -42,9 +42,12 @@ func TestImportCarrierIPCCConvertsBinaryAndXMLPlistsSafely(t *testing.T) {
 				},
 				"IMSConfig": map[string]any{
 					"EnableWiFiCallingWithoutEntitlement": true,
-					"Signaling":                           map[string]any{"UseIPSec": true},
-					"Media":                               map[string]any{"SupportPCMA": false},
-					"Emergency":                           map[string]any{"E911OverITechSupported": true},
+					"Signaling": map[string]any{
+						"UseIPSec":                   true,
+						"CountryOfOriginationFormat": "PANI",
+					},
+					"Media":     map[string]any{"SupportPCMA": false},
+					"Emergency": map[string]any{"E911OverITechSupported": true},
 				},
 			},
 		},
@@ -72,6 +75,9 @@ func TestImportCarrierIPCCConvertsBinaryAndXMLPlistsSafely(t *testing.T) {
 	}
 	if rule.IMS.IPSecEncryption != "aes-cbc" {
 		t.Fatalf("converted IMS profile = %#v", rule.IMS)
+	}
+	if rule.IMS.PANIEnabled == nil || !*rule.IMS.PANIEnabled || rule.IMS.PANICountry != "AUTO" {
+		t.Fatalf("converted PANI behavior = enabled=%v country=%q", rule.IMS.PANIEnabled, rule.IMS.PANICountry)
 	}
 	for _, code := range []string{
 		"remote_certificate_bypass_ignored",

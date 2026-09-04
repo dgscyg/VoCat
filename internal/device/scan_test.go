@@ -91,11 +91,11 @@ func TestCarrierForIMSIHandlesTwoAndThreeDigitMNCs(t *testing.T) {
 		wantPLMN    string
 		wantCountry string
 	}{
-		{imsi: "234336570710174", wantPLMN: "23433", wantCountry: "GB"},
-		{imsi: "234159609054263", wantPLMN: "23415", wantCountry: "GB"},
-		{imsi: "234870123456789", wantPLMN: "23487", wantCountry: "GB"},
-		{imsi: "454006395879502", wantPLMN: "45400", wantCountry: "HK"},
-		{imsi: "310260123456789", wantPLMN: "310260", wantCountry: "US"},
+		{imsi: "234330000000001", wantPLMN: "23433", wantCountry: "GB"},
+		{imsi: "234150000000001", wantPLMN: "23415", wantCountry: "GB"},
+		{imsi: "234870000000001", wantPLMN: "23487", wantCountry: "GB"},
+		{imsi: "454000000000001", wantPLMN: "45400", wantCountry: "HK"},
+		{imsi: "310260000000001", wantPLMN: "310260", wantCountry: "US"},
 	}
 	for _, item := range tests {
 		plmn, name, country, ok := CarrierForIMSI(item.imsi)

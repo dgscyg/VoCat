@@ -50,6 +50,42 @@ func TestMergePCSCAndSingleUSBReaderEnrichesFallbackPath(t *testing.T) {
 	}
 }
 
+func TestMergePCSCAndMultipleUSBReadersWithFallbackPath(t *testing.T) {
+	readers := mergePCSCAndUSBReaders(
+		[]Reader{
+			{Name: "Identiv uTrust 00 00", USBPath: "1-2", CardPresent: true},
+			{Name: "Generic Smart Card Reader 00 00", USBPath: "pcsc:Generic Smart Card Reader 00 00", CardPresent: true},
+		},
+		[]Reader{
+			{Name: "uTrust", USBPath: "1-2", VendorID: "04e6", ProductID: "5810", DiscoveryIssue: "pcsc_driver_missing"},
+			{Name: "ESTKme-RED", USBPath: "1-1", VendorID: "0bda", ProductID: "0165", DiscoveryIssue: "pcsc_driver_missing"},
+		},
+	)
+	if len(readers) != 2 {
+		t.Fatalf("len(readers) = %d, want 2", len(readers))
+	}
+	for _, r := range readers {
+		if r.DiscoveryIssue != "" {
+			t.Errorf("reader %#v still has discovery issue %q", r, r.DiscoveryIssue)
+		}
+	}
+}
+
+func TestFilterVirtualPCDReadersKeepsPhysicalReaders(t *testing.T) {
+	readers := filterVirtualPCDReaders([]Reader{
+		{Name: "Virtual PCD 00 00", USBPath: "pcsc:Virtual PCD 00 00"},
+		{Name: "Virtual PCD 00 01", USBPath: "pcsc:Virtual PCD 00 01"},
+		{Name: "Generic Smart Card Reader 00 00", USBPath: "pcsc:Generic Smart Card Reader 00 00"},
+		{Name: "Virtual PCD 00 02", USBPath: "2-1", VendorID: "1234", ProductID: "5678"},
+	})
+	if len(readers) != 2 {
+		t.Fatalf("readers = %#v, want two real/unresolved non-virtual readers", readers)
+	}
+	if readers[0].Name != "Generic Smart Card Reader 00 00" || readers[1].USBPath != "2-1" {
+		t.Fatalf("retained readers = %#v", readers)
+	}
+}
+
 func writeUSBTestFile(t *testing.T, path, value string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

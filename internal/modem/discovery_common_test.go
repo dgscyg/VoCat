@@ -35,3 +35,25 @@ func TestSelectATPortPrefersTTYUSB2AcrossUSBCompositions(t *testing.T) {
 		t.Fatalf("selected %#v, want ttyUSB2 on interface 02", selected)
 	}
 }
+
+func TestNormalizeEC20AndroidUSBIdentity(t *testing.T) {
+	manufacturer, product := normalizeUSBIdentity("2C7C", "0125", "Android", "Android")
+	if manufacturer != "Quectel" || product != "Quectel EC20 / EC25" {
+		t.Fatalf("normalized identity = %q / %q", manufacturer, product)
+	}
+
+	manufacturer, product = normalizeUSBIdentity("1199", "9077", "Android", "Android")
+	if manufacturer != "Android" || product != "Android" {
+		t.Fatalf("non-Quectel identity was changed to %q / %q", manufacturer, product)
+	}
+}
+
+func TestReliableSerialAliasRejectsGenericAndroidSerial(t *testing.T) {
+	alias := "/dev/serial/by-id/usb-Android_Android-if02-port0"
+	if got := reliableSerialAlias("Android", alias); got != "" {
+		t.Fatalf("generic Android alias = %q, want empty", got)
+	}
+	if got := reliableSerialAlias("0123456789ABCDEF", alias); got != alias {
+		t.Fatalf("unique serial alias = %q, want %q", got, alias)
+	}
+}

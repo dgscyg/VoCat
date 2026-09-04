@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
+
+	"vocat/internal/store"
 )
 
 var wecomTemplateVariableNames = []string{
@@ -23,6 +26,10 @@ var wecomTemplateVariableNames = []string{
 	"device_name",
 	"device_label",
 	"time",
+}
+
+var wecomWebhookHosts = map[string]struct{}{
+	"qyapi.weixin.qq.com": {},
 }
 
 type wecomTemplateValues map[string]string
@@ -44,6 +51,46 @@ func renderWecomPayload(template string, values wecomTemplateValues) ([]byte, er
 		return nil, errors.New("wecom.payload_template must render to a non-empty JSON object")
 	}
 	return []byte(template), nil
+}
+
+func parseWecomWebhookURL(raw string) (*url.URL, error) {
+	parsed, err := parseOutboundURL(raw, true)
+	if err != nil {
+		return nil, err
+	}
+	canonicalHost := strings.ToLower(parsed.Hostname())
+	if _, ok := wecomWebhookHosts[canonicalHost]; !ok {
+		return nil, errors.New("WeCom bot webhook must use qyapi.weixin.qq.com")
+	}
+	if parsed.Port() != "" && parsed.Port() != "443" {
+		return nil, errors.New("WeCom bot webhook must use the default HTTPS port")
+	}
+	if parsed.Path != "/cgi-bin/webhook/send" {
+		return nil, errors.New("WeCom bot webhook path must be /cgi-bin/webhook/send")
+	}
+	key := parsed.Query().Get("key")
+	if key == "" || strings.ContainsAny(key, " \t\r\n/") {
+		return nil, errors.New("WeCom bot webhook key parameter is missing or invalid")
+	}
+	query := url.Values{}
+	query.Set("key", key)
+	return &url.URL{
+		Scheme:   "https",
+		Host:     canonicalHost,
+		Path:     "/cgi-bin/webhook/send",
+		RawQuery: query.Encode(),
+	}, nil
+}
+
+func validateWecomWebhookURL(ctx context.Context, raw string) (*url.URL, error) {
+	parsed, err := parseWecomWebhookURL(raw)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := resolvePublicAddresses(ctx, parsed.Hostname()); err != nil {
+		return nil, err
+	}
+	return parsed, nil
 }
 
 func validateWecomResponse(status int, body []byte) error {
@@ -102,6 +149,13 @@ func validateWecomNotificationConfig(config map[string]any) error {
 	if len(urls) > 8 {
 		return errors.New("wecom.urls cannot contain more than 8 URLs")
 	}
+	for _, rawURL := range urls {
+		if rawURL != store.SecretMask {
+			if _, err := parseWecomWebhookURL(rawURL); err != nil {
+				return err
+			}
+		}
+	}
 	template := configString(config, "payload_template")
 	if template == "" {
 		return errors.New("wecom.payload_template is required")
@@ -120,7 +174,7 @@ func sendWecomNotification(ctx context.Context, config map[string]any, values we
 		return err
 	}
 	for _, destination := range configStrings(config, "urls") {
-		parsed, err := validateOutboundURL(ctx, destination, false)
+		parsed, err := validateWecomWebhookURL(ctx, destination)
 		if err != nil {
 			return err
 		}
@@ -130,6 +184,8 @@ func sendWecomNotification(ctx context.Context, config map[string]any, values we
 		}
 		request.Header.Set("Content-Type", "application/json; charset=utf-8")
 		request.Header.Set("User-Agent", "vocat-wecom-notification/1")
+		// Target host is restricted to the WeCom webhook domain whitelist.
+		// codeql[go/uncontrolled-data-in-network-request]
 		response, err := client.Do(request)
 		if err != nil {
 			return fmt.Errorf("send WeCom notification: %w", err)

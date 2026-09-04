@@ -14,7 +14,13 @@ import (
 const (
 	djiVendorID    = "2ca3"
 	dji4GProductID = "4006"
+	// quectelVendorID covers Quectel USB modems exposed purely as serial or
+	// RNDIS/ECM devices (for example the EC200A at 2c7c:6005). Their control
+	// interface is not bound to qmi_wwan, so the QMI-binding gate would skip
+	// them even though they expose a usable AT serial port.
+	quectelVendorID = "2c7c"
 )
+
 type SysFSDiscoverer struct {
 	SysRoot string
 	DevRoot string
@@ -83,21 +89,39 @@ func (d *SysFSDiscoverer) Discover(ctx context.Context) ([]Candidate, error) {
 		vendorID := strings.ToLower(readTrimmed(filepath.Join(resolvedDevice, "idVendor")))
 		productID := strings.ToLower(readTrimmed(filepath.Join(resolvedDevice, "idProduct")))
 		if _, bound := qmiBound[deviceName]; !bound && !IsDJI4GUSB(vendorID, productID) {
-			continue
+			// A bound qmi_wwan interface is the strongest vendor-neutral "this is
+			// a live QMI modem" signal, but it excludes Quectel modules running
+			// in a serial or RNDIS/ECM USB composition (no qmi_wwan binding).
+			// Re-admit them by vendor so their AT serial ports stay discoverable;
+			// the candidate is only kept if a ttyUSB/ttyACM node is actually
+			// found below, which is exactly the AT-bearing composition we want.
+			if !isQuectelUSBModem(vendorID) {
+				continue
+			}
 		}
 
 		state := devices[deviceName]
 		if state == nil {
 			serialNumber := readTrimmed(filepath.Join(resolvedDevice, "serial"))
+			manufacturer, product := normalizeUSBIdentity(
+				vendorID,
+				productID,
+				readTrimmed(filepath.Join(resolvedDevice, "manufacturer")),
+				readTrimmed(filepath.Join(resolvedDevice, "product")),
+			)
 			state = &discoveredUSBDevice{
 				candidate: Candidate{
 					ID:           candidateID(vendorID, productID, serialNumber, deviceName),
 					VendorID:     vendorID,
 					ProductID:    productID,
-					Manufacturer: readTrimmed(filepath.Join(resolvedDevice, "manufacturer")),
-					Product:      readTrimmed(filepath.Join(resolvedDevice, "product")),
+					Manufacturer: manufacturer,
+					Product:      product,
 					SerialNumber: serialNumber,
 					USBPath:      devicePath,
+					USBGeneration: strings.TrimSpace(
+						readTrimmed(filepath.Join(resolvedDevice, "busnum")) + ":" +
+							readTrimmed(filepath.Join(resolvedDevice, "devnum")),
+					),
 				},
 				ports: make(map[string]Port),
 			}
@@ -112,7 +136,7 @@ func (d *SysFSDiscoverer) Discover(ctx context.Context) ([]Candidate, error) {
 			path := filepath.Join(d.DevRoot, name)
 			state.ports[name] = Port{
 				Path:            path,
-				StablePath:      aliases[name],
+				StablePath:      reliableSerialAlias(state.candidate.SerialNumber, aliases[name]),
 				Name:            name,
 				InterfaceNumber: interfaceNumber,
 				Role:            quecPortRole(interfaceNumber, name),
@@ -142,11 +166,19 @@ func (d *SysFSDiscoverer) Discover(ctx context.Context) ([]Candidate, error) {
 		assignQuectelPortRoles(state.candidate.Ports)
 		state.candidate.ATPort = selectATPort(state.candidate.Ports)
 		if !state.candidate.HasATPort() {
-			// A bound QMI interface proves the modem is alive, but the snapshot,
-			// SMS, USSD and eSIM (AT+CSIM) paths all require an AT port. A missing
-			// ttyUSB/ttyACM node almost always means the option/qcserial driver
-			// does not claim the serial interfaces (often a missing PID in its
-			// device-ID table), not that the module lacks an AT interface.
+			// A modem without a usable AT port cannot be driven by vocat, but it
+			// is far more useful to surface it with a discovery issue than to
+			// silently drop it: the operator sees the device is present and gets
+			// told why it is unusable. Two shapes land here:
+			//   * qmi_wwan is bound but no ttyUSB/ttyACM exists — the option/qcserial
+			//     driver did not claim the serial interfaces (often a missing PID
+			//     in its device-ID table, common on Ubuntu for EG25-G carrier
+			//     builds). The modem is alive; it just lacks an AT node.
+			//   * no qmi_wwan binding (Quectel re-admitted by vendor) and no AT
+			//     port — typically an MBIM/RNDIS/ECM composition. The module is on
+			//     the bus but exposes no AT serial interface vocat can open.
+			// Both resolve the same operator action: add the PID to the option
+			// driver or switch the module to a QMI+AT composition.
 			state.candidate.DiscoveryIssue = "at_port_missing"
 		}
 		result = append(result, state.candidate)
@@ -166,6 +198,45 @@ func (d *SysFSDiscoverer) Discover(ctx context.Context) ([]Candidate, error) {
 func IsDJI4GUSB(vendorID, productID string) bool {
 	return strings.EqualFold(strings.TrimSpace(vendorID), djiVendorID) &&
 		strings.EqualFold(strings.TrimSpace(productID), dji4GProductID)
+}
+
+// isQuectelUSBModem reports whether a USB identity belongs to a Quectel
+// module. Quectel's serial/RNDIS/ECM compositions (e.g. EC200A at 2c7c:6005)
+// do not bind qmi_wwan, so discovery must fall back to the vendor ID to keep
+// them visible. The candidate is only retained if it exposes an AT serial
+// port, which filters out unrelated Quectel-branded peripherals.
+func isQuectelUSBModem(vendorID string) bool {
+	return strings.EqualFold(strings.TrimSpace(vendorID), quectelVendorID)
+}
+
+// normalizeUSBIdentity replaces the placeholder strings shipped by the
+// classic Quectel EC20/EC25 USB composition. Linux faithfully exposes those
+// modules as "Android / Android", but that text is a firmware placeholder,
+// not the modem model or manufacturer.
+func normalizeUSBIdentity(vendorID, productID, manufacturer, product string) (string, string) {
+	if !isQuectelUSBModem(vendorID) ||
+		!strings.EqualFold(strings.TrimSpace(productID), "0125") {
+		return manufacturer, product
+	}
+	if strings.EqualFold(strings.TrimSpace(manufacturer), "Android") || strings.TrimSpace(manufacturer) == "" {
+		manufacturer = "Quectel"
+	}
+	if strings.EqualFold(strings.TrimSpace(product), "Android") || strings.TrimSpace(product) == "" {
+		product = "Quectel EC20 / EC25"
+	}
+	return manufacturer, product
+}
+
+// reliableSerialAlias rejects the generic serial number used by older
+// EC20/EC25 firmware. A /dev/serial/by-id link derived from "Android" is not a
+// hardware identity: two modules can publish the same link, and udev may point
+// it at a different tty after reboot. The live tty plus USB topology/IMEI is
+// safer and is re-resolved on every discovery pass.
+func reliableSerialAlias(serialNumber, alias string) string {
+	if strings.EqualFold(strings.TrimSpace(serialNumber), "Android") {
+		return ""
+	}
+	return alias
 }
 
 type discoveredWWANDevice struct {

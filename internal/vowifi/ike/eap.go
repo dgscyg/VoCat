@@ -264,8 +264,13 @@ func permanentAKAIdentity(identity vowifi.SIMIdentity) ([]byte, error) {
 			return nil, errors.New("ike: IMSI contains a non-digit")
 		}
 	}
-	mcc := strings.TrimSpace(identity.HomeMCC)
-	mnc := strings.TrimSpace(identity.HomeMNC)
+	profile := vowifi.ResolveCarrierProfile(identity)
+	mcc := strings.TrimSpace(profile.RouteMCC)
+	mnc := strings.TrimSpace(profile.RouteMNC)
+	if mcc == "" || mnc == "" {
+		mcc = strings.TrimSpace(identity.HomeMCC)
+		mnc = strings.TrimSpace(identity.HomeMNC)
+	}
 	if len(mcc) != 3 || (len(mnc) != 2 && len(mnc) != 3) {
 		return nil, errors.New("ike: explicit home MCC/MNC is required for EAP-AKA")
 	}
