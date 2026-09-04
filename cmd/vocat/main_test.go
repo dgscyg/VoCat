@@ -101,12 +101,8 @@ func regionTestLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-func TestEnforceCardRegionForcesAirplaneAndPersistsPolicy(t *testing.T) {
-	client := &fakeModemClient{steps: []fakeStep{
-		{command: "AT+CFUN?", lines: []string{"+CFUN: 1"}},
-		{command: "AT+CFUN=4"},
-		{command: "AT+CFUN?", lines: []string{"+CFUN: 4"}},
-	}}
+func TestEnforceCardRegionDoesNotBlockChinaSIM(t *testing.T) {
+	client := &fakeModemClient{}
 	manager := newRegionTestManager(t, client)
 	database := newRegionTestStore(t)
 
@@ -119,35 +115,8 @@ func TestEnforceCardRegionForcesAirplaneAndPersistsPolicy(t *testing.T) {
 	enforceCardRegion(context.Background(), regionTestLogger(), database, manager, regionTestDeviceID, snapshot)
 	client.assertExhausted(t)
 
-	policy, err := database.CardPolicy(context.Background(), snapshot.ICCID)
-	if err != nil {
-		t.Fatalf("CardPolicy: %v", err)
-	}
-	if policy.Source != cardPolicySourceRegionBlock {
-		t.Fatalf("policy source = %q, want %q", policy.Source, cardPolicySourceRegionBlock)
-	}
-	if policy.NetworkEnabled || policy.VoWiFiEnabled || !policy.AirplaneEnabled {
-		t.Fatalf("policy switches = %#v, want all service off and airplane on", policy)
-	}
-}
-
-func TestEnforceCardRegionSkipsRadioWhenAlreadyOff(t *testing.T) {
-	client := &fakeModemClient{}
-	manager := newRegionTestManager(t, client)
-	database := newRegionTestStore(t)
-
-	snapshot := &device.Snapshot{
-		DeviceID:   regionTestDeviceID,
-		SIMReady:   true,
-		IMSI:       "461001234567890",
-		ICCID:      "89860012345678901234",
-		FlightMode: true,
-	}
-	enforceCardRegion(context.Background(), regionTestLogger(), database, manager, regionTestDeviceID, snapshot)
-	client.assertExhausted(t)
-
-	if _, err := database.CardPolicy(context.Background(), snapshot.ICCID); err != nil {
-		t.Fatalf("expected a persisted block policy even with the radio already off: %v", err)
+	if _, err := database.CardPolicy(context.Background(), snapshot.ICCID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("China SIM must not receive an auto region-block policy, err=%v", err)
 	}
 }
 

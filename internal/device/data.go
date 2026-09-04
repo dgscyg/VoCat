@@ -248,11 +248,6 @@ func (manager *Manager) SetNetwork(
 			return NetworkResult{}, err
 		}
 		candidate = manager.candidateFor(state)
-		if request.Enabled {
-			if err := manager.regionBlockError(state); err != nil {
-				return NetworkResult{}, err
-			}
-		}
 		if candidate.QMIControl == "" || candidate.NetworkInterface == "" {
 			return NetworkResult{}, fmt.Errorf("%w: QMI control device and network interface are required", ErrDataBackendUnavailable)
 		}
@@ -298,12 +293,6 @@ func (manager *Manager) SetNetwork(
 	defer state.opMu.Unlock()
 	if err := manager.validateActive(id, state); err != nil {
 		return NetworkResult{}, err
-	}
-	if request.Enabled {
-		if err := manager.regionBlockError(state); err != nil {
-			manager.setResult(id, state, nil, err)
-			return NetworkResult{}, err
-		}
 	}
 	candidate = manager.candidateFor(state)
 

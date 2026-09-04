@@ -73,7 +73,6 @@ var zhToEn = map[string]string{
 
 	// ---- devices ----
 	"设备数量已达上限，最多只能添加 %d 台设备": "Device limit reached; at most %d devices can be added.",
-	"SIM 卡归属地为%s（MCC %s），本服务不向该地区卡片提供数据/短信/VoWiFi": "The SIM's home region is %s (MCC %s); this service does not provide data, SMS, or VoWiFi to cards from that region.",
 	"请先禁用该设备已绑定的导出代理，再关闭漫游数据": "Disable the export proxy bound to this device before turning off roaming data.",
 
 	// ---- settings / update ----
