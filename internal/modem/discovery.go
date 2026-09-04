@@ -42,6 +42,10 @@ func (d *SysFSDiscoverer) Discover(ctx context.Context) ([]Candidate, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// Factory-ID DJI/Baiwang modules are not in option/qmi_wwan ID tables.
+	// Binding here (and reclaiming if4 from option after a USB reprobe) is what
+	// keeps AT + wwanN available; a stored interface name is not enough.
+	_ = ensureDJIUSBComposition(ctx, d.SysRoot, d.DevRoot)
 	usbRoot := filepath.Join(d.SysRoot, "bus", "usb", "devices")
 	entries, err := os.ReadDir(usbRoot)
 	if err != nil {

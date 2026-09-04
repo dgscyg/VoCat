@@ -1962,7 +1962,7 @@ func (s *Server) configuredDeviceSummary(
 	result["id"] = config.ID
 	result["name"] = config.Name
 	result["device_type"] = store.NormalizeDeviceType(config.DeviceType)
-	result["interface"] = config.Interface
+	result["interface"] = liveCellularInterface(config, entry)
 	result["proxy_port"] = config.ProxyPort
 	result["esim_transport"] = config.ESIMTransport
 	result["sms_enabled"] = config.SMSEnabled
@@ -2046,7 +2046,8 @@ func (s *Server) configuredDeviceOverview(
 	result := s.configuredDeviceSummary(config, physical)
 	result["id"] = config.ID
 	result["name"] = config.Name
-	result["interface"] = config.Interface
+	ifaceName := liveCellularInterface(config, physical)
+	result["interface"] = ifaceName
 	// ttyUSB allocation changes across USB reconnects and boot cycles. The AT
 	// terminal must use only the currently discovered physical port; a stored
 	// path may point at another modem after enumeration order changes.
@@ -2068,8 +2069,8 @@ func (s *Server) configuredDeviceOverview(
 	// Live network state: on-demand sample of the cellular interface counters,
 	// kept warm by the 2s overview SSE cadence. Only meaningful when the modem
 	// data path is enabled and an interface is configured.
-	if connected, _ := result["network_connected"].(bool); (connected || config.NetworkEnabled) && strings.TrimSpace(config.Interface) != "" {
-		live := s.netTraffic.sample(config.ID, config.Interface, time.Now())
+	if connected, _ := result["network_connected"].(bool); (connected || config.NetworkEnabled) && ifaceName != "" {
+		live := s.netTraffic.sample(config.ID, ifaceName, time.Now())
 		result["private_ip"] = live.ipv4
 		result["traffic"] = map[string]string{
 			"rx":      formatLiveBytes(float64(live.minuteRx)),
@@ -2121,9 +2122,26 @@ func (s *Server) configuredDeviceStatus(
 	}
 	result["id"] = config.ID
 	result["name"] = config.Name
-	result["interface"] = config.Interface
+	result["interface"] = liveCellularInterface(config, physical)
 	result["proxy_port"] = config.ProxyPort
 	return result
+}
+
+// liveCellularInterface prefers the netdev currently attached to the USB
+// composition. A stored name such as wwan1 is left behind when option steals
+// the QMI function; if live discovery ran and found no netdev, do not keep
+// dialing that stale name.
+func liveCellularInterface(config store.Device, entry *device.Device) string {
+	if entry != nil {
+		live := strings.TrimSpace(entry.Candidate.NetworkInterface)
+		if live != "" {
+			return live
+		}
+		if strings.TrimSpace(entry.Candidate.VendorID) != "" || strings.TrimSpace(entry.Candidate.USBPath) != "" {
+			return ""
+		}
+	}
+	return strings.TrimSpace(config.Interface)
 }
 
 func storedVoWiFiRuntime(runtime store.VoWiFiRuntime) map[string]any {
@@ -2361,8 +2379,8 @@ func fillConfigFromPhysical(config *store.Device, entry device.Device) {
 	} else if modem.IsDJI4GUSB(candidate.VendorID, candidate.ProductID) {
 		config.DeviceType = store.DeviceTypeDJI4G
 	}
-	if config.Interface == "" {
-		config.Interface = candidate.NetworkInterface
+	if candidate.HardwareKind != "pcsc" {
+		config.Interface = strings.TrimSpace(candidate.NetworkInterface)
 	}
 	if config.ControlDevice == "" {
 		config.ControlDevice = firstNonEmpty(candidate.QMIControl, candidate.ATPort.OpenPath())

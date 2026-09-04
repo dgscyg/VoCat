@@ -189,6 +189,10 @@ func (session *Session) executePromptLocked(
 		return response, fmt.Errorf("drain %s: %w", command, err)
 	}
 	if err := session.waitPromptLocked(ctx, command, &response); err != nil {
+		// AT+CMGS already put the modem into '>' payload mode. Leaving that
+		// prompt open makes every later command return +CMS ERROR: 350 and the
+		// UI looks like "SMS is stuck".
+		session.abortPromptLocked()
 		response.Duration = time.Since(started)
 		return response, session.normalizeReadError(command, err)
 	}

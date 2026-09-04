@@ -516,10 +516,16 @@ func (s *Server) executeAutomaticCall(ctx context.Context, task store.AutomaticT
 }
 
 func (s *Server) executeAutomaticPublicIP(ctx context.Context, config store.Device, iccid string) (string, error) {
-	if strings.TrimSpace(config.Interface) == "" {
+	entry, _, present := s.physicalForConfig(config)
+	var physical *device.Device
+	if present {
+		physical = &entry
+	}
+	networkInterface := liveCellularInterface(config, physical)
+	if networkInterface == "" {
 		return "", errors.New("device has no cellular network interface")
 	}
-	info, err := exportproxy.LookupPublicIP(ctx, config.Interface)
+	info, err := exportproxy.LookupPublicIP(ctx, networkInterface)
 	if err != nil {
 		return "", fmt.Errorf("detect roaming public IP: %w", err)
 	}

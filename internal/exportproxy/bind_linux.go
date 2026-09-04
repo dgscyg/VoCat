@@ -20,6 +20,7 @@ import (
 	"unicode"
 
 	"vocat/internal/fwmark"
+	"vocat/internal/hostif"
 )
 
 func platformSupported() error { return nil }
@@ -56,7 +57,15 @@ func interfaceDialReady(networkInterface string) error {
 	if networkInterface == "" {
 		return fmt.Errorf("cellular network interface is required")
 	}
-	iface, err := net.InterfaceByName(networkInterface)
+	var iface *net.Interface
+	var err error
+	for attempt := 0; attempt < 4; attempt++ {
+		iface, err = hostif.Lookup(networkInterface)
+		if err == nil {
+			break
+		}
+		time.Sleep(125 * time.Millisecond)
+	}
 	if err != nil {
 		return fmt.Errorf("%s is not present on this host: %w", networkInterface, err)
 	}

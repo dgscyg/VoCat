@@ -100,11 +100,15 @@ func (s *Server) schedulePublicIPDetection(configID, physicalID string, revision
 		defer cancel()
 
 		config, err := s.store.Device(ctx, configID)
-		if err != nil || !config.NetworkEnabled || config.VoWiFiEnabled || strings.TrimSpace(config.Interface) == "" {
+		if err != nil || !config.NetworkEnabled || config.VoWiFiEnabled {
 			return
 		}
 		entry, err := s.devices.Get(physicalID)
 		if err != nil || entry.Snapshot == nil {
+			return
+		}
+		networkInterface := liveCellularInterface(config, &entry)
+		if networkInterface == "" {
 			return
 		}
 		iccid := strings.TrimSpace(entry.Snapshot.ICCID)
@@ -112,10 +116,10 @@ func (s *Server) schedulePublicIPDetection(configID, physicalID string, revision
 			return
 		}
 
-		info, err := s.lookupCellularPublicIP(ctx, config.Interface)
+		info, err := s.lookupCellularPublicIP(ctx, networkInterface)
 		if err != nil {
 			if s.logger != nil {
-				s.logger.Warn("automatic roaming public IP detection failed", "device_id", configID, "interface", config.Interface, "error", err)
+				s.logger.Warn("automatic roaming public IP detection failed", "device_id", configID, "interface", networkInterface, "error", err)
 			}
 			return
 		}
@@ -125,7 +129,7 @@ func (s *Server) schedulePublicIPDetection(configID, physicalID string, revision
 			return
 		}
 		latest, err := s.store.Device(ctx, configID)
-		if err != nil || !latest.NetworkEnabled || latest.VoWiFiEnabled || latest.Interface != config.Interface {
+		if err != nil || !latest.NetworkEnabled || latest.VoWiFiEnabled {
 			return
 		}
 		latestEntry, err := s.devices.Get(physicalID)
@@ -134,7 +138,7 @@ func (s *Server) schedulePublicIPDetection(configID, physicalID string, revision
 		}
 		s.savePublicIP(configID, iccid, info)
 		if s.logger != nil {
-			s.logger.Info("automatic roaming public IP detected", "device_id", configID, "interface", config.Interface)
+			s.logger.Info("automatic roaming public IP detected", "device_id", configID, "interface", networkInterface)
 		}
 	}()
 }
@@ -166,15 +170,21 @@ func (s *Server) handleCellularPublicIP(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusConflict, "sim_identity_unavailable", "the modem has no current ICCID; refresh it before detecting the public IP")
 		return true
 	}
-	if strings.TrimSpace(config.Interface) == "" {
+	entry, _, present := s.physicalForConfig(config)
+	var physical *device.Device
+	if present {
+		physical = &entry
+	}
+	networkInterface := liveCellularInterface(config, physical)
+	if networkInterface == "" {
 		writeError(w, http.StatusConflict, "cellular_interface_missing", "the device has no cellular network interface")
 		return true
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	info, err := s.lookupCellularPublicIP(ctx, config.Interface)
+	info, err := s.lookupCellularPublicIP(ctx, networkInterface)
 	if err != nil {
-		s.logger.Warn("detect roaming public IP failed", "device_id", config.ID, "interface", config.Interface, "error", err)
+		s.logger.Warn("detect roaming public IP failed", "device_id", config.ID, "interface", networkInterface, "error", err)
 		writeError(w, http.StatusBadGateway, "public_ip_lookup_failed", err.Error())
 		return true
 	}

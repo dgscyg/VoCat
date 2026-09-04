@@ -5,9 +5,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -24,33 +21,6 @@ func TestDJIUSBControlTransferLayout(t *testing.T) {
 	}
 }
 
-func TestReadUSBNumber(t *testing.T) {
-	directory := t.TempDir()
-	path := filepath.Join(directory, "busnum")
-	if err := os.WriteFile(path, []byte("12\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := readUSBNumber(path); err != nil || got != 12 {
-		t.Fatalf("readUSBNumber() = %d, %v, want 12, nil", got, err)
-	}
-	if err := os.WriteFile(path, []byte("0\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := readUSBNumber(path); err == nil {
-		t.Fatal("readUSBNumber(0) unexpectedly succeeded")
-	}
-}
-
-func TestWriteSysfsDoesNotCreateMissingPath(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "missing")
-	if err := writeSysfs(path, "value"); err == nil {
-		t.Fatal("writeSysfs(missing) unexpectedly succeeded")
-	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("missing sysfs path was created: %v", err)
-	}
-}
-
 func TestRepairDJIQMIRequiresQMICLIBeforeUSBAccess(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 
@@ -63,60 +33,6 @@ func TestRepairDJIQMIRequiresQMICLIBeforeUSBAccess(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "DTR repair attempt") || strings.Contains(err.Error(), "USB topology") {
 		t.Fatalf("repairDJIQMI() touched the repair path before checking qmicli: %v", err)
-	}
-}
-
-func TestDJISerialInterfaceLayout(t *testing.T) {
-	if djiFirstSerialIndex != 0 || djiLastSerialIndex != 3 || djiATIndex != 2 || djiQMIIndex != 4 {
-		t.Fatalf(
-			"DJI interface layout = serial %d-%d, AT %d, QMI %d; want serial 0-3, AT 2, QMI 4",
-			djiFirstSerialIndex,
-			djiLastSerialIndex,
-			djiATIndex,
-			djiQMIIndex,
-		)
-	}
-}
-
-func TestBindDJISerialInterfacesAlreadyCorrect(t *testing.T) {
-	root := t.TempDir()
-	sysRoot := filepath.Join(root, "sys")
-	devRoot := filepath.Join(root, "dev")
-	usbRoot := filepath.Join(sysRoot, "bus", "usb", "devices")
-	driversRoot := filepath.Join(sysRoot, "bus", "usb", "drivers")
-	optionRoot := filepath.Join(driversRoot, "option")
-	if err := os.MkdirAll(optionRoot, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for index := djiFirstSerialIndex; index <= djiLastSerialIndex; index++ {
-		interfacePath := filepath.Join(usbRoot, fmt.Sprintf("1-1:1.%d", index))
-		if err := os.MkdirAll(filepath.Join(interfacePath, fmt.Sprintf("ttyUSB%d", index)), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Symlink(optionRoot, filepath.Join(interfacePath, "driver")); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	interfaces, devices, atDevice, err := bindDJISerialInterfaces(
-		context.Background(),
-		sysRoot,
-		devRoot,
-		usbRoot,
-		driversRoot,
-		"1-1",
-	)
-	if err != nil {
-		t.Fatalf("bindDJISerialInterfaces() error = %v", err)
-	}
-	if len(interfaces) != 4 || interfaces[2] != "1-1:1.2" {
-		t.Fatalf("interfaces = %#v, want four interfaces with AT at 1-1:1.2", interfaces)
-	}
-	if len(devices) != 4 || devices[2] != filepath.Join(devRoot, "ttyUSB2") {
-		t.Fatalf("devices = %#v, want four devices with AT at ttyUSB2", devices)
-	}
-	if atDevice != filepath.Join(devRoot, "ttyUSB2") {
-		t.Fatalf("AT device = %q, want %q", atDevice, filepath.Join(devRoot, "ttyUSB2"))
 	}
 }
 

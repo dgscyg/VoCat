@@ -348,7 +348,10 @@ func TestSessionExecutePromptQueuesURCsAndReturnsCMGS(t *testing.T) {
 
 func TestSessionExecutePromptTimeoutDoesNotWritePayload(t *testing.T) {
 	transport := &transcriptTransport{
-		steps: []transportStep{{write: "AT+CMGS=5\r"}},
+		steps: []transportStep{
+			{write: "AT+CMGS=5\r"},
+			{write: string([]byte{0x1b})},
+		},
 	}
 	session, err := NewSession(transport, SessionOptions{
 		ReadTimeout:    time.Millisecond,
@@ -367,7 +370,7 @@ func TestSessionExecutePromptTimeoutDoesNotWritePayload(t *testing.T) {
 	}
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
-	if transport.resetCount != 1 || len(transport.steps) != 0 ||
+	if transport.resetCount < 1 || len(transport.steps) != 0 ||
 		transport.unexpected != nil {
 		t.Fatalf(
 			"transport = reset %d, steps %d, error %v",

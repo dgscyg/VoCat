@@ -28,6 +28,40 @@ func TestFillConfigFromPhysicalClassifiesDJI4G(t *testing.T) {
 	}
 }
 
+func TestFillConfigFromPhysicalUsesLiveNetworkInterface(t *testing.T) {
+	config := store.Device{Interface: "wwan1"}
+	entry := device.Device{Candidate: modem.Candidate{
+		VendorID:         "2ca3",
+		ProductID:        "4006",
+		NetworkInterface: "wwan2",
+	}}
+	fillConfigFromPhysical(&config, entry)
+	if config.Interface != "wwan2" {
+		t.Fatalf("interface = %q, want live wwan2", config.Interface)
+	}
+
+	entry.Candidate.NetworkInterface = ""
+	fillConfigFromPhysical(&config, entry)
+	if config.Interface != "" {
+		t.Fatalf("interface = %q, want empty when live discovery has no netdev", config.Interface)
+	}
+}
+
+func TestLiveCellularInterfaceIgnoresStaleStoredName(t *testing.T) {
+	config := store.Device{Interface: "wwan1"}
+	if got := liveCellularInterface(config, nil); got != "wwan1" {
+		t.Fatalf("nil entry = %q, want stored wwan1", got)
+	}
+	entry := &device.Device{Candidate: modem.Candidate{NetworkInterface: "wwan0"}}
+	if got := liveCellularInterface(config, entry); got != "wwan0" {
+		t.Fatalf("live netdev = %q, want wwan0", got)
+	}
+	entry = &device.Device{Candidate: modem.Candidate{VendorID: "2ca3", ProductID: "4006", USBPath: "/sys/bus/usb/devices/1-2"}}
+	if got := liveCellularInterface(config, entry); got != "" {
+		t.Fatalf("missing live netdev = %q, want empty instead of stored wwan1", got)
+	}
+}
+
 func TestConfiguredDeviceSummaryIgnoresVoWiFiRuntimeFromPreviousSIM(t *testing.T) {
 	database, err := store.Open(context.Background(), ":memory:")
 	if err != nil {
@@ -131,6 +165,26 @@ func TestConfiguredDeviceSummaryMarksIdleRuntimeAsNotInUse(t *testing.T) {
 	runtime := got["vowifi_runtime"].(map[string]any)
 	if runtime["enabled"] != false || got["vowifi_active"] != false {
 		t.Fatalf("summary = %#v", got)
+	}
+}
+
+func TestConfiguredDeviceOverviewUsesLiveNetworkInterface(t *testing.T) {
+	database, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	s := &Server{store: database}
+	config := store.Device{ID: "ec20_n", Interface: "wwan1"}
+	entry := device.Device{Candidate: modem.Candidate{
+		VendorID:         "2ca3",
+		ProductID:        "4006",
+		USBPath:          "/sys/bus/usb/devices/1-2",
+		NetworkInterface: "",
+	}}
+	got := s.configuredDeviceOverview(config, entry, true)
+	if got["interface"] != "" {
+		t.Fatalf("interface = %#v, want empty when live discovery has no netdev", got["interface"])
 	}
 }
 

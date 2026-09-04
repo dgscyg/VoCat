@@ -694,6 +694,44 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	return nil
 }
 
+func syncStoredCellularInterfaces(
+	ctx context.Context,
+	logger *slog.Logger,
+	database *store.Store,
+	manager *device.Manager,
+) {
+	configs, err := database.ListDevices(ctx)
+	if err != nil {
+		logger.Warn("sync cellular interfaces: list devices", "error", err)
+		return
+	}
+	mapper := integration.ATMapper{Store: database, Devices: manager}
+	for _, config := range configs {
+		if config.DeviceType == store.DeviceTypeUSBSIMReader {
+			continue
+		}
+		entry, mapErr := mapper.Get(config.ID)
+		if mapErr != nil {
+			continue
+		}
+		live := strings.TrimSpace(entry.Candidate.NetworkInterface)
+		if live == strings.TrimSpace(config.Interface) {
+			continue
+		}
+		previous := config.Interface
+		config.Interface = live
+		if err := database.UpsertDevice(ctx, config); err != nil {
+			logger.Warn("sync cellular interface", "device_id", config.ID, "error", err)
+			continue
+		}
+		if live == "" {
+			logger.Info("cleared stale cellular interface", "device_id", config.ID, "was", previous)
+		} else {
+			logger.Info("updated cellular interface from live discovery", "device_id", config.ID, "interface", live, "was", previous)
+		}
+	}
+}
+
 func configureDeviceBackends(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -1381,6 +1419,7 @@ func pollDeviceSnapshots(
 		// Hotplug can replace the physical discovery ID. Rebind each configured
 		// device's selected QMI/AT control plane before collecting its snapshot.
 		configureDeviceBackends(ctx, logger, database, manager)
+		syncStoredCellularInterfaces(ctx, logger, database, manager)
 		entries := manager.List()
 		// Each physical modem owns its own operation lock. Refresh them in
 		// parallel so a slow or wedged EC20 on one hub port cannot delay signal

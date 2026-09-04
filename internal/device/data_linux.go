@@ -20,6 +20,7 @@ import (
 	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
 
 	"vocat/internal/fwmark"
+	"vocat/internal/hostif"
 	"vocat/internal/modem"
 )
 
@@ -415,7 +416,7 @@ func prepareQMIDataFormat(
 }
 
 func qmiDataHostReady(ctx context.Context, networkInterface string) error {
-	interfaceInfo, err := net.InterfaceByName(networkInterface)
+	interfaceInfo, err := hostif.Lookup(networkInterface)
 	if err != nil {
 		return fmt.Errorf("cellular interface is unavailable: %w", err)
 	}
@@ -1111,7 +1112,7 @@ func waitForInterface(ctx context.Context, networkInterface string, timeout time
 		if ctx.Err() != nil {
 			return
 		}
-		iface, err := net.InterfaceByName(networkInterface)
+		iface, err := hostif.Lookup(networkInterface)
 		if err == nil && iface.Flags&net.FlagUp != 0 {
 			return
 		}

@@ -46,17 +46,33 @@ func LookupPublicIP(ctx context.Context, networkInterface string) (PublicIPInfo,
 		ResponseHeaderTimeout: 12 * time.Second,
 	}
 	defer transport.CloseIdleConnections()
-	// Prefer an IP-literal probe so a broken carrier DNS cannot block detection
-	// once the cellular default route exists.
-	info, err := queryPublicIPEndpoint(ctx, transport, cloudflareTraceURL, "text/plain", decodeCloudflareTrace)
-	if err == nil {
-		return info, nil
+	// Each probe gets its own budget. A blocked 1.1.1.1 (common on CN carriers)
+	// used to consume the whole 15s parent deadline, so ipinfo.io never ran and
+	// the API reported "context deadline exceeded" twice.
+	var last error
+	for _, probe := range []struct {
+		rawURL, accept string
+		decode         func(io.Reader) (PublicIPInfo, error)
+	}{
+		{cloudflareTraceURL, "text/plain", decodeCloudflareTrace},
+		{ipInfoURL, "application/json", decodePublicIPInfo},
+	} {
+		if err := ctx.Err(); err != nil {
+			last = err
+			break
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		info, err := queryPublicIPEndpoint(probeCtx, transport, probe.rawURL, probe.accept, probe.decode)
+		cancel()
+		if err == nil {
+			return info, nil
+		}
+		last = err
 	}
-	fallback, fallbackErr := queryPublicIPEndpoint(ctx, transport, ipInfoURL, "application/json", decodePublicIPInfo)
-	if fallbackErr == nil {
-		return fallback, nil
+	if last == nil {
+		last = errors.New("no public IP probe ran")
 	}
-	return PublicIPInfo{}, fmt.Errorf("query public IP through %s: %w", networkInterface, errors.Join(err, fallbackErr))
+	return PublicIPInfo{}, fmt.Errorf("query public IP through %s: %w", networkInterface, last)
 }
 
 const cloudflareTraceURL = "https://1.1.1.1/cdn-cgi/trace"

@@ -11,6 +11,7 @@ import (
 	"vocat/internal/developer"
 	"vocat/internal/device"
 	"vocat/internal/exportproxy"
+	"vocat/internal/modem"
 	"vocat/internal/store"
 )
 
@@ -80,6 +81,29 @@ func TestPublicIPCacheClearsWhileModemIsResetting(t *testing.T) {
 	server.savePublicIP("ec20", "8944100001", exportproxy.PublicIPInfo{IP: "203.0.113.8", CountryCode: "GB"})
 	if _, ok := server.loadPublicIP("ec20", ""); ok {
 		t.Fatal("cache survived a missing live ICCID")
+	}
+}
+
+func TestHandleCellularPublicIPRejectsStaleMissingInterface(t *testing.T) {
+	controller := &publicIPDeviceController{fakeDeviceController: fakeDeviceController{entry: device.Device{
+		ID:         "ec20_n",
+		Discovered: true,
+		Candidate: modem.Candidate{
+			VendorID:  "2ca3",
+			ProductID: "4006",
+			USBPath:   "/sys/bus/usb/devices/1-2",
+		},
+		Snapshot: &device.Snapshot{ICCID: "8944100001"},
+	}}}
+	server := &Server{devices: controller, publicIPs: make(map[string]cachedPublicIP), logger: regionTestLogger()}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/devices/ec20_n/network/public-ip", nil)
+	config := store.Device{ID: "ec20_n", NetworkEnabled: true, Interface: "wwan1"}
+	if !server.handleCellularPublicIP(recorder, request, config, "8944100001") {
+		t.Fatal("public IP endpoint was not handled")
+	}
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, body = %s, want 409 when live discovery has no netdev", recorder.Code, recorder.Body.String())
 	}
 }
 

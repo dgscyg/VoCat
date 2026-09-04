@@ -6,6 +6,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"vocat/internal/hostif"
 )
 
 // liveNetWindow is how far back the "last minute" byte totals reach.
@@ -71,7 +73,7 @@ func (t *liveNetTracker) sample(deviceID, iface string, now time.Time) liveNetRe
 	}
 	rxRate, txRate, minuteRx, minuteTx, status := t.record(deviceID, rxCum, txCum, now)
 	return liveNetResult{
-		ipv4: ipv4,
+		ipv4:   ipv4,
 		rxRate: rxRate, txRate: txRate,
 		minuteRx: minuteRx, minuteTx: minuteTx,
 		status: status,
@@ -131,7 +133,7 @@ func netIfAddrs(iface string) (ipv4 string) {
 	if iface == "" {
 		return ""
 	}
-	netIf, err := net.InterfaceByName(iface)
+	netIf, err := hostif.Lookup(iface)
 	if err != nil {
 		return ""
 	}

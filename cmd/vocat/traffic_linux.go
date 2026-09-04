@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -12,18 +11,18 @@ import (
 )
 
 func readInterfaceTrafficCounters(interfaceName string) (uint64, uint64, error) {
-	iface, err := net.InterfaceByName(interfaceName)
-	if err != nil {
-		return 0, 0, err
+	interfaceName = strings.TrimSpace(interfaceName)
+	if interfaceName == "" {
+		return 0, 0, fmt.Errorf("interface name is empty")
 	}
 	read := func(counter string) (uint64, error) {
-		value, err := os.ReadFile(filepath.Join("/sys/class/net", iface.Name, "statistics", counter))
+		value, err := os.ReadFile(filepath.Join("/sys/class/net", interfaceName, "statistics", counter))
 		if err != nil {
 			return 0, err
 		}
 		parsed, err := strconv.ParseUint(strings.TrimSpace(string(value)), 10, 64)
 		if err != nil {
-			return 0, fmt.Errorf("parse %s %s counter: %w", iface.Name, counter, err)
+			return 0, fmt.Errorf("parse %s %s counter: %w", interfaceName, counter, err)
 		}
 		return parsed, nil
 	}
