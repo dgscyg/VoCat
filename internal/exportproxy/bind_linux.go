@@ -108,12 +108,28 @@ func lookupBoundIPs(ctx context.Context, networkInterface, host string) ([]net.I
 		}
 		lastError = queryErr
 	}
+	// Bound UDP to 1.1.1.1/8.8.8.8 often fake-handshakes on CN cellular.
+	// Clash/host DNS still works for unmarked queries; dial the answers with
+	// SO_BINDTODEVICE so the HTTP probe still exits through the modem.
+	if ips, hostErr := lookupHostIPv4(ctx, host); hostErr == nil && len(ips) > 0 {
+		return ips, nil
+	} else if lastError == nil {
+		lastError = hostErr
+	}
 	if ips, dohErr := lookupDoH(ctx, networkInterface, host); dohErr == nil && len(ips) > 0 {
 		return ips, nil
 	} else if lastError == nil {
 		lastError = dohErr
 	}
 	return nil, fmt.Errorf("lookup %s through %s: %w", host, networkInterface, lastError)
+}
+
+func lookupHostIPv4(ctx context.Context, host string) ([]net.IPAddr, error) {
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
+	if err != nil {
+		return nil, err
+	}
+	return ipsToAddrs(ips), nil
 }
 
 func ipsToAddrs(ips []net.IP) []net.IPAddr {
@@ -173,8 +189,8 @@ func queryDoH(ctx context.Context, transport *http.Transport, rawURL string) ([]
 
 func dnsQueryA(ctx context.Context, dialer *net.Dialer, server, name string) ([]net.IP, error) {
 	ips, err := dnsQueryAOn(ctx, dialer, "udp4", server, name, 512)
-	if err == nil {
-		return ips, nil
+	if err == nil || !errors.Is(err, errDNSTruncated) {
+		return ips, err
 	}
 	return dnsQueryAOn(ctx, dialer, "tcp4", server, name, 4096)
 }
@@ -248,25 +264,7 @@ func exportRouteDNSServers(networkInterface string) []string {
 	if len(servers) == 0 {
 		return []string{"1.1.1.1", "8.8.8.8"}
 	}
-	return appendPublicResolverFallbacks(servers)
-}
-
-func appendPublicResolverFallbacks(servers []string) []string {
-	seen := make(map[string]bool, len(servers)+2)
-	out := make([]string, 0, len(servers)+2)
-	for _, server := range servers {
-		if seen[server] {
-			continue
-		}
-		seen[server] = true
-		out = append(out, server)
-	}
-	for _, fallback := range []string{"1.1.1.1", "8.8.8.8"} {
-		if !seen[fallback] {
-			out = append(out, fallback)
-		}
-	}
-	return out
+	return servers
 }
 
 // Linux IFNAMSIZ is 16 including the terminator. Restricting names here both

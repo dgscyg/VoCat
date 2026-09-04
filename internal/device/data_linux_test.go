@@ -225,3 +225,14 @@ func TestIsNoRouteError(t *testing.T) {
 		t.Fatal("timeout was treated as no-route")
 	}
 }
+
+func TestAppendPublicDNSFallbacksKeepsCarrierServersOnly(t *testing.T) {
+	got := appendPublicDNSFallbacks([]string{"109.249.185.129", "109.249.185.130"})
+	if len(got) != 2 || got[0] != "109.249.185.129" || got[1] != "109.249.185.130" {
+		t.Fatalf("got %v, want carrier DNS only", got)
+	}
+	empty := appendPublicDNSFallbacks(nil)
+	if len(empty) != 2 || empty[0] != "1.1.1.1" || empty[1] != "8.8.8.8" {
+		t.Fatalf("empty = %v, want public fallbacks", empty)
+	}
+}

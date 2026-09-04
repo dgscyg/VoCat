@@ -949,10 +949,8 @@ func appendPublicDNSFallbacks(servers []string) []string {
 		seen[value] = true
 		valid = append(valid, value)
 	}
-	for _, fallback := range []string{"1.1.1.1", "8.8.8.8"} {
-		if !seen[fallback] {
-			valid = append(valid, fallback)
-		}
+	if len(valid) == 0 {
+		return []string{"1.1.1.1", "8.8.8.8"}
 	}
 	return valid
 }
