@@ -43,7 +43,7 @@ export function useDeviceCalls(deviceId: string, enabled = true) {
     return () => window.clearInterval(timer);
   }, [deviceId, enabled, load]);
 
-  const act = useCallback(async (action: "dial" | "answer" | "hangup", body: Record<string, unknown>) => {
+  const act = useCallback(async (action: "dial" | "answer" | "hangup" | "dtmf", body: Record<string, unknown>) => {
     const id = deviceIdRef.current;
     if (!id) return;
     setBusy(action);
@@ -60,6 +60,7 @@ export function useDeviceCalls(deviceId: string, enabled = true) {
   const dial = useCallback((number: string) => act("dial", { number, durationSeconds: 0 }), [act]);
   const answer = useCallback((callId: string) => act("answer", { callId }), [act]);
   const hangup = useCallback((callId: string) => act("hangup", { callId }), [act]);
+  const dtmf = useCallback((callId: string, digits: string) => act("dtmf", { callId, digits }), [act]);
 
   const live = useMemo(() => pickLiveCall(calls), [calls]);
   const incoming = useMemo(() => pickIncomingCall(calls), [calls]);
@@ -75,5 +76,6 @@ export function useDeviceCalls(deviceId: string, enabled = true) {
     dial,
     answer,
     hangup,
+    dtmf,
   };
 }

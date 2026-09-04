@@ -401,6 +401,19 @@ func (manager *Manager) HangupCall(ctx context.Context, deviceID, id string) err
 	return item.orchestrator.HangupCall(ctx, id)
 }
 
+func (manager *Manager) SendDTMF(ctx context.Context, deviceID, id, digits string) error {
+	if err := manager.Ensure(ctx, deviceID); err != nil {
+		return err
+	}
+	manager.mu.Lock()
+	item := manager.entries[deviceID]
+	manager.mu.Unlock()
+	if item == nil {
+		return ErrNotRegistered
+	}
+	return item.orchestrator.SendDTMF(ctx, id, digits)
+}
+
 func (manager *Manager) CallMedia(ctx context.Context, deviceID, id string) (vowifi.CallMedia, error) {
 	if err := manager.Ensure(ctx, deviceID); err != nil {
 		return nil, err

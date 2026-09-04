@@ -711,7 +711,7 @@ func (s *Server) handleDevicePath(
 			return true
 		}
 		return s.handleCalls(w, r, config, physicalID)
-	case "calls/dial", "calls/answer", "calls/hangup":
+	case "calls/dial", "calls/answer", "calls/hangup", "calls/dtmf":
 		if !s.requirePhysicalDevice(w, physicalPresent) {
 			return true
 		}
@@ -721,6 +721,16 @@ func (s *Server) handleDevicePath(
 			return true
 		}
 		return s.handleCallMedia(w, r, config)
+	case "softphone":
+		if !s.requirePhysicalDevice(w, physicalPresent) {
+			return true
+		}
+		return s.handleSoftphoneInfo(w, r, config)
+	case "sip/ws":
+		if !s.requirePhysicalDevice(w, physicalPresent) {
+			return true
+		}
+		return s.handleSIPWebSocket(w, r, config)
 	default:
 		return false
 	}

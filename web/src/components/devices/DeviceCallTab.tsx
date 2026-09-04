@@ -152,6 +152,8 @@ export function DeviceCallTab({
   const [number, setNumber] = useState("");
   const [muted, setMuted] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+  const [keypad, setKeypad] = useState(false);
+  const [dtmfSeq, setDtmfSeq] = useState("");
   const live = session.live;
   const audioEnabled = session.audioAvailable && live?.state === "active";
   const media = useCallMedia(device.id, live?.id || "", !!audioEnabled, muted);
@@ -173,7 +175,27 @@ export function DeviceCallTab({
   }, [live?.id, live?.state, live?.startedAt]);
 
   function appendDigit(digit: string) {
+    if (live?.state === "active") {
+      setDtmfSeq((current) => (current + digit).slice(-32));
+      void session.dtmf(live.id, digit);
+      return;
+    }
     setNumber((current) => sanitizeDialNumber(current + digit));
+  }
+
+  function toggleRecording() {
+    if (media.recording) {
+      const blob = media.stopRecording();
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `vocat-call-${live?.number || "rec"}-${Date.now()}.wav`;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 10000);
+      return;
+    }
+    media.startRecording();
   }
 
   async function withAudioGesture(action: () => Promise<void>) {
@@ -236,6 +258,16 @@ export function DeviceCallTab({
                   {muted ? t("已静音") : t("麦克风")}
                 </Button>
               ) : null}
+              {live.state === "active" ? (
+                <Button onClick={() => setKeypad((value) => !value)}>
+                  {keypad ? t("隐藏键盘") : t("键盘")}
+                </Button>
+              ) : null}
+              {audioEnabled ? (
+                <Button onClick={toggleRecording}>
+                  {media.recording ? t("停止录音") : t("录音")}
+                </Button>
+              ) : null}
               <Button
                 variant="danger"
                 icon={<CallEndRegular />}
@@ -258,11 +290,16 @@ export function DeviceCallTab({
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,280px)_1fr]">
         <div className="space-y-3">
           <Input
-            value={number}
+            value={live?.state === "active" && keypad ? dtmfSeq : number}
             onChange={(event) => setNumber(sanitizeDialNumber(event.target.value))}
-            placeholder={t("输入号码")}
-            disabled={!!live}
+            placeholder={live?.state === "active" ? t("DTMF") : t("输入号码")}
+            disabled={!!live && !(live.state === "active" && keypad)}
             onKeyDown={(event) => {
+              if (live?.state === "active" && /^[0-9*#]$/.test(event.key)) {
+                event.preventDefault();
+                appendDigit(event.key);
+                return;
+              }
               if (event.key === "Enter") void handleDial();
             }}
           />
@@ -271,7 +308,7 @@ export function DeviceCallTab({
               <button
                 key={key}
                 type="button"
-                disabled={!!live}
+                disabled={!!live && live.state !== "active"}
                 onClick={() => appendDigit(key)}
                 className="ui-glass-border h-12 rounded-xl text-lg font-semibold text-gray-800 disabled:opacity-40 dark:text-gray-100"
               >

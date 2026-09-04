@@ -5,7 +5,7 @@ import { api, apiMessage } from "../api";
 import type { DeviceListItem, DevicesResponse } from "../types";
 import { usePolling } from "../lib/usePolling";
 import { useI18n } from "../lib/i18n";
-import { ErrorState, PageHeader, RefreshButton, Select, Spinner } from "../components/ui";
+import { Button, ErrorState, PageHeader, RefreshButton, Select, Spinner, message } from "../components/ui";
 import { DeviceCallTab } from "../components/devices/DeviceCallTab";
 import { useDeviceCalls } from "../components/devices/useDeviceCalls";
 import { isDeviceOnline } from "../components/devices/shared";
@@ -14,6 +14,16 @@ import type { DeviceDetail } from "../components/devices/types";
 interface LoadError {
   message: string;
   status?: number;
+}
+
+interface SoftphoneInfo {
+  enabled?: boolean;
+  username?: string;
+  password?: string;
+  realm?: string;
+  wsUrl?: string;
+  udpPort?: number;
+  host?: string;
 }
 
 function toDetail(item: DeviceListItem): DeviceDetail {
@@ -58,6 +68,25 @@ export default function SoftphonePage() {
   }, [callable, requestedId]);
   const selected = callable.find((device) => device.id === selectedId) || null;
   const session = useDeviceCalls(selectedId, !!selectedId);
+  const [sip, setSip] = useState<SoftphoneInfo | null>(null);
+
+  useEffect(() => {
+    if (!selectedId) {
+      setSip(null);
+      return;
+    }
+    let cancelled = false;
+    api<SoftphoneInfo>(`/devices/${encodeURIComponent(selectedId)}/softphone`)
+      .then((info) => {
+        if (!cancelled) setSip(info);
+      })
+      .catch(() => {
+        if (!cancelled) setSip({ enabled: false });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId]);
 
   function selectDevice(id: string) {
     const next = new URLSearchParams(searchParams);
@@ -109,6 +138,29 @@ export default function SoftphonePage() {
           {selected ? (
             <div className="ui-card p-6">
               <DeviceCallTab device={toDetail(selected)} online={isDeviceOnline(selected)} session={session} />
+            </div>
+          ) : null}
+          {sip?.enabled ? (
+            <div className="ui-card space-y-3 p-6 text-sm">
+              <div className="text-base font-bold text-gray-900 dark:text-white">{t("SIP 分机")}</div>
+              <div className="text-gray-500">{t("浏览器 WebRTC 分机和外部 SIP 客户端可注册到这条线路")}</div>
+              <div className="grid gap-2 font-mono text-xs sm:grid-cols-2">
+                <div>{t("用户名")}: {sip.username}</div>
+                <div className="flex items-center gap-2">
+                  {t("密码")}: {sip.password}
+                  <Button
+                    size="small"
+                    onClick={() => {
+                      void navigator.clipboard.writeText(sip.password || "");
+                      message.success(t("已复制 SIP 密码"));
+                    }}
+                  >
+                    {t("复制")}
+                  </Button>
+                </div>
+                <div className="sm:col-span-2 break-all">{t("WSS 地址")}: {sip.wsUrl}</div>
+                <div>{t("SIP UDP")}: {sip.host}:{sip.udpPort}</div>
+              </div>
             </div>
           ) : null}
         </div>

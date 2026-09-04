@@ -502,3 +502,7 @@ func (controller *telegramTestCallController) HangupCall(_ context.Context, _ st
 	controller.hungUp = append(controller.hungUp, id)
 	return nil
 }
+
+func (*telegramTestCallController) SendDTMF(context.Context, string, string, string) error {
+	return nil
+}

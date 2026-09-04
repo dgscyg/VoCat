@@ -26,6 +26,7 @@ type rtpMedia struct {
 	remote      *net.UDPAddr
 	codec       string
 	payloadType byte
+	dtmfPT      byte
 
 	writeMu   sync.Mutex
 	pending   []int16
@@ -52,7 +53,7 @@ func newRTPMedia(local net.IP) (*rtpMedia, error) {
 	media := &rtpMedia{
 		conn: connection, sequence: binary.BigEndian.Uint16(seed[:2]),
 		timestamp: binary.BigEndian.Uint32(seed[2:6]), ssrc: binary.BigEndian.Uint32(seed[6:]),
-		downlink: make(chan []int16, 64), closed: make(chan struct{}),
+		dtmfPT: 100, downlink: make(chan []int16, 64), closed: make(chan struct{}),
 	}
 	go media.receive()
 	return media, nil
@@ -94,8 +95,14 @@ func (media *rtpMedia) answerSDP(local net.IP) []byte {
 	if codec == "AMR-WB" {
 		rate = 16000
 	}
-	return media.buildSDP(local, strconv.Itoa(int(payload)), []string{
+	dtmfPT := media.dtmfPT
+	if dtmfPT == 0 {
+		dtmfPT = 100
+	}
+	return media.buildSDP(local, strconv.Itoa(int(payload))+" "+strconv.Itoa(int(dtmfPT)), []string{
 		fmt.Sprintf("a=rtpmap:%d %s/%d", payload, codec, rate),
+		fmt.Sprintf("a=rtpmap:%d telephone-event/8000", dtmfPT),
+		fmt.Sprintf("a=fmtp:%d 0-15", dtmfPT),
 	})
 }
 
@@ -147,6 +154,7 @@ func (media *rtpMedia) configureRemote(body []byte) error {
 	}
 	var codec string
 	var payload byte
+	var dtmfPT byte
 	for _, value := range formats {
 		parsed, parseErr := strconv.Atoi(value)
 		if parseErr != nil || parsed < 0 || parsed > 127 {
@@ -165,9 +173,12 @@ func (media *rtpMedia) configureRemote(body []byte) error {
 				name = fmt.Sprintf("PAYLOAD-%d", parsed)
 			}
 		}
-		if name != "TELEPHONE-EVENT" {
+		if name == "TELEPHONE-EVENT" {
+			dtmfPT = byte(parsed)
+			continue
+		}
+		if codec == "" {
 			codec, payload = name, byte(parsed)
-			break
 		}
 	}
 	if codec == "" && len(formats) > 0 {
@@ -178,10 +189,14 @@ func (media *rtpMedia) configureRemote(body []byte) error {
 	if codec == "" {
 		return errors.New("ims: remote SDP has no usable audio format")
 	}
+	if dtmfPT == 0 {
+		dtmfPT = 100
+	}
 	media.mu.Lock()
 	media.remote = &net.UDPAddr{IP: address, Port: port}
 	media.codec = codec
 	media.payloadType = payload
+	media.dtmfPT = dtmfPT
 	media.mu.Unlock()
 	return nil
 }

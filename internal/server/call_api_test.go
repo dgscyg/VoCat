@@ -18,6 +18,15 @@ func TestParseCLCC(t *testing.T) {
 	}
 }
 
+func TestValidDTMFDigits(t *testing.T) {
+	if !validDTMFDigits("1*#A") || validDTMFDigits("") || validDTMFDigits("9;") {
+		t.Fatal("validDTMFDigits mismatch")
+	}
+	if dtmfATArgument("5") != "5" || dtmfATArgument("12") != `"12"` {
+		t.Fatalf("dtmfATArgument unexpected")
+	}
+}
+
 func TestValidDialNumber(t *testing.T) {
 	for _, value := range []string{"+447700900000", "12345", "*100#"} {
 		if !validDialNumber(value) {
@@ -85,3 +94,5 @@ func (*fakeCallController) AnswerCall(context.Context, string, string) (vowifi.C
 }
 
 func (*fakeCallController) HangupCall(context.Context, string, string) error { return nil }
+
+func (*fakeCallController) SendDTMF(context.Context, string, string, string) error { return nil }

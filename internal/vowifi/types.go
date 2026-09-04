@@ -449,6 +449,7 @@ type CallController interface {
 	DialCall(context.Context, string) (Call, error)
 	AnswerCall(context.Context, string) (Call, error)
 	HangupCall(context.Context, string) error
+	SendDTMF(context.Context, string, string) error
 }
 
 // CallMedia is a narrow, codec-independent bridge between an IMS RTP stream

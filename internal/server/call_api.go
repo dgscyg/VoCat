@@ -66,6 +66,7 @@ func (s *Server) handleCallAction(w http.ResponseWriter, r *http.Request, config
 	duration := time.Duration(0)
 	number := ""
 	callID := ""
+	digits := ""
 	switch action {
 	case "dial":
 		var request struct {
@@ -107,6 +108,22 @@ func (s *Server) handleCallAction(w http.ResponseWriter, r *http.Request, config
 		}
 		callID = strings.TrimSpace(request.CallID)
 		command = "ATH"
+	case "dtmf":
+		var request struct {
+			CallID string `json:"call_id"`
+			Digits string `json:"digits"`
+		}
+		if err := s.decodeJSON(w, r, &request); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return true
+		}
+		callID = strings.TrimSpace(request.CallID)
+		digits = strings.TrimSpace(request.Digits)
+		if !validDTMFDigits(digits) {
+			writeError(w, http.StatusBadRequest, "invalid_dtmf", "DTMF digits must be 0-9, *, #, or A-D")
+			return true
+		}
+		command = "AT+VTS=" + dtmfATArgument(digits)
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "call action not found")
 		return true
@@ -133,6 +150,11 @@ func (s *Server) handleCallAction(w http.ResponseWriter, r *http.Request, config
 			callID, err = resolveVoWiFiCallID(controller, config.ID, callID, "")
 			if err == nil {
 				err = controller.HangupCall(r.Context(), config.ID, callID)
+			}
+		case "dtmf":
+			callID, err = resolveVoWiFiCallID(controller, config.ID, callID, "active")
+			if err == nil {
+				err = controller.SendDTMF(r.Context(), config.ID, callID, digits)
 			}
 		}
 		if err != nil {
@@ -243,6 +265,27 @@ func (s *Server) hangupAfter(deviceID, physicalID string, duration time.Duration
 	if _, err := s.devices.ExecuteAT(ctx, physicalID, "ATH"); err != nil {
 		s.logger.Warn("automatic call hangup failed", "device_id", deviceID, "error", err)
 	}
+}
+
+func validDTMFDigits(value string) bool {
+	if value == "" || len(value) > 32 {
+		return false
+	}
+	for _, character := range value {
+		if character >= '0' && character <= '9' || character == '*' || character == '#' ||
+			character >= 'A' && character <= 'D' || character >= 'a' && character <= 'd' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func dtmfATArgument(digits string) string {
+	if len(digits) == 1 {
+		return digits
+	}
+	return `"` + digits + `"`
 }
 
 func validDialNumber(value string) bool {

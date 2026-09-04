@@ -22,6 +22,7 @@ import (
 	"vocat/internal/extensions"
 	"vocat/internal/httpsmode"
 	"vocat/internal/loghub"
+	"vocat/internal/sipgw"
 	"vocat/internal/store"
 	"vocat/internal/update"
 	"vocat/internal/vowifi"
@@ -94,6 +95,7 @@ type Server struct {
 	cellularDataEventOnce     sync.Once
 	cellularDataLifecycleOnce sync.Once
 	cellularData              *cellularDataRuntime
+	sipgw                     *sipgw.Manager
 }
 
 func New(options Options) (*Server, error) {
@@ -150,6 +152,10 @@ func New(options Options) (*Server, error) {
 		updateApply:         update.ApplyLatest,
 		updateRestart:       update.RestartService,
 	}
+	if calls, ok := options.VoWiFi.(VoWiFiCallController); ok {
+		media, _ := options.VoWiFi.(VoWiFiCallMediaController)
+		server.sipgw = sipgw.New(calls, media)
+	}
 	server.cellularDataRuntime()
 	server.loadAccessConfig(context.Background())
 	server.loadUILanguage(context.Background())
@@ -197,6 +203,7 @@ type VoWiFiCallController interface {
 	DialCall(context.Context, string, string) (vowifi.Call, error)
 	AnswerCall(context.Context, string, string) (vowifi.Call, error)
 	HangupCall(context.Context, string, string) error
+	SendDTMF(context.Context, string, string, string) error
 }
 
 type VoWiFiCallMediaController interface {

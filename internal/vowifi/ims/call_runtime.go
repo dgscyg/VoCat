@@ -660,14 +660,21 @@ func (session *Session) startSessionTimer(call *imsCall, header string) {
 }
 
 func (session *Session) sendDialogRequest(ctx context.Context, call *imsCall, method string) error {
+	return session.sendDialogRequestWithBody(ctx, call, method, "", nil)
+}
+
+func (session *Session) sendDialogRequestWithBody(ctx context.Context, call *imsCall, method, contentType string, body []byte) error {
 	cseq := call.cseq
-	if method == "BYE" || method == "UPDATE" {
+	if method == "BYE" || method == "UPDATE" || method == "INFO" {
 		session.mu.Lock()
 		cseq = session.cseq
 		session.cseq++
 		session.mu.Unlock()
 	}
 	request := session.buildDialogRequest(call, method, cseq)
+	if len(body) > 0 {
+		request = session.buildDialogRequestWithBody(call, method, cseq, contentType, body)
+	}
 	if method == "ACK" {
 		session.writeMu.Lock()
 		_, err := session.conn.Write(request)
@@ -728,6 +735,16 @@ func (session *Session) buildDialogRequest(call *imsCall, method string, cseq ui
 		lines = append(lines[:len(lines)-3], fmt.Sprintf("Session-Expires: %d;refresher=uac", call.sessionExpires), "Content-Length: 0", "", "")
 	}
 	return []byte(strings.Join(lines, "\r\n"))
+}
+
+func (session *Session) buildDialogRequestWithBody(call *imsCall, method string, cseq uint32, contentType string, body []byte) []byte {
+	packet := session.buildDialogRequest(call, method, cseq)
+	if len(body) == 0 {
+		return packet
+	}
+	text := string(packet)
+	text = strings.Replace(text, "Content-Length: 0\r\n\r\n", fmt.Sprintf("Content-Type: %s\r\nContent-Length: %d\r\n\r\n", contentType, len(body)), 1)
+	return append([]byte(text), body...)
 }
 
 func (session *Session) localMediaIP() net.IP {
@@ -904,6 +921,38 @@ func (session *Session) setCallMediaReady(id string) {
 		call.public.Codec = call.media.Codec()
 	}
 	session.callMu.Unlock()
+}
+
+func (session *Session) SendDTMF(ctx context.Context, id, digits string) error {
+	normalized, err := normalizeDTMFDigits(digits)
+	if err != nil {
+		return err
+	}
+	session.callMu.Lock()
+	call := session.calls[id]
+	session.callMu.Unlock()
+	if call == nil {
+		return ErrCallNotFound
+	}
+	if call.public.State != "active" || call.media == nil || !call.media.ready() {
+		return ErrCallState
+	}
+	rtpErr := call.media.SendDTMF(normalized)
+	infoErr := session.sendDTMFInfo(ctx, call, normalized)
+	if rtpErr != nil && infoErr != nil {
+		return fmt.Errorf("ims: send DTMF: rtp: %v; info: %w", rtpErr, infoErr)
+	}
+	return nil
+}
+
+func (session *Session) sendDTMFInfo(ctx context.Context, call *imsCall, digits string) error {
+	for _, digit := range digits {
+		body := []byte(fmt.Sprintf("Signal=%c\r\nDuration=160\r\n", digit))
+		if err := session.sendDialogRequestWithBody(ctx, call, "INFO", "application/dtmf-relay", body); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (session *Session) CallMedia(_ context.Context, id string) (vowifi.CallMedia, error) {
