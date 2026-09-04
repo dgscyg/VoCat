@@ -39,10 +39,29 @@ func (s *Server) handleCalls(w http.ResponseWriter, r *http.Request, config stor
 		s.writeDeviceError(w, err)
 		return true
 	}
+	extra := map[string]any{"raw": response.Text()}
+	if s.cellularCallAudioReady(r.Context(), physicalID) {
+		extra["audio_available"] = true
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"data": callListPayload(config.ID, transport, parseCLCC(response), map[string]any{"raw": response.Text()}),
+		"data": callListPayload(config.ID, transport, parseCLCC(response), extra),
 	})
 	return true
+}
+
+type cellularCallAudioController interface {
+	PrepareCallAudio(context.Context, string) error
+	CallAudio(context.Context, string) (vowifi.CallMedia, error)
+	CallAudioReady(string) bool
+}
+
+func (s *Server) cellularCallAudioReady(ctx context.Context, physicalID string) bool {
+	controller, ok := s.devices.(cellularCallAudioController)
+	if !ok {
+		return false
+	}
+	_ = controller.PrepareCallAudio(ctx, physicalID)
+	return controller.CallAudioReady(physicalID)
 }
 
 func callListPayload(deviceID, transport string, calls any, extra map[string]any) map[string]any {

@@ -135,6 +135,8 @@ type managedDevice struct {
 	preFlightMode      *int
 	resetClientOnLock  bool
 	simPIN             string
+	callAudio          *nmeaCallAudio
+	callAudioSkipped   bool
 }
 
 func NewManager(options Options) (*Manager, error) {
@@ -870,6 +872,8 @@ func (manager *Manager) Reboot(ctx context.Context, id string) error {
 		err = closeErr
 	}
 	state.client = nil
+	closeCallAudio(state)
+	state.callAudioSkipped = false
 	state.preFlightMode = nil
 	manager.clearSnapshot(id, state)
 	manager.setResult(id, state, nil, err)

@@ -1265,6 +1265,7 @@ export const EN_DICT: Record<string, string> = {
   "暂无可用于通话的设备": "No devices are available for calling",
   "VoWiFi IMS 已就绪，可在浏览器里拨打和接听，无需外部客户端": "VoWiFi IMS is ready; you can place and receive calls in the browser without an external client",
   "当前走基站电路域，只能拨打、接听和挂断，浏览器没有声音": "Using circuit-switched cellular; you can dial, answer, and hang up, but the browser has no audio",
+  "电路域 USB 语音已接通，可在浏览器里听和说": "Circuit-switched USB voice is on; you can listen and talk in the browser",
   "浏览器音频": "Browser audio",
   "电路域 · 无音频": "Circuit-switched · no audio",
   "浏览器听筒和麦克风已接通": "Browser earpiece and microphone are connected",

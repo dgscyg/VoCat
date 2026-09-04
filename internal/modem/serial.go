@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 )
 
 type SerialOpener struct {
@@ -54,6 +55,22 @@ func (opener SerialOpener) Open(ctx context.Context, port Port) (Client, error) 
 		return nil, err
 	}
 	return session, nil
+}
+
+// OpenRawPort opens a USB serial (or WWAN AT) node for non-AT binary I/O such
+// as Quectel QPCMV PCM on the NMEA interface.
+func OpenRawPort(path string, baudRate int) (Transport, error) {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if path == "" || path == "." {
+		return nil, errors.New("modem: raw port path is required")
+	}
+	if isNativeWWANATPath(path) {
+		return openNativeWWANATTransport(path)
+	}
+	if baudRate <= 0 {
+		baudRate = 115200
+	}
+	return openSerialTransport(path, baudRate)
 }
 
 func isNativeWWANATPath(path string) bool {

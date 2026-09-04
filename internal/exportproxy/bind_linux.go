@@ -189,8 +189,8 @@ func queryDoH(ctx context.Context, transport *http.Transport, rawURL string) ([]
 
 func dnsQueryA(ctx context.Context, dialer *net.Dialer, server, name string) ([]net.IP, error) {
 	ips, err := dnsQueryAOn(ctx, dialer, "udp4", server, name, 512)
-	if err == nil || !errors.Is(err, errDNSTruncated) {
-		return ips, err
+	if err == nil {
+		return ips, nil
 	}
 	return dnsQueryAOn(ctx, dialer, "tcp4", server, name, 4096)
 }
@@ -264,7 +264,25 @@ func exportRouteDNSServers(networkInterface string) []string {
 	if len(servers) == 0 {
 		return []string{"1.1.1.1", "8.8.8.8"}
 	}
-	return servers
+	return appendPublicResolverFallbacks(servers)
+}
+
+func appendPublicResolverFallbacks(servers []string) []string {
+	seen := make(map[string]bool, len(servers)+2)
+	out := make([]string, 0, len(servers)+2)
+	for _, server := range servers {
+		if seen[server] {
+			continue
+		}
+		seen[server] = true
+		out = append(out, server)
+	}
+	for _, fallback := range []string{"1.1.1.1", "8.8.8.8"} {
+		if !seen[fallback] {
+			out = append(out, fallback)
+		}
+	}
+	return out
 }
 
 // Linux IFNAMSIZ is 16 including the terminator. Restricting names here both

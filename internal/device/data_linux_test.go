@@ -226,10 +226,16 @@ func TestIsNoRouteError(t *testing.T) {
 	}
 }
 
-func TestAppendPublicDNSFallbacksKeepsCarrierServersOnly(t *testing.T) {
+func TestAppendPublicDNSFallbacksKeepsCarrierThenPublicResolvers(t *testing.T) {
 	got := appendPublicDNSFallbacks([]string{"109.249.185.129", "109.249.185.130"})
-	if len(got) != 2 || got[0] != "109.249.185.129" || got[1] != "109.249.185.130" {
-		t.Fatalf("got %v, want carrier DNS only", got)
+	want := []string{"109.249.185.129", "109.249.185.130", "1.1.1.1", "8.8.8.8"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
 	}
 	empty := appendPublicDNSFallbacks(nil)
 	if len(empty) != 2 || empty[0] != "1.1.1.1" || empty[1] != "8.8.8.8" {

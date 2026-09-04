@@ -346,6 +346,37 @@ func TestSessionExecutePromptQueuesURCsAndReturnsCMGS(t *testing.T) {
 	}
 }
 
+func TestSessionRecoverPromptSendsEscapeThenAT(t *testing.T) {
+	transport := &transcriptTransport{steps: []transportStep{
+		{write: string([]byte{0x1b})},
+		{write: "AT\r", chunks: []string{"\r\nOK\r\n"}},
+	}}
+	session := newTestSession(t, transport)
+	if err := session.RecoverPrompt(context.Background()); err != nil {
+		t.Fatalf("RecoverPrompt: %v", err)
+	}
+}
+
+func TestSessionExecutePromptDrainsBeforeWriting(t *testing.T) {
+	const pdu = "00"
+	inner := &transcriptTransport{steps: []transportStep{
+		{write: "AT+CMGS=1\r", chunks: []string{"> "}},
+		{write: pdu},
+		{write: string([]byte{0x1a}), chunks: []string{"\r\n+CMGS: 1\r\nOK\r\n"}},
+	}}
+	events := make(chan string, 8)
+	session := newTestSession(t, &drainOrderTransport{inner: inner, events: events})
+	if _, err := session.ExecutePrompt(context.Background(), "AT+CMGS=1", []byte(pdu)); err != nil {
+		t.Fatalf("ExecutePrompt: %v", err)
+	}
+	if first := <-events; first != "drain" {
+		t.Fatalf("first transport event = %q, want drain before AT+CMGS", first)
+	}
+	if second := <-events; second != "write:AT+CMGS=1\r" {
+		t.Fatalf("second transport event = %q, want the CMGS write", second)
+	}
+}
+
 func TestSessionExecutePromptTimeoutDoesNotWritePayload(t *testing.T) {
 	transport := &transcriptTransport{
 		steps: []transportStep{

@@ -49,6 +49,11 @@ func (manager *Manager) SendSMS(
 		manager.setResult(id, state, nil, err)
 		return result, err
 	}
+	if recovery, ok := client.(interface{ RecoverPrompt(context.Context) error }); ok {
+		recoverCtx, cancelRecover := context.WithTimeout(ctx, 3*time.Second)
+		_ = recovery.RecoverPrompt(recoverCtx)
+		cancelRecover()
+	}
 	for _, command := range parts[0].setup {
 		if _, err := manager.command(ctx, client, command); err != nil {
 			result.SubmissionStatus = "setup_failed"

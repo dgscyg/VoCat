@@ -43,37 +43,22 @@ func LookupPublicIP(ctx context.Context, networkInterface string) (PublicIPInfo,
 			return dialTarget(ctx, address, &dialer, networkInterface)
 		},
 		DisableKeepAlives:     true,
-		ResponseHeaderTimeout: 8 * time.Second,
-		TLSHandshakeTimeout:   8 * time.Second,
+		ResponseHeaderTimeout: 12 * time.Second,
+		TLSHandshakeTimeout:   12 * time.Second,
 	}
 	defer transport.CloseIdleConnections()
-	// Pre-merge order: ipinfo.io first. 1.1.1.1 is an IP-literal so it skips
-	// DNS, but on CN cellular it often fake-handshakes and never completes
-	// TLS/HTTP, eating the whole deadline. Each probe is still bounded.
-	var last error
-	for _, probe := range []struct {
-		rawURL, accept string
-		decode         func(io.Reader) (PublicIPInfo, error)
-	}{
-		{ipInfoURL, "application/json", decodePublicIPInfo},
-		{cloudflareTraceURL, "text/plain", decodeCloudflareTrace},
-	} {
-		if err := ctx.Err(); err != nil {
-			last = err
-			break
-		}
-		probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
-		info, err := queryPublicIPEndpoint(probeCtx, transport, probe.rawURL, probe.accept, probe.decode)
-		cancel()
-		if err == nil {
-			return info, nil
-		}
-		last = err
+	// 225c15c order: IP-literal 1.1.1.1 first so a broken carrier DNS cannot
+	// block detection once the cellular default route exists. ipinfo.io is
+	// the DNS-dependent fallback, not the first probe.
+	info, err := queryPublicIPEndpoint(ctx, transport, cloudflareTraceURL, "text/plain", decodeCloudflareTrace)
+	if err == nil {
+		return info, nil
 	}
-	if last == nil {
-		last = errors.New("no public IP probe ran")
+	fallback, fallbackErr := queryPublicIPEndpoint(ctx, transport, ipInfoURL, "application/json", decodePublicIPInfo)
+	if fallbackErr == nil {
+		return fallback, nil
 	}
-	return PublicIPInfo{}, fmt.Errorf("query public IP through %s: %w", networkInterface, last)
+	return PublicIPInfo{}, fmt.Errorf("query public IP through %s: %w", networkInterface, errors.Join(err, fallbackErr))
 }
 
 const cloudflareTraceURL = "https://1.1.1.1/cdn-cgi/trace"

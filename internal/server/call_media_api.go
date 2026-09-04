@@ -17,13 +17,10 @@ const maxCallMediaMessage = 16 << 10
 
 // handleCallMedia upgrades an authenticated same-origin request to a binary
 // PCM bridge. Each WebSocket message contains little-endian signed 16-bit,
-// 8 kHz, mono samples. RTP and codec details remain inside the IMS provider.
-func (s *Server) handleCallMedia(w http.ResponseWriter, r *http.Request, config store.Device) bool {
+// 8 kHz, mono samples. VoWiFi uses IMS RTP; circuit-switched calls use USB
+// QPCMV PCM when the modem exposes it.
+func (s *Server) handleCallMedia(w http.ResponseWriter, r *http.Request, config store.Device, physicalID string) bool {
 	if !requireMethod(w, r, http.MethodGet) {
-		return true
-	}
-	if s.callTransport(config.ID) != "vowifi" {
-		writeError(w, http.StatusNotImplemented, "call_media_unavailable", "browser audio is only available for an active VoWiFi IMS call")
 		return true
 	}
 	callID := strings.TrimSpace(r.URL.Query().Get("call_id"))
@@ -31,12 +28,7 @@ func (s *Server) handleCallMedia(w http.ResponseWriter, r *http.Request, config 
 		writeError(w, http.StatusBadRequest, "invalid_call_id", "call_id is required")
 		return true
 	}
-	controller, ok := s.vowifi.(VoWiFiCallMediaController)
-	if !ok {
-		writeError(w, http.StatusNotImplemented, "call_media_unavailable", "the active IMS session does not expose RTP media")
-		return true
-	}
-	media, err := controller.CallMedia(r.Context(), config.ID, callID)
+	media, err := s.openCallMedia(r.Context(), config, physicalID, callID)
 	if err != nil {
 		writeError(w, http.StatusConflict, "call_media_unavailable", err.Error())
 		return true
@@ -96,4 +88,25 @@ func (s *Server) handleCallMedia(w http.ResponseWriter, r *http.Request, config 
 			return true
 		}
 	}
+}
+
+func (s *Server) openCallMedia(ctx context.Context, config store.Device, physicalID, callID string) (media interface {
+	ReadPCM(context.Context) ([]int16, error)
+	WritePCM([]int16) error
+}, err error) {
+	if s.callTransport(config.ID) == "vowifi" {
+		controller, ok := s.vowifi.(VoWiFiCallMediaController)
+		if !ok {
+			return nil, errors.New("the active IMS session does not expose RTP media")
+		}
+		return controller.CallMedia(ctx, config.ID, callID)
+	}
+	audio, ok := s.devices.(cellularCallAudioController)
+	if !ok {
+		return nil, errors.New("browser audio is only available for VoWiFi IMS or USB call PCM")
+	}
+	if prepareErr := audio.PrepareCallAudio(ctx, physicalID); prepareErr != nil && !audio.CallAudioReady(physicalID) {
+		return nil, prepareErr
+	}
+	return audio.CallAudio(ctx, physicalID)
 }

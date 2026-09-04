@@ -720,7 +720,7 @@ func (s *Server) handleDevicePath(
 		if !s.requirePhysicalDevice(w, physicalPresent) {
 			return true
 		}
-		return s.handleCallMedia(w, r, config)
+		return s.handleCallMedia(w, r, config, physicalID)
 	case "softphone":
 		if !s.requirePhysicalDevice(w, physicalPresent) {
 			return true

@@ -170,6 +170,23 @@ func (session *Session) poisonLocked() {
 	session.poisoned = true
 }
 
+const smsPromptWait = 8 * time.Second
+
+// RecoverPrompt aborts a leftover AT+CMGS '>' payload mode (ESC) and then
+// issues AT so the next SMS command is not answered with +CMS ERROR: 350.
+func (session *Session) RecoverPrompt(ctx context.Context) error {
+	ctx, cancel := session.commandContext(ctx)
+	defer cancel()
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.closed {
+		return ErrSessionClosed
+	}
+	session.abortPromptLocked()
+	_, err := session.executeLocked(ctx, "AT")
+	return err
+}
+
 func (session *Session) executePromptLocked(
 	ctx context.Context,
 	command string,
@@ -180,21 +197,27 @@ func (session *Session) executePromptLocked(
 	if err := ctx.Err(); err != nil {
 		return response, err
 	}
-	if err := writeAll(session.transport, []byte(command+"\r")); err != nil {
-		session.poisonLocked()
-		return response, fmt.Errorf("write %s: %w", command, err)
-	}
+	// Drain stale RX before writing. Drain after AT+CMGS would discard '>' on
+	// WWAN ports (they implement Drain as an input flush) and the UI then waits
+	// the full SMS timeout looking stuck.
 	if err := drainTransport(ctx, session.transport); err != nil {
 		session.poisonLocked()
 		return response, fmt.Errorf("drain %s: %w", command, err)
 	}
-	if err := session.waitPromptLocked(ctx, command, &response); err != nil {
+	if err := writeAll(session.transport, []byte(command+"\r")); err != nil {
+		session.poisonLocked()
+		return response, fmt.Errorf("write %s: %w", command, err)
+	}
+	promptCtx, cancelPrompt := context.WithTimeout(ctx, smsPromptWait)
+	promptErr := session.waitPromptLocked(promptCtx, command, &response)
+	cancelPrompt()
+	if promptErr != nil {
 		// AT+CMGS already put the modem into '>' payload mode. Leaving that
 		// prompt open makes every later command return +CMS ERROR: 350 and the
 		// UI looks like "SMS is stuck".
 		session.abortPromptLocked()
 		response.Duration = time.Since(started)
-		return response, session.normalizeReadError(command, err)
+		return response, session.normalizeReadError(command, promptErr)
 	}
 	if err := ctx.Err(); err != nil {
 		session.abortPromptLocked()
@@ -212,11 +235,6 @@ func (session *Session) executePromptLocked(
 		session.abortPromptLocked()
 		response.Duration = time.Since(started)
 		return response, fmt.Errorf("terminate %s payload: %w", command, err)
-	}
-	if err := drainTransport(ctx, session.transport); err != nil {
-		session.poisonLocked()
-		response.Duration = time.Since(started)
-		return response, fmt.Errorf("drain %s payload: %w", command, err)
 	}
 	return session.readFinalLocked(ctx, started, command, string(payload), response)
 }

@@ -229,7 +229,9 @@ export function DeviceCallTab({
           <div className="text-lg font-bold text-gray-900 dark:text-white">{t("软电话")}</div>
           <div className="mt-0.5 text-sm text-gray-500 dark:text-gray-400">
             {session.audioAvailable
-              ? t("VoWiFi IMS 已就绪，可在浏览器里拨打和接听，无需外部客户端")
+              ? session.transport === "vowifi"
+                ? t("VoWiFi IMS 已就绪，可在浏览器里拨打和接听，无需外部客户端")
+                : t("电路域 USB 语音已接通，可在浏览器里听和说")
               : t("当前走基站电路域，只能拨打、接听和挂断，浏览器没有声音")}
           </div>
         </div>

@@ -54,6 +54,16 @@ func TestCallListPayloadMarksVoWiFiAudio(t *testing.T) {
 	}
 }
 
+func TestCallListPayloadCellularUSBAudioOverride(t *testing.T) {
+	payload := callListPayload("ec20", "cellular", []any{}, map[string]any{"audio_available": true})
+	if payload["audio_available"] != true {
+		t.Fatalf("USB PCM audio_available = %#v, want true", payload["audio_available"])
+	}
+	if payload["transport"] != "cellular" {
+		t.Fatalf("transport = %#v", payload["transport"])
+	}
+}
+
 func TestCallTransportRequiresIMSReady(t *testing.T) {
 	controller := &fakeVoWiFiController{state: vowifi.State{Enabled: true}}
 	server := &Server{vowifi: controller}

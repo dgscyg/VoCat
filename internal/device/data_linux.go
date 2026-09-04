@@ -676,51 +676,44 @@ func configureQMIDataHost(ctx context.Context, state *managedDevice, candidate m
 		rollbackQMIDataHost(state, candidate, ipCommand)
 		return NetworkResult{}, fmt.Errorf("set %s up: %w: %s", candidate.NetworkInterface, linkErr, strings.TrimSpace(string(linkOutput)))
 	}
+	// Native WDS Start replaced qmi-network. Host addressing must stay on the
+	// pre-merge path: qmicli --wds-get-current-settings, then udhcpc.
+	// session.RuntimeIPv4 uses GetRuntimeSettings, which SetIPFamilyPreference
+	// on the live PDH client and previously also applied WDS MTU. Both arrived
+	// with upstream v0.2.26 and match SYN-ok / TLS-HTTP-DNS-payload-dead.
+	hostDetail, hostErr := bringUpExportProxyInterface(ctx, candidate, nil, []string{"qmi-wds", "dhcp"})
+	if hostErr == nil {
+		return NetworkResult{
+			Enabled: true, Backend: "qmi", Interface: candidate.NetworkInterface,
+			ControlDevice: candidate.QMIControl, APN: apn, IPVersion: ipVersion,
+			Detail: strings.TrimSpace(detail + "\n" + hostDetail),
+		}, nil
+	}
 	runtimeContext, cancelRuntime := context.WithTimeout(ctx, qmiDataStatusTimeout)
 	runtimeSettings, runtimeErr := state.dataSession.RuntimeIPv4(runtimeContext)
 	cancelRuntime()
 	if runtimeErr == nil {
-		if runtimeSettings.MTU >= 576 && runtimeSettings.MTU <= 65535 {
-			mtuOutput, mtuErr := exec.CommandContext(ctx, ipCommand, "link", "set", "dev", candidate.NetworkInterface, "mtu", strconv.Itoa(runtimeSettings.MTU)).CombinedOutput()
-			if mtuErr != nil {
-				rollbackQMIDataHost(state, candidate, ipCommand)
-				return NetworkResult{}, fmt.Errorf("set %s MTU: %w: %s", candidate.NetworkInterface, mtuErr, strings.TrimSpace(string(mtuOutput)))
-			}
-		}
+		// Never apply WDS MTU. Pre-merge qmi-network leave the kernel default;
+		// a 1500-byte WDS MTU on EG25 black-holes TLS/HTTP after TCP handshake.
 		runtimeDetail, configureErr := configureExportProxyIPv4(
 			ctx, ipCommand, candidate.NetworkInterface,
 			runtimeSettings.Address, runtimeSettings.Prefix,
 			runtimeSettings.Gateway, runtimeSettings.DNS,
 		)
-		if configureErr != nil {
-			rollbackQMIDataHost(state, candidate, ipCommand)
-			return NetworkResult{}, fmt.Errorf("QMI session started but WDS runtime configuration failed: %w", configureErr)
+		if configureErr == nil {
+			return NetworkResult{
+				Enabled: true, Backend: "qmi", Interface: candidate.NetworkInterface,
+				ControlDevice: candidate.QMIControl, APN: apn, IPVersion: ipVersion,
+				Detail: strings.TrimSpace(detail + "\n" + runtimeDetail),
+			}, nil
 		}
-		return NetworkResult{
-			Enabled: true, Backend: "qmi", Interface: candidate.NetworkInterface,
-			ControlDevice: candidate.QMIControl, APN: apn, IPVersion: ipVersion,
-			Detail: strings.TrimSpace(detail + "\n" + runtimeDetail),
-		}, nil
+		hostErr = configureErr
 	}
-	busybox, err := exec.LookPath("busybox")
-	if err != nil {
-		rollbackQMIDataHost(state, candidate, ipCommand)
-		return NetworkResult{}, fmt.Errorf("%w: WDS runtime settings unavailable (%v) and busybox udhcpc is required for %s", ErrDataBackendUnavailable, runtimeErr, candidate.NetworkInterface)
+	rollbackQMIDataHost(state, candidate, ipCommand)
+	if runtimeErr != nil {
+		return NetworkResult{}, fmt.Errorf("QMI session started but the host interface has no IPv4: %v; WDS runtime settings unavailable: %w", hostErr, runtimeErr)
 	}
-	dhcpDetail, err := configureExportProxyDHCP(ctx, busybox, ipCommand, candidate.NetworkInterface)
-	if err != nil {
-		rollbackQMIDataHost(state, candidate, ipCommand)
-		return NetworkResult{}, fmt.Errorf("QMI session started but WDS runtime settings were unavailable (%v) and protected DHCP failed: %w", runtimeErr, err)
-	}
-	return NetworkResult{
-		Enabled:       true,
-		Backend:       "qmi",
-		Interface:     candidate.NetworkInterface,
-		ControlDevice: candidate.QMIControl,
-		APN:           apn,
-		IPVersion:     ipVersion,
-		Detail:        strings.TrimSpace(detail + "\n" + dhcpDetail),
-	}, nil
+	return NetworkResult{}, fmt.Errorf("QMI session started but the host interface has no IPv4: %w", hostErr)
 }
 
 // exportProxyRouteIdentity must stay in sync with the Export Proxy plugin's
@@ -949,8 +942,10 @@ func appendPublicDNSFallbacks(servers []string) []string {
 		seen[value] = true
 		valid = append(valid, value)
 	}
-	if len(valid) == 0 {
-		return []string{"1.1.1.1", "8.8.8.8"}
+	for _, fallback := range []string{"1.1.1.1", "8.8.8.8"} {
+		if !seen[fallback] {
+			valid = append(valid, fallback)
+		}
 	}
 	return valid
 }
